@@ -9,6 +9,11 @@
     "preview": "bun run build && bun run ./dist/index.js",
     "test": "bun test",
     "typecheck": "tsc --noEmit",
+    "lint": "oxlint",
+    "lint:fix": "oxlint --fix",
+    "format": "oxfmt",
+    "format:check": "oxfmt --check",
+    "check": "bun run format:check && bun run lint && bun run typecheck && bun test",
     "db:generate": "prisma generate",
     "db:push": "prisma db push",
     "db:seed": "bun run prisma/seed.ts"
@@ -27,6 +32,8 @@
     "@types/bun": "^1.1.14",
     "@types/react": "^18.3.17",
     "@types/react-dom": "^18.3.5",
+    "oxfmt": "^0.45.0",
+    "oxlint": "^1.60.0",
     "prisma": "^5.22.0",
     "typescript": "^5.7.2",
     "vite": "^5.4.11"

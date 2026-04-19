@@ -1,4 +1,4 @@
-import { reactRenderer } from '@hono/react-renderer'
+import { reactRenderer } from "@hono/react-renderer";
 
 export default reactRenderer(({ children, title }) => {
   return (
@@ -11,9 +11,9 @@ export default reactRenderer(({ children, title }) => {
         ) : (
           <script type="module" src="/app/client.ts" />
         )}
-        <title>{title ?? 'music-analyzer'}</title>
+        <title>{title ?? "music-analyzer"}</title>
       </head>
       <body>{children}</body>
     </html>
-  )
-})
+  );
+});
