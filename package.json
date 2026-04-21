@@ -19,12 +19,12 @@
     "db:seed": "bun run prisma/seed.ts"
   },
   "dependencies": {
-    "@hono/react-renderer": "^0.3.0",
-    "@prisma/client": "^5.22.0",
+    "@hono/react-renderer": "^1.0.1",
+    "@prisma/client": "^7.7.0",
     "hono": "^4.6.14",
     "honox": "^0.1.35",
-    "react": "^18.3.1",
-    "react-dom": "^18.3.1"
+    "react": "^19.2.5",
+    "react-dom": "^19.2.5"
   },
   "devDependencies": {
     "@hono/vite-build": "^1.2.0",
