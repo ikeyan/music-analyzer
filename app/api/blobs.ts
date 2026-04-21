@@ -3,7 +3,7 @@ import { getS3 } from "../lib/s3";
 
 export const blobs = new Hono()
   .get("/", async (c) => {
-    const prefix = c.req.query("prefix") ?? undefined;
+    const prefix = c.req.query("prefix");
     const result = await getS3().list(prefix ? { prefix } : null);
     const keys = (result.contents ?? []).map((o) => ({
       key: o.key,
@@ -30,9 +30,8 @@ export const blobs = new Hono()
 
     const file = s3.file(key);
     const stat = await file.stat();
-    const buffer = await file.arrayBuffer();
 
-    return new Response(buffer, {
+    return new Response(file.stream(), {
       headers: {
         "content-type": stat.type || "application/octet-stream",
         "content-length": String(stat.size),
