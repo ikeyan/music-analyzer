@@ -15,10 +15,11 @@ export const blobs = new Hono()
   })
   .put("/:key{.+}", async (c) => {
     const key = c.req.param("key");
-    const body = await c.req.arrayBuffer();
     const contentType = c.req.header("content-type") ?? "application/octet-stream";
-    await getS3().write(key, body, { type: contentType });
-    return c.json({ key, size: body.byteLength }, 201);
+    // Pass the raw Request so Bun streams the body to S3 via multipart
+    // upload instead of buffering the entire payload in memory.
+    const size = await getS3().write(key, c.req.raw, { type: contentType });
+    return c.json({ key, size }, 201);
   })
   .get("/:key{.+}", async (c) => {
     const key = c.req.param("key");

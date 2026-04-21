@@ -2,14 +2,23 @@ import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { Hono } from "hono";
 import { GenericContainer, type StartedTestContainer, Wait } from "testcontainers";
 
-const MINIO_IMAGE = "minio/minio:latest";
+const MINIO_IMAGE = "minio/minio:RELEASE.2025-09-07T16-13-09Z";
 const MINIO_USER = "minioadmin";
 const MINIO_PASSWORD = "minioadmin";
 const TEST_BUCKET = "test-bucket";
 const CONTAINER_STARTUP_MS = 120_000;
 
+const S3_ENV_VARS = [
+  "S3_ENDPOINT",
+  "S3_REGION",
+  "S3_ACCESS_KEY_ID",
+  "S3_SECRET_ACCESS_KEY",
+  "S3_BUCKET",
+] as const;
+
 let container: StartedTestContainer;
 let app: Hono;
+let originalEnv: Partial<Record<(typeof S3_ENV_VARS)[number], string | undefined>> = {};
 
 beforeAll(async () => {
   // The official minio image does not support an "auto-create buckets" env
@@ -29,6 +38,8 @@ beforeAll(async () => {
     .withStartupTimeout(CONTAINER_STARTUP_MS)
     .start();
 
+  originalEnv = Object.fromEntries(S3_ENV_VARS.map((k) => [k, process.env[k]]));
+
   const endpoint = `http://${container.getHost()}:${container.getMappedPort(9000)}`;
   process.env.S3_ENDPOINT = endpoint;
   process.env.S3_REGION = "us-east-1";
@@ -44,6 +55,18 @@ beforeAll(async () => {
 }, CONTAINER_STARTUP_MS);
 
 afterAll(async () => {
+  for (const k of S3_ENV_VARS) {
+    const prev = originalEnv[k];
+    if (prev === undefined) {
+      delete process.env[k];
+    } else {
+      process.env[k] = prev;
+    }
+  }
+
+  const { resetS3ForTest } = await import("./lib/s3");
+  resetS3ForTest();
+
   await container?.stop();
 });
 
