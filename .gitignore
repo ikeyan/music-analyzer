@@ -148,3 +148,7 @@ app/generated/
 # HonoX / Vite build
 dist/
 .vite/
+
+# agents
+.claude/settings.local.json
+.claude/worktrees/
