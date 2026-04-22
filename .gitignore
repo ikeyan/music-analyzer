@@ -143,6 +143,7 @@ prisma/dev.db
 prisma/dev.db-journal
 *.db
 *.db-journal
+app/generated/
 
 # HonoX / Vite build
 dist/
