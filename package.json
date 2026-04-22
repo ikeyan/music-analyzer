@@ -44,6 +44,7 @@
   "trustedDependencies": [
     "@prisma/client",
     "@prisma/engines",
+    "better-sqlite3",
     "cpu-features",
     "esbuild",
     "prisma",
