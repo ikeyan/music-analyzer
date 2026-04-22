@@ -25,7 +25,8 @@ export default defineConfig(({ mode }) => {
     ssr: {
       external: [
         "@prisma/client",
-        ".prisma/client",
+        "prisma-adapter-bun-sqlite",
+        "bun:sqlite",
         "react",
         "react-dom",
         "react-dom/server",

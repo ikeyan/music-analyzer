@@ -1,6 +1,10 @@
-import { PrismaClient } from "@prisma/client";
+import { PrismaBunSqlite } from "prisma-adapter-bun-sqlite";
+import { PrismaClient } from "../app/generated/prisma/client";
 
-const prisma = new PrismaClient();
+const adapter = new PrismaBunSqlite({
+  url: process.env.DATABASE_URL ?? "file:./dev.db",
+});
+const prisma = new PrismaClient({ adapter });
 
 async function main() {
   const existing = await prisma.message.findFirst();

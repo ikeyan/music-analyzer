@@ -143,7 +143,12 @@ prisma/dev.db
 prisma/dev.db-journal
 *.db
 *.db-journal
+app/generated/
 
 # HonoX / Vite build
 dist/
 .vite/
+
+# agents
+.claude/settings.local.json
+.claude/worktrees/
