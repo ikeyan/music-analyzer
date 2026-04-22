@@ -19,10 +19,16 @@ updates:
     schedule:
       interval: weekly
     groups:
-      production:
-        dependency-type: production
-      development:
-        dependency-type: development
+      all:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+    ignore:
+      - dependency-name: "*"
+        update-types:
+          - version-update:semver-major
     commit-message:
       prefix: deps
     labels:
