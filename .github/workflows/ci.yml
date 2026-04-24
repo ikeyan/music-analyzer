@@ -64,3 +64,213 @@ jobs:
 
       - name: Build
         run: bun run build
+
+  e2e-authentik:
+    name: e2e (authentik)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    timeout-minutes: 30
+    env:
+      DATABASE_URL: file:./dev.db
+      AUTHENTIK_TAG: "2025.2.4"
+      AUTHENTIK_BOOTSTRAP_EMAIL: "admin@localhost"
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@8d3c67de8e2fe68ef647c8db1e6a09f647780f40 # v2.19.0
+        with:
+          egress-policy: audit
+          disable-sudo: true
+
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          show-progress: false
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: .bun-version
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Generate Prisma Client
+        run: bun run db:generate
+
+      # Fresh per-run secrets. These are only reachable over the runner's
+      # loopback, but generating them here keeps them out of the repo's
+      # history and rotates them every run. ::add-mask:: also hides them
+      # from the step logs if anything prints them.
+      - name: Generate per-run secrets
+        run: |
+          pg_pass=$(openssl rand -hex 16)
+          bootstrap_pwd=$(openssl rand -hex 16)
+          bootstrap_token=$(openssl rand -hex 32)
+          echo "::add-mask::$pg_pass"
+          echo "::add-mask::$bootstrap_pwd"
+          echo "::add-mask::$bootstrap_token"
+          {
+            echo "PG_PASS=$pg_pass"
+            echo "AUTHENTIK_BOOTSTRAP_PASSWORD=$bootstrap_pwd"
+            echo "AUTHENTIK_BOOTSTRAP_TOKEN=$bootstrap_token"
+          } >> "$GITHUB_ENV"
+
+      # Pre-pull in parallel so the slow authentik image overlaps with the
+      # smaller ones instead of serializing inside docker compose.
+      - name: Pre-pull compose images
+        run: |
+          docker pull "ghcr.io/goauthentik/server:${AUTHENTIK_TAG}" &
+          docker pull postgres:16-alpine &
+          docker pull redis:alpine &
+          docker pull caddy:2-alpine &
+          docker pull oven/bun:1.3.11 &
+          wait
+
+      # Boot the stack directly (not via testcontainers) so containers stay up
+      # for log collection regardless of how the test step terminates.
+      - name: Bring up authentik stack
+        working-directory: e2e/authentik
+        run: |
+          cat > .env <<EOF
+          PG_PASS=${PG_PASS}
+          AUTHENTIK_TAG=${AUTHENTIK_TAG}
+          AUTHENTIK_SECRET_KEY=ci-secret-$(openssl rand -hex 32)
+          AUTHENTIK_BOOTSTRAP_EMAIL=${AUTHENTIK_BOOTSTRAP_EMAIL}
+          AUTHENTIK_BOOTSTRAP_PASSWORD=${AUTHENTIK_BOOTSTRAP_PASSWORD}
+          AUTHENTIK_BOOTSTRAP_TOKEN=${AUTHENTIK_BOOTSTRAP_TOKEN}
+          CADDY_PORT_HTTP=8080
+          AUTHENTIK_PORT_HTTP=9000
+          AUTHENTIK_PORT_HTTPS=9443
+          EOF
+          docker compose --env-file .env up -d --build --pull never
+
+      - name: Show initial container state
+        working-directory: e2e/authentik
+        run: docker compose --env-file .env ps
+
+      - name: Wait for authentik to become healthy
+        run: |
+          deadline=$(( $(date +%s) + 600 ))
+          while :; do
+            if curl -fsS -o /dev/null http://localhost:9000/-/health/ready/; then
+              echo "authentik /-/health/ready/ returned 200"
+              break
+            fi
+            now=$(date +%s)
+            if [ "$now" -ge "$deadline" ]; then
+              echo "::error::authentik did not become healthy within 10 minutes"
+              exit 1
+            fi
+            echo "waiting for authentik... ($((deadline - now))s left)"
+            sleep 5
+          done
+
+      # Provider/application/outpost binding and the outpost-endpoint wait
+      # live in the test itself (e2e/authentik/scripts/setup.ts, called from
+      # beforeAll) so the same setup path runs both locally and in CI.
+      - name: Run authentik e2e
+        env:
+          AUTHENTIK_E2E_CADDY_URL: http://localhost:8080
+          AUTHENTIK_E2E_AUTHENTIK_URL: http://localhost:9000
+        run: bun run e2e:authentik
+
+      # Full compose logs go to $RUNNER_TEMP and get uploaded as an artifact
+      # so they survive the GH Actions UI (which occasionally fails to load
+      # logs) and can be grepped locally after the fact. A tail-200 summary
+      # per service also goes inline for a quick glance in the UI.
+      - name: Collect compose logs and state
+        if: always()
+        working-directory: e2e/authentik
+        env:
+          LOGS_DIR: ${{ runner.temp }}/authentik-e2e-logs
+        run: |
+          mkdir -p "$LOGS_DIR"
+          docker compose --env-file .env ps -a > "$LOGS_DIR/docker-compose-ps.txt" 2>&1 || true
+          for svc in postgresql redis authentik-server authentik-worker music-analyzer caddy; do
+            docker compose --env-file .env logs --no-color --no-log-prefix "$svc" \
+              > "$LOGS_DIR/$svc.log" 2>&1 || true
+          done
+
+          echo "::group::docker compose ps"
+          cat "$LOGS_DIR/docker-compose-ps.txt" || true
+          echo "::endgroup::"
+          for svc in postgresql redis authentik-server authentik-worker music-analyzer caddy; do
+            echo "::group::$svc (tail 200 — full log in artifact)"
+            tail -200 "$LOGS_DIR/$svc.log" || true
+            echo "::endgroup::"
+          done
+
+      - name: Upload compose logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: authentik-e2e-logs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/authentik-e2e-logs
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Tear down
+        if: always()
+        working-directory: e2e/authentik
+        run: docker compose --env-file .env down --volumes --timeout 5 || true
+
+  # Fires only when every required job (check + e2e-authentik) succeeded;
+  # dependent jobs are skipped automatically when a `needs:` target fails.
+  # Purpose: surface a "PR is all-green" event that tools subscribed via
+  # GitHub's PR activity stream can react to — the default stream only
+  # forwards failures and comment *creates*, so we always POST a fresh
+  # comment (firing the create event) and sweep any previous marker'd
+  # comments to keep the PR to a single status comment.
+  notify-pr-green:
+    name: notify PR (all green)
+    needs: [check, e2e-authentik]
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@8d3c67de8e2fe68ef647c8db1e6a09f647780f40 # v2.19.0
+        with:
+          egress-policy: audit
+          disable-sudo: true
+
+      - name: Comment on PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          marker='<!-- ci-status -->'
+          body=$(printf '%s\n✅ all CI jobs passed on `%s` — [run](%s)' \
+            "$marker" "${SHA:0:7}" "$RUN_URL")
+          payload=$(jq -n --arg body "$body" '{body: $body}')
+          api="https://api.github.com/repos/$REPO"
+          auth_header="Authorization: Bearer $GH_TOKEN"
+          accept_header='Accept: application/vnd.github+json'
+
+          # Snapshot existing marker'd comments BEFORE creating the new one
+          # so we don't accidentally delete the fresh one. Also match the
+          # legacy e2e-only marker so the one-off transitional comment left
+          # on the PR by an earlier version of this job gets cleaned up.
+          old_ids=$(curl -fsS -H "$auth_header" -H "$accept_header" \
+            "$api/issues/$PR/comments?per_page=100" \
+            | jq -r \
+                --arg m "$marker" \
+                --arg legacy '<!-- e2e-authentik-status -->' \
+                '.[] | select(.body | contains($m) or contains($legacy)) | .id')
+
+          curl -fsS -X POST -H "$auth_header" -H "$accept_header" \
+            -d "$payload" "$api/issues/$PR/comments" -o /dev/null
+          echo "Created new status comment"
+
+          for id in $old_ids; do
+            curl -sS -o /dev/null -w 'deleted comment %{url_effective} -> %{http_code}\n' \
+              -X DELETE -H "$auth_header" -H "$accept_header" \
+              "$api/issues/comments/$id" || true
+          done
