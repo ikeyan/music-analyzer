@@ -14,8 +14,11 @@
 //   4. Binds the provider to the embedded outpost AND sets
 //      config.authentik_host — without the latter the embedded outpost
 //      refuses to serve /outpost.goauthentik.io/* and 404s every request.
-//   5. Waits for the outpost endpoint to stop 404-ing, probing with the
-//      X-Forwarded-* headers that Caddy's forward_auth would send.
+//   5. Waits for the outpost endpoint to return a status that proves auth is
+//      actually wired up — 2xx/3xx (the unauth redirect chain) or 401 — not
+//      just "anything but 404", which would let transient 5xx during boot
+//      slip through as "ready". Probes with the X-Forwarded-* headers that
+//      Caddy's forward_auth would send.
 
 const PROVIDER_NAME = "music-analyzer-provider";
 const APP_SLUG = "music-analyzer";
@@ -56,9 +59,9 @@ export async function setupMusicAnalyzer(opts: SetupOptions): Promise<void> {
   const browserHost = opts.authentikHostForBrowser ?? opts.authentikUrl;
 
   log(`waiting for ${AUTH_FLOW_SLUG}...`);
-  const authFlowPk = await waitForFlow(api, authHeaders, AUTH_FLOW_SLUG, deadline);
+  const authFlowPk = await waitForFlow(api, authHeaders, AUTH_FLOW_SLUG, deadline, log);
   log(`waiting for ${INV_FLOW_SLUG}...`);
-  const invFlowPk = await waitForFlow(api, authHeaders, INV_FLOW_SLUG, deadline);
+  const invFlowPk = await waitForFlow(api, authHeaders, INV_FLOW_SLUG, deadline, log);
   log(`  auth_flow_pk=${authFlowPk} inv_flow_pk=${invFlowPk}`);
 
   let providerPk = await findProviderPk(api, authHeaders);
@@ -93,7 +96,17 @@ async function waitForFlow(
   auth: Record<string, string>,
   slug: string,
   deadline: number,
+  log: (msg: string) => void,
 ): Promise<string> {
+  // Surface the first non-ok status / exception so a misconfigured token or
+  // unreachable host doesn't masquerade as "flow never appeared" five
+  // minutes later.
+  let firstFailureLogged = false;
+  const noteFailure = (detail: string): void => {
+    if (firstFailureLogged) return;
+    firstFailureLogged = true;
+    log(`  waitForFlow(${slug}): first failure — ${detail}`);
+  };
   while (Date.now() < deadline) {
     try {
       const res = await timedFetch(`${api}/flows/instances/?slug=${slug}`, { headers: auth });
@@ -101,9 +114,11 @@ async function waitForFlow(
         const body = (await res.json()) as { results: { pk: string; slug: string }[] };
         const match = body.results.find((f) => f.slug === slug);
         if (match) return match.pk;
+      } else {
+        noteFailure(`HTTP ${res.status}`);
       }
-    } catch {
-      // timeout / network / non-ok — retry
+    } catch (err) {
+      noteFailure(err instanceof Error ? err.message : String(err));
     }
     await sleep(POLL_INTERVAL_MS);
   }
@@ -111,15 +126,21 @@ async function waitForFlow(
 }
 
 async function findProviderPk(api: string, auth: Record<string, string>): Promise<number | null> {
+  // `search` is the DRF SearchFilter that authentik's providers viewset
+  // exposes; an unknown filter key (e.g. ?name=) gets silently ignored and
+  // the API returns an unfiltered first page, which would let us pick up an
+  // unrelated provider in external mode. Re-verify with an exact name match
+  // client-side so the result can never be a false positive.
   const res = await timedFetch(
-    `${api}/providers/proxy/?name=${encodeURIComponent(PROVIDER_NAME)}`,
+    `${api}/providers/proxy/?search=${encodeURIComponent(PROVIDER_NAME)}`,
     {
       headers: auth,
     },
   );
   if (!res.ok) throw new Error(`list providers failed: ${res.status} ${await res.text()}`);
-  const body = (await res.json()) as { results: { pk: number }[] };
-  return body.results[0]?.pk ?? null;
+  const body = (await res.json()) as { results: { pk: number; name: string }[] };
+  const match = body.results.find((p) => p.name === PROVIDER_NAME);
+  return match?.pk ?? null;
 }
 
 async function createProvider(
@@ -144,10 +165,14 @@ async function createProvider(
 }
 
 async function applicationExists(api: string, auth: Record<string, string>): Promise<boolean> {
-  const res = await timedFetch(`${api}/core/applications/?slug=${APP_SLUG}`, { headers: auth });
+  const res = await timedFetch(`${api}/core/applications/?search=${encodeURIComponent(APP_SLUG)}`, {
+    headers: auth,
+  });
   if (!res.ok) throw new Error(`list applications failed: ${res.status} ${await res.text()}`);
-  const body = (await res.json()) as { results: unknown[] };
-  return body.results.length > 0;
+  // Same defensive client-side filter as findProviderPk: an unknown server-
+  // side filter key returns the unfiltered first page in DRF.
+  const body = (await res.json()) as { results: { slug: string }[] };
+  return body.results.some((a) => a.slug === APP_SLUG);
 }
 
 async function createApplication(
@@ -173,18 +198,29 @@ async function bindEmbeddedOutpost(
   if (!listRes.ok)
     throw new Error(`list outposts failed: ${listRes.status} ${await listRes.text()}`);
   const list = (await listRes.json()) as {
-    results: { pk: string; managed: string | null; config: Record<string, unknown> }[];
+    results: {
+      pk: string;
+      managed: string | null;
+      config: Record<string, unknown>;
+      providers: number[];
+    }[];
   };
   const embedded = list.results.find((o) => o.managed === EMBEDDED_OUTPOST_MANAGED_KEY);
   if (!embedded) {
     throw new Error(`embedded outpost (managed=${EMBEDDED_OUTPOST_MANAGED_KEY}) not found`);
   }
 
+  // Append + dedupe rather than replace: in external mode the embedded
+  // outpost may already gate other applications, and providers is a full-
+  // replacement field on PATCH (not a merge).
+  const existing = Array.isArray(embedded.providers) ? embedded.providers : [];
+  const providers = Array.from(new Set([...existing, providerPk]));
+
   const patchRes = await timedFetch(`${api}/outposts/instances/${embedded.pk}/`, {
     method: "PATCH",
     headers: { ...auth, "Content-Type": "application/json" },
     body: JSON.stringify({
-      providers: [providerPk],
+      providers,
       config: { ...embedded.config, authentik_host: authentikHost },
     }),
   });
@@ -209,13 +245,19 @@ async function waitForOutpostEndpoint(
   while (Date.now() < deadline) {
     try {
       const res = await timedFetch(url, { headers, redirect: "manual" });
-      if (res.status !== 404) return;
+      // 2xx: outpost returned an allow decision (unlikely for an anon probe).
+      // 3xx: redirect into the login flow — the normal "gate is up" answer.
+      // 401: older authentik versions answer challenges this way.
+      // Anything else (404 while binding propagates, 5xx during boot, etc.)
+      // means the gate is not yet wired up — keep waiting.
+      const ready = (res.status >= 200 && res.status < 400) || res.status === 401;
+      if (ready) return;
     } catch {
       // retry
     }
     await sleep(POLL_INTERVAL_MS);
   }
-  throw new Error(`outpost endpoint kept returning 404 until the deadline`);
+  throw new Error(`outpost endpoint did not become ready within the deadline`);
 }
 
 async function timedFetch(url: string, init?: RequestInit): Promise<Response> {
