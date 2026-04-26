@@ -126,13 +126,13 @@ async function waitForFlow(
 }
 
 async function findProviderPk(api: string, auth: Record<string, string>): Promise<number | null> {
-  // `search` is the DRF SearchFilter that authentik's providers viewset
-  // exposes; an unknown filter key (e.g. ?name=) gets silently ignored and
-  // the API returns an unfiltered first page, which would let us pick up an
-  // unrelated provider in external mode. Re-verify with an exact name match
-  // client-side so the result can never be a false positive.
+  // The providers viewset exposes `name__iexact` as an exact filter; prefer
+  // that over the fuzzy + paginated `search` so a busy authentik instance
+  // can't push our exact match off the first page and trick us into
+  // re-creating the provider. Client-side `name === PROVIDER_NAME` stays as
+  // a safety net in case the filter is ever silently ignored.
   const res = await timedFetch(
-    `${api}/providers/proxy/?search=${encodeURIComponent(PROVIDER_NAME)}`,
+    `${api}/providers/proxy/?name__iexact=${encodeURIComponent(PROVIDER_NAME)}`,
     {
       headers: auth,
     },
