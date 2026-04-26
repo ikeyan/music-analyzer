@@ -165,12 +165,16 @@ async function createProvider(
 }
 
 async function applicationExists(api: string, auth: Record<string, string>): Promise<boolean> {
-  const res = await timedFetch(`${api}/core/applications/?search=${encodeURIComponent(APP_SLUG)}`, {
+  // The applications viewset documents `slug` as an exact filter, so use
+  // that rather than the fuzzy + paginated `search` — in shared instances
+  // with many similarly named apps, search could push the exact match off
+  // the first page and we'd recreate the app, getting a 400 on the slug
+  // collision. Client-side `slug === APP_SLUG` stays as a safety net in
+  // case the filter is ever silently ignored.
+  const res = await timedFetch(`${api}/core/applications/?slug=${encodeURIComponent(APP_SLUG)}`, {
     headers: auth,
   });
   if (!res.ok) throw new Error(`list applications failed: ${res.status} ${await res.text()}`);
-  // Same defensive client-side filter as findProviderPk: an unknown server-
-  // side filter key returns the unfiltered first page in DRF.
   const body = (await res.json()) as { results: { slug: string }[] };
   return body.results.some((a) => a.slug === APP_SLUG);
 }
