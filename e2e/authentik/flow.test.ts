@@ -48,8 +48,12 @@ const EXTERNAL_AUTHENTIK_URL = process.env.AUTHENTIK_E2E_AUTHENTIK_URL ?? "";
 const EXTERNAL_MODE = Boolean(EXTERNAL_CADDY_URL && EXTERNAL_AUTHENTIK_URL);
 
 const COMPOSE_DIR = dirname(fileURLToPath(import.meta.url));
-// Bootstrap token must match the one passed to the running stack in external
-// mode. In self-managed mode we pick a fresh one per run.
+// Bootstrap credentials must match what the running stack was started with
+// in external mode (we hit the API as akadmin and authenticate with these).
+// In self-managed mode we pick fresh values per run and pass them into the
+// stack we boot ourselves. External mode validates the env vars in
+// beforeAll — falling back to a random UUID would let the login test fail
+// deterministically while looking like an integration bug.
 const BOOTSTRAP_TOKEN = process.env.AUTHENTIK_BOOTSTRAP_TOKEN || `e2e-${crypto.randomUUID()}`;
 const BOOTSTRAP_PASSWORD = process.env.AUTHENTIK_BOOTSTRAP_PASSWORD || `e2e-${crypto.randomUUID()}`;
 
@@ -61,6 +65,16 @@ beforeAll(async () => {
   if (!RUN) return;
 
   if (EXTERNAL_MODE) {
+    if (!process.env.AUTHENTIK_BOOTSTRAP_TOKEN) {
+      throw new Error(
+        "external mode (AUTHENTIK_E2E_*_URL set) requires AUTHENTIK_BOOTSTRAP_TOKEN to match the running stack's token",
+      );
+    }
+    if (!process.env.AUTHENTIK_BOOTSTRAP_PASSWORD) {
+      throw new Error(
+        "external mode (AUTHENTIK_E2E_*_URL set) requires AUTHENTIK_BOOTSTRAP_PASSWORD to match akadmin's password on the running stack",
+      );
+    }
     caddyUrl = EXTERNAL_CADDY_URL;
     authentikUrl = EXTERNAL_AUTHENTIK_URL;
   } else {
