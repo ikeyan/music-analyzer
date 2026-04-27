@@ -226,7 +226,12 @@ jobs:
   notify-pr-green:
     name: notify PR (all green)
     needs: [check, e2e-authentik]
-    if: github.event_name == 'pull_request'
+    # Skip on forks: GITHUB_TOKEN is downgraded to read-only there, so the
+    # comment POST would 403 and (because of `set -euo pipefail`) flip the
+    # job red on otherwise-passing PRs.
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-24.04
     permissions:
       pull-requests: write

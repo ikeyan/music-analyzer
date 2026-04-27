@@ -1,5 +1,11 @@
 # Test / e2e stack for: caddy -> authentik -> music-analyzer.
 #
+# Intended for local development and the CI e2e job only — NOT hardened for
+# production or LAN exposure (the .env.example bootstrap credentials are
+# defaults like "changeme-admin"). Public ports therefore bind to 127.0.0.1
+# by default; set BIND_ADDR=0.0.0.0 explicitly if you need to reach the
+# stack from another host (e.g. a phone on the same network).
+#
 # Usage:
 #   cp e2e/authentik/.env.example e2e/authentik/.env
 #   docker compose -f e2e/authentik/compose.yaml --env-file e2e/authentik/.env up --build
@@ -8,7 +14,7 @@
 #     AUTHENTIK_BOOTSTRAP_TOKEN=<same as .env> \
 #     bun run e2e/authentik/scripts/setup.ts
 #
-# Access:
+# Access (loopback only by default):
 #   http://localhost:8080               -> music-analyzer (gated by authentik)
 #   http://localhost:9000               -> authentik admin UI (login: akadmin / $AUTHENTIK_BOOTSTRAP_PASSWORD)
 #
@@ -65,8 +71,8 @@ services:
     volumes:
       - authentik-media:/media
     ports:
-      - "${AUTHENTIK_PORT_HTTP:-9000}:9000"
-      - "${AUTHENTIK_PORT_HTTPS:-9443}:9443"
+      - "${BIND_ADDR:-127.0.0.1}:${AUTHENTIK_PORT_HTTP:-9000}:9000"
+      - "${BIND_ADDR:-127.0.0.1}:${AUTHENTIK_PORT_HTTPS:-9443}:9443"
     depends_on:
       postgresql:
         condition: service_healthy
@@ -112,7 +118,7 @@ services:
   caddy:
     image: docker.io/library/caddy:2-alpine
     ports:
-      - "${CADDY_PORT_HTTP:-8080}:80"
+      - "${BIND_ADDR:-127.0.0.1}:${CADDY_PORT_HTTP:-8080}:80"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
     depends_on:
