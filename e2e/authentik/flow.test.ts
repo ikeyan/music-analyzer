@@ -117,11 +117,15 @@ d("caddy -> authentik -> music-analyzer", () => {
 
   it("has the proxy provider and application seeded", async () => {
     const auth = { Authorization: `Bearer ${BOOTSTRAP_TOKEN}` };
+    // Use exact filters (`name__iexact` / `slug`) rather than the fuzzy
+    // `search`; in external mode an authentik instance with many similarly
+    // named objects could push our target off the first page and trick the
+    // assertion into a false failure. Same pattern as scripts/setup.ts.
     const [providers, apps] = await Promise.all([
-      fetch(`${authentikUrl}/api/v3/providers/proxy/?search=music-analyzer-provider`, {
+      fetch(`${authentikUrl}/api/v3/providers/proxy/?name__iexact=music-analyzer-provider`, {
         headers: auth,
       }).then((r) => r.json() as Promise<{ results: { name: string }[] }>),
-      fetch(`${authentikUrl}/api/v3/core/applications/?search=music-analyzer`, {
+      fetch(`${authentikUrl}/api/v3/core/applications/?slug=music-analyzer`, {
         headers: auth,
       }).then((r) => r.json() as Promise<{ results: { slug: string }[] }>),
     ]);
