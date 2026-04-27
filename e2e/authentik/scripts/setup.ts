@@ -64,24 +64,18 @@ export async function setupMusicAnalyzer(opts: SetupOptions): Promise<void> {
   const invFlowPk = await waitForFlow(api, authHeaders, INV_FLOW_SLUG, deadline, log);
   log(`  auth_flow_pk=${authFlowPk} inv_flow_pk=${invFlowPk}`);
 
-  let providerPk = await findProviderPk(api, authHeaders);
-  if (providerPk === null) {
-    providerPk = await createProvider(api, authHeaders, {
-      authFlowPk,
-      invFlowPk,
-      externalHost: opts.externalHost,
-    });
-    log(`created provider pk=${providerPk}`);
-  } else {
-    log(`provider already exists pk=${providerPk}`);
-  }
+  // authentik enforces unique on Provider.name and Application.slug at the
+  // DB level, so two concurrent setups racing past `find` -> `create` end
+  // with the loser hitting a 400/409 rather than producing a duplicate.
+  // Catching that and re-finding makes the setup safe under concurrent
+  // calls without sequencing them externally.
+  const providerPk = await ensureProvider(api, authHeaders, log, {
+    authFlowPk,
+    invFlowPk,
+    externalHost: opts.externalHost,
+  });
 
-  if (!(await applicationExists(api, authHeaders))) {
-    await createApplication(api, authHeaders, providerPk);
-    log(`created application ${APP_SLUG}`);
-  } else {
-    log(`application ${APP_SLUG} already exists`);
-  }
+  await ensureApplication(api, authHeaders, log, providerPk);
 
   await bindEmbeddedOutpost(api, authHeaders, providerPk, browserHost);
   log(`bound provider to embedded outpost (authentik_host=${browserHost})`);
@@ -143,6 +137,34 @@ async function findProviderPk(api: string, auth: Record<string, string>): Promis
   return match?.pk ?? null;
 }
 
+async function ensureProvider(
+  api: string,
+  auth: Record<string, string>,
+  log: (msg: string) => void,
+  p: { authFlowPk: string; invFlowPk: string; externalHost: string },
+): Promise<number> {
+  const existing = await findProviderPk(api, auth);
+  if (existing !== null) {
+    log(`provider already exists pk=${existing}`);
+    return existing;
+  }
+  try {
+    const pk = await createProvider(api, auth, p);
+    log(`created provider pk=${pk}`);
+    return pk;
+  } catch (err) {
+    // Race recovery: a concurrent setup might have created the provider
+    // between our find and our create. Re-find — if it's there now, reuse
+    // it; otherwise the create error was real, so re-throw.
+    const second = await findProviderPk(api, auth);
+    if (second !== null) {
+      log(`provider was created concurrently, reusing pk=${second}`);
+      return second;
+    }
+    throw err;
+  }
+}
+
 async function createProvider(
   api: string,
   auth: Record<string, string>,
@@ -162,6 +184,29 @@ async function createProvider(
   if (!res.ok) throw new Error(`create provider failed: ${res.status} ${await res.text()}`);
   const body = (await res.json()) as { pk: number };
   return body.pk;
+}
+
+async function ensureApplication(
+  api: string,
+  auth: Record<string, string>,
+  log: (msg: string) => void,
+  providerPk: number,
+): Promise<void> {
+  if (await applicationExists(api, auth)) {
+    log(`application ${APP_SLUG} already exists`);
+    return;
+  }
+  try {
+    await createApplication(api, auth, providerPk);
+    log(`created application ${APP_SLUG}`);
+  } catch (err) {
+    // Same race-recovery pattern as ensureProvider.
+    if (await applicationExists(api, auth)) {
+      log(`application ${APP_SLUG} was created concurrently, reusing`);
+      return;
+    }
+    throw err;
+  }
 }
 
 async function applicationExists(api: string, auth: Record<string, string>): Promise<boolean> {

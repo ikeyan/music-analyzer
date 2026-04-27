@@ -181,10 +181,11 @@ d("caddy -> authentik -> music-analyzer", () => {
       const res = await jarFetch(jar, `${caddyUrl}/`);
       expect(res.status).toBe(200);
       const html = await res.text();
-      // The music-analyzer index page renders this marker string; if Caddy
-      // were returning the authentik login page or an error, the assertion
-      // below would fail loudly.
-      expect(html).toContain("music-analyzer");
+      // Match the home route's distinctive <p> fingerprint rather than just
+      // "music-analyzer" — vite error overlays / authentik login pages /
+      // generic 5xx bodies can all contain the project name, but only the
+      // SSR'd index page contains this exact string.
+      expect(html).toContain("music-analyzer / bun + hono + honox + react + prisma + sqlite");
     },
     LOGIN_TIMEOUT_MS,
   );
