@@ -152,9 +152,18 @@ jobs:
           AUTHENTIK_PORT_HTTP=9000
           AUTHENTIK_PORT_HTTPS=9443
           EOF
+          # `wait` with no args always returns 0, so capture each PID and wait
+          # on it individually — otherwise a failed pull/build is silently
+          # ignored and `up --pull never` proceeds with stale or missing
+          # images.
           docker compose --env-file .env pull &
+          pull_pid=$!
           docker compose --env-file .env build music-analyzer &
-          wait
+          build_pid=$!
+          status=0
+          wait "$pull_pid" || status=$?
+          wait "$build_pid" || status=$?
+          [ "$status" -eq 0 ]
           docker compose --env-file .env up -d --pull never
 
       - name: Show initial container state
