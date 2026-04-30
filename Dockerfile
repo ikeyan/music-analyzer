@@ -17,7 +17,12 @@ WORKDIR /app
 COPY --from=builder /app/dist ./dist
 COPY --from=builder /app/node_modules ./node_modules
 COPY --from=builder /app/app/generated ./app/generated
+COPY --from=builder /app/prisma ./prisma
+COPY --from=builder /app/prisma.config.ts /app/package.json ./
 ENV NODE_ENV=production
 ENV PORT=3000
 EXPOSE 3000
-CMD ["bun", "run", "./dist/index.js"]
+# `db:push` syncs the schema to the SQLite file on every start (no-op when
+# already up-to-date). Migrations are not yet versioned in this repo; switch
+# to `migrate deploy` once they are.
+CMD ["sh", "-c", "bun run db:push && bun run ./dist/index.js"]
