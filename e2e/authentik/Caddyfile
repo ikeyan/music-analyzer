@@ -1,0 +1,41 @@
+# Caddy fronts music-analyzer and delegates authentication to Authentik's
+# embedded outpost via forward_auth.
+#
+# Pattern per Authentik docs:
+#   https://docs.goauthentik.io/docs/add-secure-apps/providers/proxy/server_caddy
+
+{
+	# Tests talk plain HTTP on localhost; disable automatic HTTPS.
+	auto_https off
+	admin off
+}
+
+:80 {
+	# 1) Let authentik's outpost endpoints pass through untouched. These power
+	#    the login redirect, callback, sign_out and user info JSON. Don't
+	#    rewrite Host: authentik's callback handler matches the request
+	#    against each proxy provider's external_host, and a rewritten Host
+	#    (authentik-server:9000) doesn't match http://localhost:8080 so the
+	#    callback 404s. Caddy already sets X-Forwarded-* by default.
+	route /outpost.goauthentik.io/* {
+		reverse_proxy http://authentik-server:9000
+	}
+
+	# 2) Everything else: ask authentik if the request is allowed. On 2xx the
+	#    request is forwarded to music-analyzer with X-authentik-* headers;
+	#    on 302 the user is redirected into the authentik login flow.
+	route {
+		forward_auth http://authentik-server:9000 {
+			uri /outpost.goauthentik.io/auth/caddy
+
+			copy_headers X-Authentik-Username X-Authentik-Groups X-Authentik-Entitlements X-Authentik-Email X-Authentik-Name X-Authentik-Uid X-Authentik-Jwt X-Authentik-Meta-Jwks X-Authentik-Meta-Outpost X-Authentik-Meta-Provider X-Authentik-Meta-App X-Authentik-Meta-Version
+
+			# forward_auth already forwards cookies and the original URL via
+			# X-Forwarded-* headers, which is what the outpost's caddy mode
+			# reads to reconstruct the request URL and match a provider.
+			trusted_proxies private_ranges
+		}
+
+		reverse_proxy http://music-analyzer:5173
+	}
+}

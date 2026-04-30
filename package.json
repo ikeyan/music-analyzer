@@ -8,6 +8,7 @@
     "build": "vite build --mode client && vite build",
     "preview": "bun run build && bun run ./dist/index.js",
     "test": "bun test",
+    "e2e:authentik": "RUN_AUTHENTIK_E2E=1 bun test e2e/authentik/flow.test.ts",
     "typecheck": "tsc --noEmit",
     "lint": "oxlint",
     "lint:fix": "oxlint --fix",

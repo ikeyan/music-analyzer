@@ -1,0 +1,132 @@
+# Test / e2e stack for: caddy -> authentik -> music-analyzer.
+#
+# Intended for local development and the CI e2e job only — NOT hardened for
+# production or LAN exposure (the .env.example bootstrap credentials are
+# defaults like "changeme-admin"). Public ports therefore bind to 127.0.0.1
+# by default; set BIND_ADDR=0.0.0.0 explicitly if you need to reach the
+# stack from another host (e.g. a phone on the same network).
+#
+# Usage:
+#   cp e2e/authentik/.env.example e2e/authentik/.env
+#   docker compose -f e2e/authentik/compose.yaml --env-file e2e/authentik/.env up --build
+#   AUTHENTIK_E2E_AUTHENTIK_URL=http://localhost:9000 \
+#     AUTHENTIK_E2E_CADDY_URL=http://localhost:8080 \
+#     AUTHENTIK_BOOTSTRAP_TOKEN=<same as .env> \
+#     bun run e2e/authentik/scripts/setup.ts
+#
+# Access (loopback only by default):
+#   http://localhost:8080               -> music-analyzer (gated by authentik)
+#   http://localhost:9000               -> authentik admin UI (login: akadmin / $AUTHENTIK_BOOTSTRAP_PASSWORD)
+#
+# The first boot of authentik-server takes ~30-60s while it migrates the DB.
+# The music-analyzer proxy provider, application, and embedded-outpost
+# binding are provisioned over REST by scripts/setup.ts — run it after
+# `docker compose up` (the e2e test calls it automatically).
+
+name: music-analyzer-authentik-e2e
+
+services:
+  postgresql:
+    image: docker.io/library/postgres:16-alpine
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -d $${POSTGRES_DB} -U $${POSTGRES_USER}"]
+      start_period: 20s
+      interval: 5s
+      retries: 10
+      timeout: 5s
+    environment:
+      POSTGRES_PASSWORD: ${PG_PASS:?database password required}
+      POSTGRES_USER: ${PG_USER:-authentik}
+      POSTGRES_DB: ${PG_DB:-authentik}
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+
+  redis:
+    image: docker.io/library/redis:alpine
+    command: --save 60 1 --loglevel warning
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep PONG"]
+      start_period: 10s
+      interval: 5s
+      retries: 10
+      timeout: 3s
+    volumes:
+      - redis-data:/data
+
+  authentik-server:
+    image: ${AUTHENTIK_IMAGE:-ghcr.io/goauthentik/server}:${AUTHENTIK_TAG:-2025.2.4}
+    command: server
+    environment:
+      AUTHENTIK_REDIS__HOST: redis
+      AUTHENTIK_POSTGRESQL__HOST: postgresql
+      AUTHENTIK_POSTGRESQL__USER: ${PG_USER:-authentik}
+      AUTHENTIK_POSTGRESQL__NAME: ${PG_DB:-authentik}
+      AUTHENTIK_POSTGRESQL__PASSWORD: ${PG_PASS}
+      AUTHENTIK_SECRET_KEY: ${AUTHENTIK_SECRET_KEY:?secret key required}
+      AUTHENTIK_BOOTSTRAP_PASSWORD: ${AUTHENTIK_BOOTSTRAP_PASSWORD:-changeme-admin}
+      AUTHENTIK_BOOTSTRAP_TOKEN: ${AUTHENTIK_BOOTSTRAP_TOKEN:-changeme-token}
+      AUTHENTIK_BOOTSTRAP_EMAIL: ${AUTHENTIK_BOOTSTRAP_EMAIL:-admin@localhost}
+      # Trust Caddy's X-Forwarded-* headers.
+      AUTHENTIK_LISTEN__TRUSTED_PROXY_CIDRS: "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,127.0.0.0/8"
+    volumes:
+      - authentik-media:/media
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:${AUTHENTIK_PORT_HTTP:-9000}:9000"
+      - "${BIND_ADDR:-127.0.0.1}:${AUTHENTIK_PORT_HTTPS:-9443}:9443"
+    depends_on:
+      postgresql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "ak", "healthcheck"]
+      start_period: 60s
+      interval: 10s
+      retries: 30
+      timeout: 5s
+
+  authentik-worker:
+    image: ${AUTHENTIK_IMAGE:-ghcr.io/goauthentik/server}:${AUTHENTIK_TAG:-2025.2.4}
+    command: worker
+    environment:
+      AUTHENTIK_REDIS__HOST: redis
+      AUTHENTIK_POSTGRESQL__HOST: postgresql
+      AUTHENTIK_POSTGRESQL__USER: ${PG_USER:-authentik}
+      AUTHENTIK_POSTGRESQL__NAME: ${PG_DB:-authentik}
+      AUTHENTIK_POSTGRESQL__PASSWORD: ${PG_PASS}
+      AUTHENTIK_SECRET_KEY: ${AUTHENTIK_SECRET_KEY}
+      AUTHENTIK_BOOTSTRAP_PASSWORD: ${AUTHENTIK_BOOTSTRAP_PASSWORD:-changeme-admin}
+      AUTHENTIK_BOOTSTRAP_TOKEN: ${AUTHENTIK_BOOTSTRAP_TOKEN:-changeme-token}
+      AUTHENTIK_BOOTSTRAP_EMAIL: ${AUTHENTIK_BOOTSTRAP_EMAIL:-admin@localhost}
+    volumes:
+      - authentik-media:/media
+    depends_on:
+      postgresql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  music-analyzer:
+    build:
+      context: ../..
+      dockerfile: e2e/authentik/Dockerfile.app
+    environment:
+      DATABASE_URL: file:/data/dev.db
+    volumes:
+      - app-data:/data
+
+  caddy:
+    image: docker.io/library/caddy:2-alpine
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:${CADDY_PORT_HTTP:-8080}:80"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+    depends_on:
+      - authentik-server
+      - music-analyzer
+
+volumes:
+  pg-data:
+  redis-data:
+  authentik-media:
+  app-data:
