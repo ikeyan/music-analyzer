@@ -14,7 +14,10 @@ RUN bun run build
 
 FROM oven/bun:1.3.13-slim AS runtime
 WORKDIR /app
-COPY --from=builder /app/dist ./dist
+# Flatten dist/ into /app so the bundled server resolves /static/* (relative
+# to CWD via root: "./") AND db:push and the server share the same CWD; this
+# keeps any relative DATABASE_URL pointing at the same SQLite file.
+COPY --from=builder /app/dist/ ./
 COPY --from=builder /app/node_modules ./node_modules
 COPY --from=builder /app/app/generated ./app/generated
 COPY --from=builder /app/prisma ./prisma
@@ -27,11 +30,7 @@ ENV PORT=3000
 # the image self-starting for ad-hoc `docker run` too.
 ENV DATABASE_URL=file:/data/dev.db
 EXPOSE 3000
-# 1) `db:push` (run from /app to find prisma.config.ts) syncs the SQLite
-#    schema; no-op when already up-to-date. Migrations aren't versioned yet,
-#    switch to `migrate deploy` once they are.
-# 2) `cd dist` so the bundled server resolves /static/* against /app/dist
-#    (it serves from `root: "./"` relative to CWD).
-# 3) `exec` so Bun becomes PID 1 and receives SIGTERM directly from
-#    `docker stop`, instead of the wrapping shell swallowing the signal.
-CMD ["sh", "-c", "bun run db:push && cd dist && exec bun run ./index.js"]
+# `db:push` syncs the SQLite schema (no-op when already up-to-date; migrations
+# aren't versioned yet, switch to `migrate deploy` once they are). `exec` so
+# Bun becomes PID 1 and receives SIGTERM from `docker stop` directly.
+CMD ["sh", "-c", "bun run db:push && exec bun run ./index.js"]
