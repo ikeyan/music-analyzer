@@ -27,7 +27,11 @@ ENV PORT=3000
 # the image self-starting for ad-hoc `docker run` too.
 ENV DATABASE_URL=file:/data/dev.db
 EXPOSE 3000
-# `db:push` syncs the schema to the SQLite file on every start (no-op when
-# already up-to-date). Migrations are not yet versioned in this repo; switch
-# to `migrate deploy` once they are.
-CMD ["sh", "-c", "bun run db:push && bun run ./dist/index.js"]
+# 1) `db:push` (run from /app to find prisma.config.ts) syncs the SQLite
+#    schema; no-op when already up-to-date. Migrations aren't versioned yet,
+#    switch to `migrate deploy` once they are.
+# 2) `cd dist` so the bundled server resolves /static/* against /app/dist
+#    (it serves from `root: "./"` relative to CWD).
+# 3) `exec` so Bun becomes PID 1 and receives SIGTERM directly from
+#    `docker stop`, instead of the wrapping shell swallowing the signal.
+CMD ["sh", "-c", "bun run db:push && cd dist && exec bun run ./index.js"]
