@@ -33,3 +33,45 @@ updates:
       prefix: deps
     labels:
       - dependencies
+
+  - package-ecosystem: docker
+    directory: /e2e/authentik
+    schedule:
+      interval: weekly
+    groups:
+      all:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+    ignore:
+      - dependency-name: "*"
+        update-types:
+          - version-update:semver-major
+    commit-message:
+      prefix: deps
+    labels:
+      - dependencies
+      - docker
+
+  - package-ecosystem: docker-compose
+    directory: /e2e/authentik
+    schedule:
+      interval: weekly
+    groups:
+      all:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+    ignore:
+      - dependency-name: "*"
+        update-types:
+          - version-update:semver-major
+    commit-message:
+      prefix: deps
+    labels:
+      - dependencies
+      - docker
