@@ -1,0 +1,15 @@
+.git
+.github
+.claude
+.vscode
+node_modules
+dist
+app/generated
+prisma/dev.db
+prisma/dev.db-journal
+*.log
+.env
+.env.*
+!.env.example
+README.md
+LICENSE
