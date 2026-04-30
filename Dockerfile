@@ -19,6 +19,7 @@ COPY --from=builder /app/node_modules ./node_modules
 COPY --from=builder /app/app/generated ./app/generated
 COPY --from=builder /app/prisma ./prisma
 COPY --from=builder /app/prisma.config.ts /app/package.json ./
+RUN mkdir -p /data
 ENV NODE_ENV=production
 ENV PORT=3000
 # `/data` is the conventional mount point for the SQLite file; compose / `docker
