@@ -21,6 +21,10 @@ COPY --from=builder /app/prisma ./prisma
 COPY --from=builder /app/prisma.config.ts /app/package.json ./
 ENV NODE_ENV=production
 ENV PORT=3000
+# `/data` is the conventional mount point for the SQLite file; compose / `docker
+# run -v` is expected to attach a persistent volume there. The default makes
+# the image self-starting for ad-hoc `docker run` too.
+ENV DATABASE_URL=file:/data/dev.db
 EXPOSE 3000
 # `db:push` syncs the schema to the SQLite file on every start (no-op when
 # already up-to-date). Migrations are not yet versioned in this repo; switch
