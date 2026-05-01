@@ -24,17 +24,16 @@ permissions:
   contents: read
 
 concurrency:
-  group: bun-pin-sync-${{ github.workflow }}-${{ github.ref }}
+  # On pull_request_target `github.ref` resolves to the base branch, so
+  # without a PR-specific suffix every PR's sync would land in the same
+  # group and `cancel-in-progress` would clobber sibling PRs mid-flight.
+  group: bun-pin-sync-${{ github.workflow }}-pr-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
 jobs:
   sync:
     name: sync bun pins to Dockerfile
     runs-on: ubuntu-24.04
-    # Forks don't grant the base-repo token push access to their head
-    # branch, so the push would 403. Skip cleanly there — the check job
-    # in ci.yml will still fail loudly if a fork PR ships drift.
-    if: github.event.pull_request.head.repo.full_name == github.repository
     permissions:
       contents: write
     steps:
@@ -58,6 +57,8 @@ jobs:
       - name: Sync .bun-version and package.json to Dockerfile
         env:
           PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           docker_tag=$(grep -oP '(?<=^FROM oven/bun:)\S+' e2e/authentik/Dockerfile.app)
@@ -67,6 +68,15 @@ jobs:
           if [ "$bun_file" = "$docker_tag" ] && [ "$pkg_manager" = "$docker_tag" ]; then
             echo "all three pins already match Dockerfile ($docker_tag); nothing to do"
             exit 0
+          fi
+
+          # Forks don't grant the base-repo token push access to the PR's
+          # head branch, so we can't auto-fix from here. Fall back to a
+          # read-only failure so drift is still blocked — fork contributors
+          # have to bump the other two pins themselves.
+          if [ "$PR_HEAD_REPO" != "$REPO" ]; then
+            echo "::error::bun pins drift from Dockerfile ($docker_tag) but auto-sync cannot push to forks. Bump .bun-version and package.json's packageManager to $docker_tag in your branch."
+            exit 1
           fi
 
           printf '%s\n' "$docker_tag" > .bun-version
