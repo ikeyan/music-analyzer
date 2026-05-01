@@ -1,6 +1,6 @@
 # Lightweight test image for music-analyzer. Runs the vite dev server so the
 # stack boots quickly without a full prod build. Not intended for production.
-FROM oven/bun:1.3.11
+FROM oven/bun:1.3.13
 
 WORKDIR /app
 
