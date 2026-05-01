@@ -1,0 +1,70 @@
+name: Bun pin sync
+
+# Dependabot only bumps Dockerfile.app's oven/bun tag; mirror it into .bun-version and package.json's packageManager.
+on:
+  # pull_request's GITHUB_TOKEN is read-only on Dependabot PRs.
+  pull_request_target:
+    paths:
+      - "e2e/authentik/Dockerfile.app"
+      - ".bun-version"
+      - "package.json"
+
+permissions:
+  contents: read
+
+concurrency:
+  # github.ref is the base branch on pull_request_target; key by PR number.
+  group: bun-pin-sync-${{ github.workflow }}-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  sync:
+    name: sync bun pins to Dockerfile
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@8d3c67de8e2fe68ef647c8db1e6a09f647780f40 # v2.19.0
+        with:
+          egress-policy: audit
+          disable-sudo: true
+
+      # pull_request_target defaults to checking out the base ref.
+      - name: Checkout PR head
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: true
+          show-progress: false
+
+      - name: Sync .bun-version and package.json to Dockerfile
+        env:
+          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          docker_tag=$(grep -oP '(?<=^FROM oven/bun:)\S+' e2e/authentik/Dockerfile.app)
+          bun_file=$(cat .bun-version)
+          pkg_manager=$(grep -oP '(?<="packageManager": "bun@)[^"]+' package.json)
+          echo "Dockerfile=$docker_tag .bun-version=$bun_file packageManager=$pkg_manager"
+          if [ "$bun_file" = "$docker_tag" ] && [ "$pkg_manager" = "$docker_tag" ]; then
+            echo "all three pins already match Dockerfile ($docker_tag); nothing to do"
+            exit 0
+          fi
+
+          # GITHUB_TOKEN can't push to a fork's head, so fail closed.
+          if [ "$PR_HEAD_REPO" != "$REPO" ]; then
+            echo "::error::bun pins drift from Dockerfile ($docker_tag) but auto-sync cannot push to forks. Bump .bun-version and package.json's packageManager to $docker_tag in your branch."
+            exit 1
+          fi
+
+          printf '%s\n' "$docker_tag" > .bun-version
+          perl -i -pe 's|(?<="packageManager": "bun\@)[^"]+|'"$docker_tag"'|' package.json
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add .bun-version package.json
+          git commit -m "ci: sync bun pins to ${docker_tag} from Dockerfile"
+          git push origin "HEAD:${PR_HEAD_REF}"

@@ -33,21 +33,16 @@ jobs:
           persist-credentials: false
           show-progress: false
 
-      # Bun's runtime version is pinned in three independent places that no
-      # single tool keeps in sync: .bun-version (read by setup-bun and mise /
-      # asdf), e2e/authentik/Dockerfile.app's FROM (Dependabot's docker
-      # ecosystem updates this one), and package.json's packageManager.
-      # Dependabot can only bump the Dockerfile, so this guard makes drift
-      # visible — when a Dependabot PR lands, this step fails until
-      # .bun-version and packageManager are bumped to match.
+      # PRs are auto-fixed by .github/workflows/bun-pin-sync.yml; this is the post-merge failsafe.
       - name: Verify bun version pins are in sync
+        if: github.event_name == 'push'
         run: |
           bun_file=$(cat .bun-version)
           docker_tag=$(grep -oP '(?<=^FROM oven/bun:)\S+' e2e/authentik/Dockerfile.app)
           pkg_manager=$(grep -oP '(?<="packageManager": "bun@)[^"]+' package.json)
           echo ".bun-version=$bun_file Dockerfile.app=$docker_tag packageManager=$pkg_manager"
           if [ "$bun_file" != "$docker_tag" ] || [ "$bun_file" != "$pkg_manager" ]; then
-            echo "::error::bun version pins disagree — bump all three to the same value"
+            echo "::error::bun version pins disagree on $GITHUB_REF — bun-pin-sync should have caught this on the PR"
             exit 1
           fi
 
