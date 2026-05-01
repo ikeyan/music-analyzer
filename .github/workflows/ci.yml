@@ -33,24 +33,11 @@ jobs:
           persist-credentials: false
           show-progress: false
 
-      # Bun's runtime version is pinned in three independent places that no
-      # single tool keeps in sync: .bun-version (read by setup-bun and mise /
-      # asdf), e2e/authentik/Dockerfile.app's FROM (Dependabot's docker
-      # ecosystem updates this one), and package.json's packageManager.
-      # Dependabot can only bump the Dockerfile, so this guard makes drift
-      # visible — when a Dependabot PR lands, this step fails until
-      # .bun-version and packageManager are bumped to match.
-      - name: Verify bun version pins are in sync
-        run: |
-          bun_file=$(cat .bun-version)
-          docker_tag=$(grep -oP '(?<=^FROM oven/bun:)\S+' e2e/authentik/Dockerfile.app)
-          pkg_manager=$(grep -oP '(?<="packageManager": "bun@)[^"]+' package.json)
-          echo ".bun-version=$bun_file Dockerfile.app=$docker_tag packageManager=$pkg_manager"
-          if [ "$bun_file" != "$docker_tag" ] || [ "$bun_file" != "$pkg_manager" ]; then
-            echo "::error::bun version pins disagree — bump all three to the same value"
-            exit 1
-          fi
-
+      # Bun's runtime version is pinned in three places (.bun-version,
+      # e2e/authentik/Dockerfile.app's FROM, package.json's packageManager).
+      # Dependabot only bumps the Dockerfile; .github/workflows/bun-pin-sync.yml
+      # auto-pushes a follow-up commit that brings the other two back in line
+      # using the Dockerfile tag as the source of truth.
       - name: Setup Bun
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:

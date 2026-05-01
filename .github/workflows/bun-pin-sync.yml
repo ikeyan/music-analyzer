@@ -1,0 +1,85 @@
+name: Bun pin sync
+
+# Bun's runtime version is pinned in three independent places: .bun-version
+# (read by setup-bun and mise / asdf), e2e/authentik/Dockerfile.app's FROM
+# (Dependabot's docker ecosystem updates this one), and package.json's
+# packageManager. Dependabot can only bump the Dockerfile, leaving the
+# other two behind. This workflow treats the Dockerfile tag as the source
+# of truth and auto-pushes a commit that brings the other two pins back in
+# line, so Dependabot PRs (and any human PR that touches one of these
+# files) self-heal without a maintainer round-trip.
+on:
+  # pull_request_target gives the workflow a writable GITHUB_TOKEN even on
+  # Dependabot-authored PRs, where the regular pull_request event token is
+  # downgraded to read-only. We never execute code from the PR head — we
+  # only read three text files and write back two — so the usual
+  # pull_request_target supply-chain caveat does not apply here.
+  pull_request_target:
+    paths:
+      - 'e2e/authentik/Dockerfile.app'
+      - '.bun-version'
+      - 'package.json'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bun-pin-sync-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sync:
+    name: sync bun pins to Dockerfile
+    runs-on: ubuntu-24.04
+    # Forks don't grant the base-repo token push access to their head
+    # branch, so the push would 403. Skip cleanly there — the check job
+    # in ci.yml will still fail loudly if a fork PR ships drift.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    permissions:
+      contents: write
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@8d3c67de8e2fe68ef647c8db1e6a09f647780f40 # v2.19.0
+        with:
+          egress-policy: audit
+          disable-sudo: true
+
+      # pull_request_target checks out the base ref by default; we need the
+      # PR head so we can read the proposed Dockerfile tag and push the
+      # sync commit on top of it. persist-credentials: true so `git push`
+      # can authenticate with GITHUB_TOKEN.
+      - name: Checkout PR head
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: true
+          show-progress: false
+
+      - name: Sync .bun-version and package.json to Dockerfile
+        env:
+          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        run: |
+          set -euo pipefail
+          docker_tag=$(grep -oP '(?<=^FROM oven/bun:)\S+' e2e/authentik/Dockerfile.app)
+          bun_file=$(cat .bun-version)
+          pkg_manager=$(grep -oP '(?<="packageManager": "bun@)[^"]+' package.json)
+          echo "Dockerfile=$docker_tag .bun-version=$bun_file packageManager=$pkg_manager"
+          if [ "$bun_file" = "$docker_tag" ] && [ "$pkg_manager" = "$docker_tag" ]; then
+            echo "all three pins already match Dockerfile ($docker_tag); nothing to do"
+            exit 0
+          fi
+
+          printf '%s\n' "$docker_tag" > .bun-version
+          # Use '|' as the sed delimiter so a literal '/' in a future tag
+          # (none today, but cheap insurance) wouldn't terminate the
+          # expression early.
+          tmp=$(mktemp)
+          sed 's|"packageManager": "bun@[^"]*"|"packageManager": "bun@'"$docker_tag"'"|' \
+            package.json > "$tmp"
+          mv "$tmp" package.json
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add .bun-version package.json
+          git commit -m "ci: sync bun pins to ${docker_tag} from Dockerfile"
+          git push origin "HEAD:${PR_HEAD_REF}"
