@@ -1,8 +1,8 @@
 name: Bun pin sync
 
-# Dependabot only bumps Dockerfile.app's oven/bun tag; mirror it into .bun-version and package.json's packageManager.
+# DependabotはDockerfile.appのoven/bunタグだけ上げるので.bun-versionとpackageManagerに反映する
 on:
-  # pull_request's GITHUB_TOKEN is read-only on Dependabot PRs.
+  # Dependabot PRではpull_requestのGITHUB_TOKENがread-only
   pull_request_target:
     paths:
       - "e2e/authentik/Dockerfile.app"
@@ -13,7 +13,7 @@ permissions:
   contents: read
 
 concurrency:
-  # github.ref is the base branch on pull_request_target; key by PR number.
+  # pull_request_targetでgithub.refはbase branchになるためPR番号で一意化
   group: bun-pin-sync-${{ github.workflow }}-pr-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
@@ -30,7 +30,7 @@ jobs:
           egress-policy: audit
           disable-sudo: true
 
-      # pull_request_target defaults to checking out the base ref.
+      # pull_request_targetはbase refを既定でcheckoutする
       - name: Checkout PR head
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -54,7 +54,7 @@ jobs:
             exit 0
           fi
 
-          # GITHUB_TOKEN can't push to a fork's head, so fail closed.
+          # GITHUB_TOKENはforkにpushできないのでfail close
           if [ "$PR_HEAD_REPO" != "$REPO" ]; then
             echo "::error::bun pins drift from Dockerfile ($docker_tag) but auto-sync cannot push to forks. Bump .bun-version and package.json's packageManager to $docker_tag in your branch."
             exit 1

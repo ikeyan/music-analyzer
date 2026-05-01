@@ -33,7 +33,7 @@ jobs:
           persist-credentials: false
           show-progress: false
 
-      # PRs are auto-fixed by .github/workflows/bun-pin-sync.yml; this is the post-merge failsafe.
+      # PR上はbun-pin-sync.ymlが自動修正するのでこれはpost-merge failsafe
       - name: Verify bun version pins are in sync
         if: github.event_name == 'push'
         run: |
@@ -111,10 +111,7 @@ jobs:
       - name: Generate Prisma Client
         run: bun run db:generate
 
-      # Fresh per-run secrets. These are only reachable over the runner's
-      # loopback, but generating them here keeps them out of the repo's
-      # history and rotates them every run. ::add-mask:: also hides them
-      # from the step logs if anything prints them.
+      # ::add-mask::でログ出力時にも秘匿される
       - name: Generate per-run secrets
         run: |
           pg_pass=$(openssl rand -hex 16)
@@ -129,11 +126,7 @@ jobs:
             echo "AUTHENTIK_BOOTSTRAP_TOKEN=$bootstrap_token"
           } >> "$GITHUB_ENV"
 
-      # Boot the stack directly (not via testcontainers) so containers stay up
-      # for log collection regardless of how the test step terminates. Pull
-      # the remote images and build the local one in parallel so the slow
-      # authentik download overlaps with the bun-based local build instead
-      # of serializing.
+      # testcontainers経由ではなく直接compose upすることでテスト失敗後もログ採取可能にする
       - name: Bring up authentik stack
         working-directory: e2e/authentik
         run: |
@@ -147,10 +140,7 @@ jobs:
           AUTHENTIK_PORT_HTTP=9000
           AUTHENTIK_PORT_HTTPS=9443
           EOF
-          # `wait` with no args always returns 0, so capture each PID and wait
-          # on it individually — otherwise a failed pull/build is silently
-          # ignored and `up --pull never` proceeds with stale or missing
-          # images.
+          # 引数なしwaitは常に0を返すのでPIDごとに個別待機する
           docker compose --env-file .env pull &
           pull_pid=$!
           docker compose --env-file .env build music-analyzer &
@@ -182,19 +172,13 @@ jobs:
             sleep 5
           done
 
-      # Provider/application/outpost binding and the outpost-endpoint wait
-      # live in the test itself (e2e/authentik/scripts/setup.ts, called from
-      # beforeAll) so the same setup path runs both locally and in CI.
       - name: Run authentik e2e
         env:
           AUTHENTIK_E2E_CADDY_URL: http://localhost:8080
           AUTHENTIK_E2E_AUTHENTIK_URL: http://localhost:9000
         run: bun run e2e:authentik
 
-      # Full compose logs go to $RUNNER_TEMP and get uploaded as an artifact
-      # so they survive the GH Actions UI (which occasionally fails to load
-      # logs) and can be grepped locally after the fact. A tail-200 summary
-      # per service also goes inline for a quick glance in the UI.
+      # 全ログをartifact化し、UI用にtail-200を各serviceについて表示
       - name: Collect compose logs and state
         if: always()
         working-directory: e2e/authentik
@@ -231,19 +215,12 @@ jobs:
         working-directory: e2e/authentik
         run: docker compose --env-file .env down --volumes --timeout 5 || true
 
-  # Fires only when every required job (check + e2e-authentik) succeeded;
-  # dependent jobs are skipped automatically when a `needs:` target fails.
-  # Purpose: surface a "PR is all-green" event that tools subscribed via
-  # GitHub's PR activity stream can react to — the default stream only
-  # forwards failures and comment *creates*, so we always POST a fresh
-  # comment (firing the create event) and sweep any previous marker'd
-  # comments to keep the PR to a single status comment.
+  # PRのactivity streamは失敗とcomment createしか流れないので、
+  # 全green時に毎回新規commentをpostしてcreateイベントを発火させる
   notify-pr-green:
     name: notify PR (all green)
     needs: [check, e2e-authentik]
-    # Skip on forks: GITHUB_TOKEN is downgraded to read-only there, so the
-    # comment POST would 403 and (because of `set -euo pipefail`) flip the
-    # job red on otherwise-passing PRs.
+    # forkはGITHUB_TOKENがread-onlyでcomment POSTが403になり緑PRが赤くなる
     if: >-
       github.event_name == 'pull_request' &&
       github.event.pull_request.head.repo.full_name == github.repository
@@ -274,10 +251,7 @@ jobs:
           auth_header="Authorization: Bearer $GH_TOKEN"
           accept_header='Accept: application/vnd.github+json'
 
-          # Snapshot existing marker'd comments BEFORE creating the new one
-          # so we don't accidentally delete the fresh one. Also match the
-          # legacy e2e-only marker so the one-off transitional comment left
-          # on the PR by an earlier version of this job gets cleaned up.
+          # 新規comment作成より前にidを採取しないと自分自身を消してしまう
           old_ids=$(curl -fsS -H "$auth_header" -H "$accept_header" \
             "$api/issues/$PR/comments?per_page=100" \
             | jq -r \

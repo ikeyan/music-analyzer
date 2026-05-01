@@ -1,24 +1,6 @@
-// Idempotent setup for the music-analyzer authentik objects.
-//
-// Callable from:
-//   - The e2e test's beforeAll (both self-managed and external modes)
-//   - The CLI (e.g. `bun run e2e/authentik/scripts/setup.ts`) for ad-hoc
-//     provisioning against a running stack.
-//
-// What it does:
-//   1. Waits for the default authorization + invalidation flows to exist
-//      (covers both the post-health auth-token propagation delay and the
-//      race against authentik's own blueprint worker).
-//   2. Creates the music-analyzer proxy provider (or finds it).
-//   3. Creates the music-analyzer application (or finds it).
-//   4. Binds the provider to the embedded outpost AND sets
-//      config.authentik_host — without the latter the embedded outpost
-//      refuses to serve /outpost.goauthentik.io/* and 404s every request.
-//   5. Waits for the outpost endpoint to return a status that proves auth is
-//      actually wired up — 2xx/3xx (the unauth redirect chain) or 401 — not
-//      just "anything but 404", which would let transient 5xx during boot
-//      slip through as "ready". Probes with the X-Forwarded-* headers that
-//      Caddy's forward_auth would send.
+// music-analyzer用authentik objectsをidempotentに用意する。
+// embedded outpostへのbindではconfig.authentik_hostも必須
+// (未設定だと/outpost.goauthentik.io/*が404)。
 
 const PROVIDER_NAME = "music-analyzer-provider";
 const APP_SLUG = "music-analyzer";
@@ -33,21 +15,13 @@ const POLL_INTERVAL_MS = 2_000;
 const PER_REQUEST_TIMEOUT_MS = 30_000;
 
 export interface SetupOptions {
-  /** Base URL of the authentik API, as reachable from this process. */
   authentikUrl: string;
-  /** Bearer token (typically AUTHENTIK_BOOTSTRAP_TOKEN). */
   token: string;
-  /** URL the user visits (what Caddy serves). Becomes provider.external_host. */
+  /** Caddy側URL。provider.external_hostになる */
   externalHost: string;
-  /**
-   * URL the outpost tells the user's browser to visit for login. For the
-   * standard loopback CI setup this is the same authentikUrl. Defaults to
-   * authentikUrl when not specified.
-   */
+  /** outpostがbrowserに案内するURL。未指定ならauthentikUrl */
   authentikHostForBrowser?: string;
-  /** Overall deadline for the entire setup. Defaults to 5 minutes. */
   timeoutMs?: number;
-  /** Log sink; defaults to console.log. Pass () => {} to silence. */
   log?: (msg: string) => void;
 }
 
@@ -64,11 +38,8 @@ export async function setupMusicAnalyzer(opts: SetupOptions): Promise<void> {
   const invFlowPk = await waitForFlow(api, authHeaders, INV_FLOW_SLUG, deadline, log);
   log(`  auth_flow_pk=${authFlowPk} inv_flow_pk=${invFlowPk}`);
 
-  // authentik enforces unique on Provider.name and Application.slug at the
-  // DB level, so two concurrent setups racing past `find` -> `create` end
-  // with the loser hitting a 400/409 rather than producing a duplicate.
-  // Catching that and re-finding makes the setup safe under concurrent
-  // calls without sequencing them externally.
+  // Provider.name/Application.slugはDB unique。並行setupはfind→createで負けて
+  // 400/409になるためensure*でcatch+再findする
   const providerPk = await ensureProvider(api, authHeaders, log, {
     authFlowPk,
     invFlowPk,
@@ -92,9 +63,7 @@ async function waitForFlow(
   deadline: number,
   log: (msg: string) => void,
 ): Promise<string> {
-  // Surface the first non-ok status / exception so a misconfigured token or
-  // unreachable host doesn't masquerade as "flow never appeared" five
-  // minutes later.
+  // 最初の失敗を残してtoken誤設定や到達不能を「flowが現れない」と誤認させない
   let firstFailureLogged = false;
   const noteFailure = (detail: string): void => {
     if (firstFailureLogged) return;
@@ -120,11 +89,8 @@ async function waitForFlow(
 }
 
 async function findProviderPk(api: string, auth: Record<string, string>): Promise<number | null> {
-  // The providers viewset exposes `name__iexact` as an exact filter; prefer
-  // that over the fuzzy + paginated `search` so a busy authentik instance
-  // can't push our exact match off the first page and trick us into
-  // re-creating the provider. Client-side `name === PROVIDER_NAME` stays as
-  // a safety net in case the filter is ever silently ignored.
+  // 完全一致filter (search はpagination漏れで再作成→409を招く)。
+  // 念のためclient側でも一致確認
   const res = await timedFetch(
     `${api}/providers/proxy/?name__iexact=${encodeURIComponent(PROVIDER_NAME)}`,
     {
@@ -153,9 +119,7 @@ async function ensureProvider(
     log(`created provider pk=${pk}`);
     return pk;
   } catch (err) {
-    // Race recovery: a concurrent setup might have created the provider
-    // between our find and our create. Re-find — if it's there now, reuse
-    // it; otherwise the create error was real, so re-throw.
+    // 並行createで負けた可能性があるので再find
     const second = await findProviderPk(api, auth);
     if (second !== null) {
       log(`provider was created concurrently, reusing pk=${second}`);
@@ -200,7 +164,6 @@ async function ensureApplication(
     await createApplication(api, auth, providerPk);
     log(`created application ${APP_SLUG}`);
   } catch (err) {
-    // Same race-recovery pattern as ensureProvider.
     if (await applicationExists(api, auth)) {
       log(`application ${APP_SLUG} was created concurrently, reusing`);
       return;
@@ -210,12 +173,7 @@ async function ensureApplication(
 }
 
 async function applicationExists(api: string, auth: Record<string, string>): Promise<boolean> {
-  // The applications viewset documents `slug` as an exact filter, so use
-  // that rather than the fuzzy + paginated `search` — in shared instances
-  // with many similarly named apps, search could push the exact match off
-  // the first page and we'd recreate the app, getting a 400 on the slug
-  // collision. Client-side `slug === APP_SLUG` stays as a safety net in
-  // case the filter is ever silently ignored.
+  // 完全一致filter (理由はfindProviderPkと同じ)
   const res = await timedFetch(`${api}/core/applications/?slug=${encodeURIComponent(APP_SLUG)}`, {
     headers: auth,
   });
@@ -259,9 +217,7 @@ async function bindEmbeddedOutpost(
     throw new Error(`embedded outpost (managed=${EMBEDDED_OUTPOST_MANAGED_KEY}) not found`);
   }
 
-  // Append + dedupe rather than replace: in external mode the embedded
-  // outpost may already gate other applications, and providers is a full-
-  // replacement field on PATCH (not a merge).
+  // providersはPATCHでmergeでなく全置換されるためappend+dedupe
   const existing = Array.isArray(embedded.providers) ? embedded.providers : [];
   const providers = Array.from(new Set([...existing, providerPk]));
 
@@ -294,11 +250,8 @@ async function waitForOutpostEndpoint(
   while (Date.now() < deadline) {
     try {
       const res = await timedFetch(url, { headers, redirect: "manual" });
-      // 2xx: outpost returned an allow decision (unlikely for an anon probe).
-      // 3xx: redirect into the login flow — the normal "gate is up" answer.
-      // 401: older authentik versions answer challenges this way.
-      // Anything else (404 while binding propagates, 5xx during boot, etc.)
-      // means the gate is not yet wired up — keep waiting.
+      // 2xx/3xx (login flowへredirect) または 401 (旧版) でready扱い。
+      // boot中の404/5xxは未配線として待つ
       const ready = (res.status >= 200 && res.status < 400) || res.status === 401;
       if (ready) return;
     } catch {
@@ -317,7 +270,6 @@ function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-// CLI entrypoint: `bun run e2e/authentik/scripts/setup.ts`
 if (import.meta.main) {
   const authentikUrl = process.env.AUTHENTIK_E2E_AUTHENTIK_URL || "http://localhost:9000";
   const caddyUrl = process.env.AUTHENTIK_E2E_CADDY_URL || "http://localhost:8080";

@@ -1,7 +1,5 @@
 #!/usr/bin/env bash
-# Build the prod Dockerfile, boot the container with an empty volume, probe
-# the root URL, then tear everything down. Use to sanity-check schema sync,
-# server boot, and port 3000 wiring before merging Dockerfile changes.
+# Dockerfile変更前後でschema sync / server boot / port疎通を確認するsmoke test
 set -euo pipefail
 
 IMAGE_TAG="music-analyzer:smoke"
@@ -35,8 +33,7 @@ for i in $(seq 1 30); do
 done
 [ "$status" = "200" ] || { echo "[fail] / no 200 within 30s; last status=$status" >&2; docker logs "$CONTAINER" >&2 || true; exit 1; }
 
-# Static assets resolve relative to the server's CWD; probe one to make sure
-# the bundled client is reachable (catches WORKDIR / `dist/` regressions).
+# static assetはCWD依存なのでWORKDIR/dist構成のregression検出用に1つ叩く
 asset_status=$(curl -s -o /dev/null -m 5 -w '%{http_code}' "http://127.0.0.1:$HOST_PORT/static/client.js" || echo 000)
 [ "$asset_status" = "200" ] || { echo "[fail] /static/client.js http=$asset_status" >&2; exit 1; }
 echo "[ok] /static/client.js http=200"
