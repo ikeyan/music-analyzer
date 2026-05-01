@@ -33,17 +33,7 @@ jobs:
           persist-credentials: false
           show-progress: false
 
-      # Bun's runtime version is pinned in three places (.bun-version,
-      # e2e/authentik/Dockerfile.app's FROM, package.json's packageManager).
-      # Dependabot only bumps the Dockerfile; .github/workflows/bun-pin-sync.yml
-      # auto-pushes a follow-up commit on PRs that brings the other two back
-      # in line using the Dockerfile tag as the source of truth.
-      #
-      # That workflow only fires on pull_request_target, so it can't catch
-      # drift that lands on main directly (admin push, or a PR merged before
-      # the sync run finished). This push-only verify is the failsafe — it
-      # stays silent on PRs (where bun-pin-sync owns the fix) and only
-      # screams when drift actually reaches main.
+      # PRs are auto-fixed by .github/workflows/bun-pin-sync.yml; this is the post-merge failsafe.
       - name: Verify bun version pins are in sync
         if: github.event_name == 'push'
         run: |
