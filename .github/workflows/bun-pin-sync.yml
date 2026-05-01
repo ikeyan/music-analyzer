@@ -80,13 +80,11 @@ jobs:
           fi
 
           printf '%s\n' "$docker_tag" > .bun-version
-          # Use '|' as the sed delimiter so a literal '/' in a future tag
-          # (none today, but cheap insurance) wouldn't terminate the
-          # expression early.
-          tmp=$(mktemp)
-          sed 's|"packageManager": "bun@[^"]*"|"packageManager": "bun@'"$docker_tag"'"|' \
-            package.json > "$tmp"
-          mv "$tmp" package.json
+          # Lookbehind asserts the prefix without consuming it, so the
+          # replacement only needs to be the new version — no need to
+          # rewrite the prefix on the RHS. sed has no lookarounds, hence
+          # perl. `\@` keeps perl from treating `@)` as array interpolation.
+          perl -i -pe 's|(?<="packageManager": "bun\@)[^"]+|'"$docker_tag"'|' package.json
 
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
