@@ -16,9 +16,9 @@ on:
   # pull_request_target supply-chain caveat does not apply here.
   pull_request_target:
     paths:
-      - 'e2e/authentik/Dockerfile.app'
-      - '.bun-version'
-      - 'package.json'
+      - "e2e/authentik/Dockerfile.app"
+      - ".bun-version"
+      - "package.json"
 
 permissions:
   contents: read
