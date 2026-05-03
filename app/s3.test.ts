@@ -21,11 +21,7 @@ let app: Hono;
 let originalEnv: Partial<Record<(typeof S3_ENV_VARS)[number], string | undefined>> = {};
 
 beforeAll(async () => {
-  // The official minio image does not support an "auto-create buckets" env
-  // var, so we pre-create the bucket directory before starting the server.
-  // Bun's S3Client does not expose a CreateBucket call, so this is the
-  // simplest way to get a usable bucket without pulling in aws-sdk purely
-  // for tests.
+  // minio imageにもBunのS3Clientにもbucket作成APIがないので起動前にディレクトリを作る
   container = await new GenericContainer(MINIO_IMAGE)
     .withExposedPorts(9000)
     .withEnvironment({
@@ -93,8 +89,7 @@ describe("/api/blobs", () => {
 
     const res = await app.request("/api/blobs/download.json");
     expect(res.status).toBe(200);
-    // JS Request constructors append ";charset=utf-8" to text content types,
-    // so we only assert the media type.
+    // Requestがcharset=utf-8を付与するので前方一致のみ
     expect(res.headers.get("content-type")).toMatch(/^application\/json/);
     expect(await res.json()).toEqual({ foo: "bar" });
   });

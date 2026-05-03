@@ -16,8 +16,7 @@ export const blobs = new Hono()
   .put("/:key{.+}", async (c) => {
     const key = c.req.param("key");
     const contentType = c.req.header("content-type") ?? "application/octet-stream";
-    // Pass the raw Request so Bun streams the body to S3 via multipart
-    // upload instead of buffering the entire payload in memory.
+    // bodyをbufferingせずstream uploadさせるためraw Requestを渡す
     const size = await getS3().write(key, c.req.raw, { type: contentType });
     return c.json({ key, size }, 201);
   })

@@ -1,19 +1,9 @@
-// Programmatic login against authentik, used by the e2e test to prove the
-// whole caddy -> authentik -> music-analyzer chain actually works, not just
-// the "unauthenticated users get redirected" plumbing.
-//
-// Approach: drive authentik's flow executor API directly, tracking cookies
-// across the authentik + caddy hosts and the authentik CSRF token.
-//
-// This is deliberately fetch-based rather than Playwright-based — no browser
-// dependency, <200 LOC, fast. It does couple to authentik's flow structure,
-// so if the default-authentication-flow stages change (e.g. a new MFA stage
-// gets added by default) the stage handler below needs extending.
+// authentikのflow executor APIを直接叩いてe2e loginを行う。
+// default-authentication-flowに新stage (例: MFA) が追加されたら
+// buildStagePayloadの拡張が必要。
 
 export class CookieJar {
-  // Keyed by host; path / secure / samesite attributes are ignored on
-  // purpose — the test talks to loopback URLs only so the extra bookkeeping
-  // buys nothing.
+  // loopback前提のためpath/secure/samesiteは無視
   private byHost = new Map<string, Map<string, string>>();
 
   store(url: string, res: Response): void {
@@ -48,7 +38,7 @@ export async function jarFetch(jar: CookieJar, url: string, init?: RequestInit):
   const headers = new Headers(init?.headers);
   const cookie = jar.headerFor(url);
   if (cookie) headers.set("cookie", cookie);
-  // authentik's DRF endpoints expect CSRF token echoed from the cookie.
+  // authentikのDRFはcookieのCSRFトークンをheaderにecho必須
   const csrf = jar.get(new URL(url).host, "authentik_csrf");
   if (csrf && !headers.has("x-csrftoken")) headers.set("x-csrftoken", csrf);
   if (!headers.has("referer")) headers.set("referer", url);
@@ -77,7 +67,6 @@ async function followRedirects(
     console.log(`  [follow] #${i} ${method} ${url} -> ${res.status} ${loc ?? "(no Location)"}`);
     if (!loc) return res;
     url = new URL(loc, url).toString();
-    // Per HTTP: redirects convert POST to GET and drop the body.
     method = "GET";
     body = undefined;
     headers = undefined;
@@ -86,31 +75,19 @@ async function followRedirects(
 }
 
 export interface LoginOptions {
-  /** Base URL of authentik, as reachable from this process. */
   authentikUrl: string;
-  /** Base URL of the Caddy front-end serving the gated upstream. */
   caddyUrl: string;
   username: string;
   password: string;
-  /**
-   * Authentication flow slug. Defaults to "default-authentication-flow"
-   * which ships with authentik and handles ak-stage-identification +
-   * ak-stage-password for the built-in akadmin user.
-   */
   flowSlug?: string;
 }
 
-/**
- * Log into authentik and then follow the OAuth callback so the returned jar
- * carries both the authentik session cookie (on the authentik host) and the
- * proxy session cookie (on the caddy host) that forward_auth will recognise.
- */
 export async function loginAndAuthorize(opts: LoginOptions): Promise<CookieJar> {
   const jar = new CookieJar();
   const flowSlug = opts.flowSlug ?? "default-authentication-flow";
   const flowUrl = `${opts.authentikUrl.replace(/\/$/, "")}/api/v3/flows/executor/${flowSlug}/`;
 
-  // Kick off the flow (also seeds the authentik_csrf cookie).
+  // 初回GETでauthentik_csrf cookieも仕込まれる
   const startRes = await jarFetch(jar, flowUrl, {
     headers: { accept: "application/json" },
   });
@@ -130,11 +107,8 @@ export async function loginAndAuthorize(opts: LoginOptions): Promise<CookieJar> 
       headers: { accept: "application/json", "content-type": "application/json" },
       body: JSON.stringify(payload),
     });
-    // authentik answers a stage POST with Post-Redirect-Get, and can chain
-    // the redirect once more (e.g. /executor/<slug>/ -> /executor/<slug>/?query=...).
-    // Follow up to 5 hops so the final GET returns the next stage JSON.
-    // Keep accept: application/json on every hop so the executor never
-    // falls through to its HTML renderer.
+    // authentikはstage POST後Post-Redirect-Getを更にチェーンしうる。
+    // accept: application/jsonを保ってHTML rendererに落ちないようにする
     let hops = 0;
     while (res.status >= 300 && res.status < 400) {
       if (hops++ >= 5) {
@@ -160,8 +134,7 @@ export async function loginAndAuthorize(opts: LoginOptions): Promise<CookieJar> 
     stage = (await res.json()) as Record<string, unknown>;
   }
 
-  // Hitting Caddy's root now bounces through the outpost and OAuth callback;
-  // follow the chain so the proxy session cookie lands on the Caddy host.
+  // Caddy hostにproxy session cookieを着地させるためOAuth callbackチェーンを辿る
   const landing = await followRedirects(jar, `${opts.caddyUrl.replace(/\/$/, "")}/`);
   if (landing.status !== 200) {
     throw new Error(
