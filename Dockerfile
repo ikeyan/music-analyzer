@@ -4,8 +4,7 @@ COPY package.json bun.lock ./
 RUN bun install --frozen-lockfile
 COPY prisma/ ./prisma/
 COPY prisma.config.ts ./
-# prisma.config.tsはload時にDATABASE_URLを要求するがdb:generateはDB I/Oしない
-RUN DATABASE_URL=file:/tmp/build.db bun run db:generate
+RUN bun run db:generate
 COPY tsconfig.json vite.config.ts ./
 COPY app/ ./app/
 RUN bun run build
