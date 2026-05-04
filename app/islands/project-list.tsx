@@ -32,7 +32,7 @@ export default function ProjectList({ initial }: { initial: ProjectSummary[] }) 
       const body = (await res.json()) as {
         project: { id: string; name: string; createdAt: string };
       };
-      setItems([
+      setItems((prev) => [
         {
           id: body.project.id,
           name: body.project.name,
@@ -40,7 +40,7 @@ export default function ProjectList({ initial }: { initial: ProjectSummary[] }) 
           videoCount: 0,
           audioCount: 0,
         },
-        ...items,
+        ...prev,
       ]);
       setName("");
     } catch (err) {
@@ -54,7 +54,7 @@ export default function ProjectList({ initial }: { initial: ProjectSummary[] }) 
     if (!confirm("プロジェクトを削除しますか？")) return;
     const res = await fetch(`/api/projects/${id}`, { method: "DELETE" });
     if (res.ok || res.status === 204) {
-      setItems(items.filter((p) => p.id !== id));
+      setItems((prev) => prev.filter((p) => p.id !== id));
     } else {
       setError(`削除失敗 (HTTP ${res.status})`);
     }

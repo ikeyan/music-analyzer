@@ -30,11 +30,15 @@ async function findProjectOr404(userId: string, projectId: string) {
 type TxClient = Parameters<Parameters<typeof prisma.$transaction>[0]>[0];
 
 // (projectId, order) のunique制約と projStart の隣接配置を満たす次スロットを採取する。
-// 呼び出しは tx 内で行い、create と原子化する
+// 呼び出しは tx 内で行い、create と原子化する。
+// video/audio の unique は table 別なので片方だけでは cross-table race を防げない。
+// project行を先に update して SQLite の write lock を獲得し、同一 project への
+// 並行 alloc を直列化する
 async function allocSlot(
   tx: TxClient,
   projectId: string,
 ): Promise<{ order: number; projStart: number }> {
+  await tx.project.update({ where: { id: projectId }, data: { updatedAt: new Date() } });
   const [vOrder, aOrder, vEnd, aEnd] = await Promise.all([
     tx.video.findFirst({
       where: { projectId },
