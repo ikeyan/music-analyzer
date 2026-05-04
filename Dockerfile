@@ -1,3 +1,5 @@
+FROM mwader/static-ffmpeg:7.1.1 AS ffmpeg
+
 FROM oven/bun:1.3.13 AS builder
 WORKDIR /app
 COPY package.json bun.lock ./
@@ -11,6 +13,8 @@ RUN bun run build
 
 FROM oven/bun:1.3.13-slim AS runtime
 WORKDIR /app
+COPY --from=ffmpeg /ffmpeg /usr/local/bin/ffmpeg
+COPY --from=ffmpeg /ffprobe /usr/local/bin/ffprobe
 # server (root: "./")とdb:pushでCWDを揃えるためdist/を/appに展開
 COPY --from=builder /app/dist/ ./
 COPY --from=builder /app/node_modules ./node_modules
