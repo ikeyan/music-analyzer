@@ -103,7 +103,12 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
     for (const t of tracks) {
       const el = mediaRefs.current.get(trackKey(t));
       if (!el) continue;
-      syncMediaElement(el, t.data, currentTime, playing);
+      syncMediaElement(el, t.data, currentTime, playing, () => {
+        setPlaying(false);
+        setError(
+          "ブラウザのautoplay制限で再生できませんでした。もう一度再生ボタンを押してください。",
+        );
+      });
     }
   }, [tracks, currentTime, playing]);
 
@@ -151,6 +156,35 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
     }
   }
 
+  // ブラウザのautoplay policyはuser-gesture同期コンテキストで呼ばれた play() しか許さない。
+  // useEffect 経由だと初回再生で NotAllowedError になるので、クリックハンドラ内で
+  // 全媒体を一度 play() して unlock した上で playing=true にする
+  function startPlayback() {
+    let blocked = false;
+    for (const t of tracks) {
+      const el = mediaRefs.current.get(trackKey(t));
+      if (!el) continue;
+      const projLow = Math.min(t.data.projStartSec, t.data.projEndSec);
+      const projHigh = Math.max(t.data.projStartSec, t.data.projEndSec);
+      const inRange = currentTime >= projLow && currentTime <= projHigh;
+      const promise = el.play();
+      if (promise && typeof promise.catch === "function") {
+        promise.catch((err: unknown) => {
+          // pause() を被せた時の AbortError は想定内、それ以外は autoplay block
+          if (err instanceof DOMException && err.name === "AbortError") return;
+          if (!blocked) {
+            blocked = true;
+            setPlaying(false);
+            setError("ブラウザのautoplay制限で再生できませんでした。もう一度押してください。");
+          }
+        });
+      }
+      if (!inRange) el.pause();
+    }
+    setError(null);
+    setPlaying(true);
+  }
+
   async function deleteTrack(t: Track) {
     if (!confirm("削除しますか？")) return;
     const url =
@@ -193,7 +227,11 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
       <section
         style={{ display: "flex", alignItems: "center", gap: "0.75rem", margin: "0.75rem 0" }}
       >
-        <button type="button" onClick={() => setPlaying(!playing)} disabled={tracks.length === 0}>
+        <button
+          type="button"
+          onClick={() => (playing ? setPlaying(false) : startPlayback())}
+          disabled={tracks.length === 0}
+        >
           {playing ? "一時停止" : "再生"}
         </button>
         <button
@@ -274,6 +312,7 @@ function syncMediaElement(
   item: VideoItem | AudioItem,
   projTime: number,
   playing: boolean,
+  onPlayError?: (err: unknown) => void,
 ): void {
   const projLow = Math.min(item.projStartSec, item.projEndSec);
   const projHigh = Math.max(item.projStartSec, item.projEndSec);
@@ -301,7 +340,10 @@ function syncMediaElement(
   }
   if (playing) {
     if (el.paused) {
-      void el.play().catch(() => {});
+      void el.play().catch((err: unknown) => {
+        if (err instanceof DOMException && err.name === "AbortError") return;
+        onPlayError?.(err);
+      });
     }
   } else if (!el.paused) {
     el.pause();
