@@ -151,7 +151,11 @@ export const projects = new Hono<AuthContext>()
       if (!probe.videoStream) {
         return { error: "no video stream", status: 400 as const };
       }
-      if (probe.durationSec <= 0 || probe.durationSec > MAX_DURATION_SEC) {
+      if (
+        !Number.isFinite(probe.durationSec) ||
+        probe.durationSec <= 0 ||
+        probe.durationSec > MAX_DURATION_SEC
+      ) {
         return { error: `duration must be > 0 and <= ${MAX_DURATION_SEC}s`, status: 400 as const };
       }
 
@@ -166,6 +170,9 @@ export const projects = new Hono<AuthContext>()
       const finalProbe = await ffprobe(videoOut);
       const v = finalProbe.videoStream;
       if (!v) return { error: "transcode produced no video stream", status: 500 as const };
+      if (!Number.isFinite(finalProbe.durationSec) || finalProbe.durationSec <= 0) {
+        return { error: "transcode produced unknown duration", status: 500 as const };
+      }
 
       const thumbs = await extractThumbnails(
         videoOut,
@@ -308,7 +315,11 @@ export const projects = new Hono<AuthContext>()
       await Bun.write(inputPath, file);
       const probe = await ffprobe(inputPath);
       if (!probe.audioStream) return { error: "no audio stream", status: 400 as const };
-      if (probe.durationSec <= 0 || probe.durationSec > MAX_DURATION_SEC) {
+      if (
+        !Number.isFinite(probe.durationSec) ||
+        probe.durationSec <= 0 ||
+        probe.durationSec > MAX_DURATION_SEC
+      ) {
         return { error: `duration must be > 0 and <= ${MAX_DURATION_SEC}s`, status: 400 as const };
       }
 
