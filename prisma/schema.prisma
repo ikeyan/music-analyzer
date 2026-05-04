@@ -39,7 +39,7 @@ model Video {
   name      String
 
   videoKey String
-  audioKey String
+  audioKey String?
 
   durationSec  Float
   width        Int

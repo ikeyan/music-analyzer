@@ -113,7 +113,14 @@ async function runFfmpeg(args: string[]): Promise<void> {
 }
 
 // 1080p / 60fps / 8Mbps / yuv420p / H.264+AAC stereo 48kHzへ正規化
-export async function transcodeVideo(input: string, output: string): Promise<void> {
+export async function transcodeVideo(
+  input: string,
+  output: string,
+  hasAudio: boolean,
+): Promise<void> {
+  const audioArgs = hasAudio
+    ? ["-c:a", "aac", "-profile:a", "aac_low", "-ar", "48000", "-ac", "2", "-b:a", "192k"]
+    : ["-an"];
   await runFfmpeg([
     "-i",
     input,
@@ -133,16 +140,7 @@ export async function transcodeVideo(input: string, output: string): Promise<voi
     "16M",
     "-pix_fmt",
     "yuv420p",
-    "-c:a",
-    "aac",
-    "-profile:a",
-    "aac_low",
-    "-ar",
-    "48000",
-    "-ac",
-    "2",
-    "-b:a",
-    "192k",
+    ...audioArgs,
     "-movflags",
     "+faststart",
     "-f",

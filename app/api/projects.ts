@@ -117,7 +117,10 @@ export const projects = new Hono<AuthContext>()
     }
     const name = (form.get("name") as string | null)?.trim() || file.name || "video";
 
-    const created = await withTempDir("video-upload", async (tmp) => {
+    // S3に全オブジェクトを置いた後にDB rowを作る (失敗時は孤立S3で済み、broken rowは残らない)
+    const videoId = crypto.randomUUID();
+
+    const result = await withTempDir("video-upload", async (tmp) => {
       const inputPath = join(tmp, "input" + (extname(file.name) || ".bin"));
       await Bun.write(inputPath, file);
 
@@ -129,10 +132,14 @@ export const projects = new Hono<AuthContext>()
         return { error: `duration must be > 0 and <= ${MAX_DURATION_SEC}s`, status: 400 as const };
       }
 
+      const hasAudio = probe.audioStream !== null;
       const videoOut = join(tmp, "video.mp4");
       const audioOut = join(tmp, "audio.m4a");
       const thumbDir = join(tmp, "thumbs");
-      await Promise.all([transcodeVideo(inputPath, videoOut), extractAudio(inputPath, audioOut)]);
+      const tasks: Promise<unknown>[] = [transcodeVideo(inputPath, videoOut, hasAudio)];
+      if (hasAudio) tasks.push(extractAudio(inputPath, audioOut));
+      await Promise.all(tasks);
+
       const finalProbe = await ffprobe(videoOut);
       const v = finalProbe.videoStream;
       if (!v) return { error: "transcode produced no video stream", status: 500 as const };
@@ -145,62 +152,66 @@ export const projects = new Hono<AuthContext>()
         v.height,
       );
 
+      const vKey = videoSourceKey(project.id, videoId);
+      const aKey = hasAudio ? videoAudioKey(project.id, videoId) : null;
+
+      try {
+        await Promise.all([
+          uploadFile(vKey, videoOut, "video/mp4"),
+          ...(aKey ? [uploadFile(aKey, audioOut, "audio/mp4")] : []),
+          ...thumbs.map((t) =>
+            uploadFile(videoThumbKey(project.id, videoId, t.atSec), t.path, "image/jpeg"),
+          ),
+        ]);
+      } catch (err) {
+        await deletePrefix(`${projectKey(project.id)}/videos/${videoId}/`).catch(() => {});
+        throw err;
+      }
+
       const order = await nextOrder(project.id);
       const projStart = await nextProjStart(project.id);
       const duration = finalProbe.durationSec;
 
-      const row = await prisma.video.create({
-        data: {
-          projectId: project.id,
-          order,
-          name,
-          videoKey: "pending",
-          audioKey: "pending",
-          durationSec: duration,
-          width: v.width,
-          height: v.height,
-          fps: v.fps,
-          videoBitrate: v.bitrate,
-          audioBitrate: finalProbe.audioStream?.bitrate ?? null,
-          sizeBytes: finalProbe.sizeBytes,
-          srcStartSec: 0,
-          srcEndSec: duration,
-          projStartSec: projStart,
-          projEndSec: projStart + duration,
-        },
-      });
-
-      const vKey = videoSourceKey(project.id, row.id);
-      const aKey = videoAudioKey(project.id, row.id);
-      await Promise.all([
-        uploadFile(vKey, videoOut, "video/mp4"),
-        uploadFile(aKey, audioOut, "audio/mp4"),
-        ...thumbs.map((t) =>
-          uploadFile(videoThumbKey(project.id, row.id, t.atSec), t.path, "image/jpeg"),
-        ),
-      ]);
-
-      const updated = await prisma.video.update({
-        where: { id: row.id },
-        data: {
-          videoKey: vKey,
-          audioKey: aKey,
-          thumbnails: {
-            create: thumbs.map((t) => ({
-              atSec: t.atSec,
-              key: videoThumbKey(project.id, row.id, t.atSec),
-              width: t.width,
-              height: t.height,
-            })),
+      try {
+        const row = await prisma.video.create({
+          data: {
+            id: videoId,
+            projectId: project.id,
+            order,
+            name,
+            videoKey: vKey,
+            audioKey: aKey,
+            durationSec: duration,
+            width: v.width,
+            height: v.height,
+            fps: v.fps,
+            videoBitrate: v.bitrate,
+            audioBitrate: finalProbe.audioStream?.bitrate ?? null,
+            sizeBytes: finalProbe.sizeBytes,
+            srcStartSec: 0,
+            srcEndSec: duration,
+            projStartSec: projStart,
+            projEndSec: projStart + duration,
+            thumbnails: {
+              create: thumbs.map((t) => ({
+                atSec: t.atSec,
+                key: videoThumbKey(project.id, videoId, t.atSec),
+                width: t.width,
+                height: t.height,
+              })),
+            },
           },
-        },
-        include: { thumbnails: { orderBy: { atSec: "asc" } } },
-      });
-      return { video: updated };
+          include: { thumbnails: { orderBy: { atSec: "asc" } } },
+        });
+        return { video: row };
+      } catch (err) {
+        await deletePrefix(`${projectKey(project.id)}/videos/${videoId}/`).catch(() => {});
+        throw err;
+      }
     });
 
-    if ("error" in created) return c.json({ error: created.error }, created.status);
-    return c.json({ video: created.video }, 201);
+    if ("error" in result) return c.json({ error: result.error }, result.status);
+    return c.json({ video: result.video }, 201);
   })
 
   .delete("/:id/videos/:videoId", async (c) => {
@@ -235,7 +246,7 @@ export const projects = new Hono<AuthContext>()
     const video = await prisma.video.findFirst({
       where: { id: c.req.param("videoId"), projectId: project.id },
     });
-    if (!video) return c.notFound();
+    if (!video || !video.audioKey) return c.notFound();
     return await streamS3(c, video.audioKey, "audio/mp4");
   })
 
@@ -264,7 +275,9 @@ export const projects = new Hono<AuthContext>()
     const ext = (extname(file.name) || ".bin").slice(1).toLowerCase();
     const contentType = file.type || "application/octet-stream";
 
-    const created = await withTempDir("audio-upload", async (tmp) => {
+    const audioId = crypto.randomUUID();
+
+    const result = await withTempDir("audio-upload", async (tmp) => {
       const inputPath = join(tmp, "input." + ext);
       await Bun.write(inputPath, file);
       const probe = await ffprobe(inputPath);
@@ -273,41 +286,48 @@ export const projects = new Hono<AuthContext>()
         return { error: `duration must be > 0 and <= ${MAX_DURATION_SEC}s`, status: 400 as const };
       }
 
+      const key = audioSourceKey(project.id, audioId, ext);
+      try {
+        await uploadFile(key, inputPath, contentType);
+      } catch (err) {
+        await deletePrefix(`${projectKey(project.id)}/audios/${audioId}/`).catch(() => {});
+        throw err;
+      }
+
       const order = await nextOrder(project.id);
       const projStart = await nextProjStart(project.id);
       const duration = probe.durationSec;
 
-      const row = await prisma.audio.create({
-        data: {
-          projectId: project.id,
-          order,
-          name,
-          audioKey: "pending",
-          contentType,
-          durationSec: duration,
-          sampleRate: probe.audioStream.sampleRate || null,
-          channels: probe.audioStream.channels || null,
-          bitrate: probe.audioStream.bitrate,
-          sizeBytes: probe.sizeBytes,
-          srcStartSec: 0,
-          srcEndSec: duration,
-          projStartSec: projStart,
-          projEndSec: projStart + duration,
-        },
-      });
-
-      const key = audioSourceKey(project.id, row.id, ext);
-      await uploadFile(key, inputPath, contentType);
-      const updated = await prisma.audio.update({
-        where: { id: row.id },
-        data: { audioKey: key },
-      });
-      await unlink(inputPath).catch(() => {});
-      return { audio: updated };
+      try {
+        const row = await prisma.audio.create({
+          data: {
+            id: audioId,
+            projectId: project.id,
+            order,
+            name,
+            audioKey: key,
+            contentType,
+            durationSec: duration,
+            sampleRate: probe.audioStream.sampleRate || null,
+            channels: probe.audioStream.channels || null,
+            bitrate: probe.audioStream.bitrate,
+            sizeBytes: probe.sizeBytes,
+            srcStartSec: 0,
+            srcEndSec: duration,
+            projStartSec: projStart,
+            projEndSec: projStart + duration,
+          },
+        });
+        await unlink(inputPath).catch(() => {});
+        return { audio: row };
+      } catch (err) {
+        await deletePrefix(`${projectKey(project.id)}/audios/${audioId}/`).catch(() => {});
+        throw err;
+      }
     });
 
-    if ("error" in created) return c.json({ error: created.error }, created.status);
-    return c.json({ audio: created.audio }, 201);
+    if ("error" in result) return c.json({ error: result.error }, result.status);
+    return c.json({ audio: result.audio }, 201);
   })
 
   .delete("/:id/audios/:audioId", async (c) => {

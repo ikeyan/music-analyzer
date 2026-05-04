@@ -15,7 +15,7 @@ export type VideoItem = {
   projStartSec: number;
   projEndSec: number;
   streamUrl: string;
-  audioUrl: string;
+  audioUrl: string | null;
   thumbnails: Thumb[];
 };
 export type AudioItem = {
@@ -602,6 +602,7 @@ type ServerProject = {
   id: string;
   name: string;
   videos: (Omit<VideoItem, "streamUrl" | "audioUrl" | "thumbnails"> & {
+    audioKey: string | null;
     thumbnails: { id: string; atSec: number; key: string; width: number; height: number }[];
   })[];
   audios: Omit<AudioItem, "streamUrl">[];
@@ -614,7 +615,7 @@ function toClient(p: ServerProject): ProjectDetailData {
     videos: p.videos.map((v) => ({
       ...v,
       streamUrl: `/api/projects/${p.id}/videos/${v.id}/stream`,
-      audioUrl: `/api/projects/${p.id}/videos/${v.id}/audio`,
+      audioUrl: v.audioKey ? `/api/projects/${p.id}/videos/${v.id}/audio` : null,
       thumbnails: v.thumbnails.map((t) => ({
         id: t.id,
         atSec: t.atSec,

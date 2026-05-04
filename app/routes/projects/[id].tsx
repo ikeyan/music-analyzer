@@ -32,7 +32,7 @@ export default createRoute(requireUser, async (c) => {
       projStartSec: v.projStartSec,
       projEndSec: v.projEndSec,
       streamUrl: `/api/projects/${project.id}/videos/${v.id}/stream`,
-      audioUrl: `/api/projects/${project.id}/videos/${v.id}/audio`,
+      audioUrl: v.audioKey ? `/api/projects/${project.id}/videos/${v.id}/audio` : null,
       thumbnails: v.thumbnails.map((t) => ({
         id: t.id,
         atSec: t.atSec,
