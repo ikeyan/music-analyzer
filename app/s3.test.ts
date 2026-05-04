@@ -1,8 +1,8 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { Hono } from "hono";
 import { GenericContainer, type StartedTestContainer, Wait } from "testcontainers";
+import { MINIO_IMAGE } from "./test-images";
 
-const MINIO_IMAGE = "minio/minio:RELEASE.2025-09-07T16-13-09Z";
 const MINIO_USER = "minioadmin";
 const MINIO_PASSWORD = "minioadmin";
 const TEST_BUCKET = "test-bucket";
