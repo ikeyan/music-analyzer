@@ -17,10 +17,14 @@ export async function uploadFile(key: string, path: string, contentType: string)
 
 export async function deletePrefix(prefix: string): Promise<void> {
   const s3 = getS3();
-  const result = await s3.list({ prefix });
-  for (const obj of result.contents ?? []) {
-    if (obj.key) await s3.delete(obj.key);
-  }
+  let continuationToken: string | undefined;
+  do {
+    const result = await s3.list({ prefix, continuationToken });
+    for (const obj of result.contents ?? []) {
+      if (obj.key) await s3.delete(obj.key);
+    }
+    continuationToken = result.isTruncated ? result.nextContinuationToken : undefined;
+  } while (continuationToken);
 }
 
 export async function streamS3(

@@ -27,36 +27,55 @@ async function findProjectOr404(userId: string, projectId: string) {
   return p;
 }
 
-async function nextOrder(projectId: string): Promise<number> {
-  const [v, a] = await Promise.all([
-    prisma.video.findFirst({
+type TxClient = Parameters<Parameters<typeof prisma.$transaction>[0]>[0];
+
+// (projectId, order) のunique制約と projStart の隣接配置を満たす次スロットを採取する。
+// 呼び出しは tx 内で行い、create と原子化する
+async function allocSlot(
+  tx: TxClient,
+  projectId: string,
+): Promise<{ order: number; projStart: number }> {
+  const [vOrder, aOrder, vEnd, aEnd] = await Promise.all([
+    tx.video.findFirst({
       where: { projectId },
       orderBy: { order: "desc" },
       select: { order: true },
     }),
-    prisma.audio.findFirst({
+    tx.audio.findFirst({
       where: { projectId },
       orderBy: { order: "desc" },
       select: { order: true },
+    }),
+    tx.video.findFirst({
+      where: { projectId },
+      orderBy: { projEndSec: "desc" },
+      select: { projEndSec: true },
+    }),
+    tx.audio.findFirst({
+      where: { projectId },
+      orderBy: { projEndSec: "desc" },
+      select: { projEndSec: true },
     }),
   ]);
-  return Math.max(v?.order ?? -1, a?.order ?? -1) + 1;
+  return {
+    order: Math.max(vOrder?.order ?? -1, aOrder?.order ?? -1) + 1,
+    projStart: Math.max(vEnd?.projEndSec ?? 0, aEnd?.projEndSec ?? 0),
+  };
 }
 
-async function nextProjStart(projectId: string): Promise<number> {
-  const [v, a] = await Promise.all([
-    prisma.video.findFirst({
-      where: { projectId },
-      orderBy: { projEndSec: "desc" },
-      select: { projEndSec: true },
-    }),
-    prisma.audio.findFirst({
-      where: { projectId },
-      orderBy: { projEndSec: "desc" },
-      select: { projEndSec: true },
-    }),
-  ]);
-  return Math.max(v?.projEndSec ?? 0, a?.projEndSec ?? 0);
+// SQLite + Prisma は transaction で write を直列化するが、保険として
+// (projectId, order) のunique衝突 (P2002) はリトライする
+async function withSlotRetry<T>(fn: () => Promise<T>): Promise<T> {
+  const MAX_ATTEMPTS = 5;
+  for (let i = 0; i < MAX_ATTEMPTS; i++) {
+    try {
+      return await fn();
+    } catch (err) {
+      const code = (err as { code?: string } | null)?.code;
+      if (code !== "P2002" || i === MAX_ATTEMPTS - 1) throw err;
+    }
+  }
+  throw new Error("unreachable");
 }
 
 export const projects = new Hono<AuthContext>()
@@ -168,41 +187,44 @@ export const projects = new Hono<AuthContext>()
         throw err;
       }
 
-      const order = await nextOrder(project.id);
-      const projStart = await nextProjStart(project.id);
       const duration = finalProbe.durationSec;
 
       try {
-        const row = await prisma.video.create({
-          data: {
-            id: videoId,
-            projectId: project.id,
-            order,
-            name,
-            videoKey: vKey,
-            audioKey: aKey,
-            durationSec: duration,
-            width: v.width,
-            height: v.height,
-            fps: v.fps,
-            videoBitrate: v.bitrate,
-            audioBitrate: finalProbe.audioStream?.bitrate ?? null,
-            sizeBytes: finalProbe.sizeBytes,
-            srcStartSec: 0,
-            srcEndSec: duration,
-            projStartSec: projStart,
-            projEndSec: projStart + duration,
-            thumbnails: {
-              create: thumbs.map((t) => ({
-                atSec: t.atSec,
-                key: videoThumbKey(project.id, videoId, t.atSec),
-                width: t.width,
-                height: t.height,
-              })),
-            },
-          },
-          include: { thumbnails: { orderBy: { atSec: "asc" } } },
-        });
+        const row = await withSlotRetry(() =>
+          prisma.$transaction(async (tx) => {
+            const { order, projStart } = await allocSlot(tx, project.id);
+            return tx.video.create({
+              data: {
+                id: videoId,
+                projectId: project.id,
+                order,
+                name,
+                videoKey: vKey,
+                audioKey: aKey,
+                durationSec: duration,
+                width: v.width,
+                height: v.height,
+                fps: v.fps,
+                videoBitrate: v.bitrate,
+                audioBitrate: finalProbe.audioStream?.bitrate ?? null,
+                sizeBytes: finalProbe.sizeBytes,
+                srcStartSec: 0,
+                srcEndSec: duration,
+                projStartSec: projStart,
+                projEndSec: projStart + duration,
+                thumbnails: {
+                  create: thumbs.map((t) => ({
+                    atSec: t.atSec,
+                    key: videoThumbKey(project.id, videoId, t.atSec),
+                    width: t.width,
+                    height: t.height,
+                  })),
+                },
+              },
+              include: { thumbnails: { orderBy: { atSec: "asc" } } },
+            });
+          }),
+        );
         return { video: row };
       } catch (err) {
         await deletePrefix(`${projectKey(project.id)}/videos/${videoId}/`).catch(() => {});
@@ -294,30 +316,33 @@ export const projects = new Hono<AuthContext>()
         throw err;
       }
 
-      const order = await nextOrder(project.id);
-      const projStart = await nextProjStart(project.id);
       const duration = probe.durationSec;
 
       try {
-        const row = await prisma.audio.create({
-          data: {
-            id: audioId,
-            projectId: project.id,
-            order,
-            name,
-            audioKey: key,
-            contentType,
-            durationSec: duration,
-            sampleRate: probe.audioStream.sampleRate || null,
-            channels: probe.audioStream.channels || null,
-            bitrate: probe.audioStream.bitrate,
-            sizeBytes: probe.sizeBytes,
-            srcStartSec: 0,
-            srcEndSec: duration,
-            projStartSec: projStart,
-            projEndSec: projStart + duration,
-          },
-        });
+        const row = await withSlotRetry(() =>
+          prisma.$transaction(async (tx) => {
+            const { order, projStart } = await allocSlot(tx, project.id);
+            return tx.audio.create({
+              data: {
+                id: audioId,
+                projectId: project.id,
+                order,
+                name,
+                audioKey: key,
+                contentType,
+                durationSec: duration,
+                sampleRate: probe.audioStream?.sampleRate || null,
+                channels: probe.audioStream?.channels || null,
+                bitrate: probe.audioStream?.bitrate ?? null,
+                sizeBytes: probe.sizeBytes,
+                srcStartSec: 0,
+                srcEndSec: duration,
+                projStartSec: projStart,
+                projEndSec: projStart + duration,
+              },
+            });
+          }),
+        );
         await unlink(inputPath).catch(() => {});
         return { audio: row };
       } catch (err) {
