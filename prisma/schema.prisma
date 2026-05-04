@@ -7,7 +7,98 @@ datasource db {
   provider = "sqlite"
 }
 
-model Message {
-  id      Int    @id @default(autoincrement())
-  content String
+model User {
+  id           String    @id @default(cuid())
+  authentikSub String    @unique
+  username     String?
+  email        String?
+  name         String?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+  projects     Project[]
+}
+
+model Project {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id])
+  name      String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  videos    Video[]
+  audios    Audio[]
+
+  @@index([userId])
+}
+
+model Video {
+  id        String  @id @default(cuid())
+  projectId String
+  project   Project @relation(fields: [projectId], references: [id])
+  order     Int
+  name      String
+
+  videoKey String
+  audioKey String
+
+  durationSec  Float
+  width        Int
+  height       Int
+  fps          Float
+  videoBitrate Int?
+  audioBitrate Int?
+  sizeBytes    Int
+
+  srcStartSec  Float @default(0)
+  srcEndSec    Float
+  projStartSec Float
+  projEndSec   Float
+
+  createdAt  DateTime    @default(now())
+  updatedAt  DateTime    @updatedAt
+  thumbnails Thumbnail[]
+
+  @@unique([projectId, order])
+  @@index([projectId])
+}
+
+model Audio {
+  id        String  @id @default(cuid())
+  projectId String
+  project   Project @relation(fields: [projectId], references: [id])
+  order     Int
+  name      String
+
+  audioKey    String
+  contentType String
+
+  durationSec Float
+  sampleRate  Int?
+  channels    Int?
+  bitrate     Int?
+  sizeBytes   Int
+
+  srcStartSec  Float @default(0)
+  srcEndSec    Float
+  projStartSec Float
+  projEndSec   Float
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([projectId, order])
+  @@index([projectId])
+}
+
+model Thumbnail {
+  id      String @id @default(cuid())
+  videoId String
+  video   Video  @relation(fields: [videoId], references: [id])
+  atSec   Float
+  key     String
+  width   Int
+  height  Int
+
+  @@unique([videoId, atSec])
+  @@index([videoId])
 }
