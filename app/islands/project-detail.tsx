@@ -551,13 +551,16 @@ function TrackRow({
           style={{ display: "none" }}
           aria-hidden="true"
         >
+          {/* timeline の durationSec / projEndSec は transcoded probe 由来なので
+              再生対象も transcoded を第一候補にして drift を出さない。raw は
+              transcoded が decode できなかった場合のフォールバック */}
+          <source src={(item as AudioItem).streamUrl} type="audio/mp4" />
           {(item as AudioItem).rawUrl && (
             <source
               src={(item as AudioItem).rawUrl ?? undefined}
               type={(item as AudioItem).rawContentType ?? undefined}
             />
           )}
-          <source src={(item as AudioItem).streamUrl} type="audio/mp4" />
           <track kind="captions" />
         </audio>
       )}
