@@ -47,7 +47,7 @@ model Video {
   fps          Float
   videoBitrate Int?
   audioBitrate Int?
-  sizeBytes    Int
+  sizeBytes    BigInt
 
   srcStartSec  Float @default(0)
   srcEndSec    Float
@@ -77,7 +77,7 @@ model Audio {
   sampleRate  Int?
   channels    Int?
   bitrate     Int?
-  sizeBytes   Int
+  sizeBytes   BigInt
 
   srcStartSec  Float @default(0)
   srcEndSec    Float
