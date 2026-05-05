@@ -177,7 +177,8 @@ export const projects = new Hono<AuthContext>()
     if (file.size > MAX_UPLOAD_BYTES) {
       return c.json({ error: `file too large (max ${MAX_UPLOAD_BYTES} bytes)` }, 413);
     }
-    const name = (form.get("name") as string | null)?.trim() || file.name || "video";
+    const nameField = form.get("name");
+    const name = (typeof nameField === "string" ? nameField.trim() : "") || file.name || "video";
 
     const videoId = crypto.randomUUID();
     const prefix = `${projectKey(project.id)}/videos/${videoId}/`;
@@ -386,7 +387,8 @@ export const projects = new Hono<AuthContext>()
     if (file.size > MAX_UPLOAD_BYTES) {
       return c.json({ error: `file too large (max ${MAX_UPLOAD_BYTES} bytes)` }, 413);
     }
-    const name = (form.get("name") as string | null)?.trim() || file.name || "audio";
+    const nameField = form.get("name");
+    const name = (typeof nameField === "string" ? nameField.trim() : "") || file.name || "audio";
     const ext = (extname(file.name) || ".bin").slice(1).toLowerCase();
     const contentType = file.type || "application/octet-stream";
 
