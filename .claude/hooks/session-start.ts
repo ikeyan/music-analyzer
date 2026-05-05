@@ -4,8 +4,7 @@ import { openSync } from "node:fs";
 
 if (process.env.CLAUDE_CODE_REMOTE !== "true") process.exit(0);
 
-const dockerReady = async () =>
-  (await $`docker ps`.quiet().nothrow()).exitCode === 0;
+const dockerReady = async () => (await $`docker ps`.quiet().nothrow()).exitCode === 0;
 
 const ensureDocker = async () => {
   if (await dockerReady()) return;
