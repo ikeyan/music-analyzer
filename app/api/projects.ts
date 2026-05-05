@@ -7,12 +7,15 @@ import {
   extractAudio,
   extractThumbnails,
   ffprobe,
+  isBrowserPlayableAudio,
+  transcodeAudio,
   transcodeVideo,
   withTempDir,
 } from "../lib/ffmpeg";
 import { prisma } from "../lib/prisma";
 import {
-  audioSourceKey,
+  audioRawKey,
+  audioTranscodedKey,
   deletePrefix,
   projectKey,
   streamS3,
@@ -323,9 +326,23 @@ export const projects = new Hono<AuthContext>()
         return { error: `duration must be > 0 and <= ${MAX_DURATION_SEC}s`, status: 400 as const };
       }
 
-      const key = audioSourceKey(project.id, audioId, ext);
+      // 標準化AAC m4aは常に作る。失敗 = ffmpegが扱えない入力なので400で拒否
+      const transcodedPath = join(tmp, "transcoded.m4a");
       try {
-        await uploadFile(key, inputPath, contentType);
+        await transcodeAudio(inputPath, transcodedPath);
+      } catch {
+        return { error: "ffmpeg cannot decode this audio", status: 400 as const };
+      }
+
+      const keepRaw = isBrowserPlayableAudio(probe.audioStream.codec, probe.formatName);
+      const transcodedKey = audioTranscodedKey(project.id, audioId);
+      const rawKey = keepRaw ? audioRawKey(project.id, audioId, ext) : null;
+
+      try {
+        await Promise.all([
+          uploadFile(transcodedKey, transcodedPath, "audio/mp4"),
+          ...(rawKey ? [uploadFile(rawKey, inputPath, contentType)] : []),
+        ]);
       } catch (err) {
         await deletePrefix(`${projectKey(project.id)}/audios/${audioId}/`).catch(() => {});
         throw err;
@@ -343,8 +360,9 @@ export const projects = new Hono<AuthContext>()
                 projectId: project.id,
                 order,
                 name,
-                audioKey: key,
-                contentType,
+                audioKey: transcodedKey,
+                rawKey,
+                rawContentType: keepRaw ? contentType : null,
                 durationSec: duration,
                 sampleRate: probe.audioStream?.sampleRate || null,
                 channels: probe.audioStream?.channels || null,
@@ -391,5 +409,16 @@ export const projects = new Hono<AuthContext>()
       where: { id: c.req.param("audioId"), projectId: project.id },
     });
     if (!audio) return c.notFound();
-    return await streamS3(c, audio.audioKey, audio.contentType);
+    return await streamS3(c, audio.audioKey, "audio/mp4");
+  })
+
+  .get("/:id/audios/:audioId/raw", async (c) => {
+    const user = c.var.user;
+    const project = await findProjectOr404(user.id, c.req.param("id"));
+    if (!project) return c.notFound();
+    const audio = await prisma.audio.findFirst({
+      where: { id: c.req.param("audioId"), projectId: project.id },
+    });
+    if (!audio || !audio.rawKey) return c.notFound();
+    return await streamS3(c, audio.rawKey, audio.rawContentType ?? "application/octet-stream");
   });

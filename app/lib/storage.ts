@@ -8,8 +8,10 @@ export const videoAudioKey = (projectId: string, videoId: string) =>
   `${projectKey(projectId)}/videos/${videoId}/audio.m4a`;
 export const videoThumbKey = (projectId: string, videoId: string, atSec: number) =>
   `${projectKey(projectId)}/videos/${videoId}/thumbs/${String(Math.round(atSec)).padStart(6, "0")}.jpg`;
-export const audioSourceKey = (projectId: string, audioId: string, ext: string) =>
-  `${projectKey(projectId)}/audios/${audioId}/source.${ext.replace(/^\./, "")}`;
+export const audioRawKey = (projectId: string, audioId: string, ext: string) =>
+  `${projectKey(projectId)}/audios/${audioId}/raw.${ext.replace(/^\./, "")}`;
+export const audioTranscodedKey = (projectId: string, audioId: string) =>
+  `${projectKey(projectId)}/audios/${audioId}/transcoded.m4a`;
 
 export async function uploadFile(key: string, path: string, contentType: string): Promise<void> {
   await getS3().write(key, Bun.file(path), { type: contentType });

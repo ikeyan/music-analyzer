@@ -46,7 +46,6 @@ export default createRoute(requireUser, async (c) => {
       name: a.name,
       order: a.order,
       durationSec: a.durationSec,
-      contentType: a.contentType,
       sampleRate: a.sampleRate,
       channels: a.channels,
       sizeBytes: a.sizeBytes,
@@ -55,6 +54,8 @@ export default createRoute(requireUser, async (c) => {
       projStartSec: a.projStartSec,
       projEndSec: a.projEndSec,
       streamUrl: `/api/projects/${project.id}/audios/${a.id}/stream`,
+      rawUrl: a.rawKey ? `/api/projects/${project.id}/audios/${a.id}/raw` : null,
+      rawContentType: a.rawContentType,
     })),
   };
 

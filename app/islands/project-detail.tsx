@@ -23,7 +23,6 @@ export type AudioItem = {
   name: string;
   order: number;
   durationSec: number;
-  contentType: string;
   sampleRate: number | null;
   channels: number | null;
   sizeBytes: number;
@@ -31,7 +30,11 @@ export type AudioItem = {
   srcEndSec: number;
   projStartSec: number;
   projEndSec: number;
+  // 標準化AAC m4aの再生URL (常に存在)
   streamUrl: string;
+  // ブラウザ再生可能と判断した raw 入力のURL (存在する場合)
+  rawUrl: string | null;
+  rawContentType: string | null;
 };
 export type ProjectDetailData = {
   id: string;
@@ -538,11 +541,17 @@ function TrackRow({
       ) : (
         <audio
           ref={attachRef as (el: HTMLAudioElement | null) => void}
-          src={(item as AudioItem).streamUrl}
           preload="auto"
           style={{ display: "none" }}
           aria-hidden="true"
         >
+          {(item as AudioItem).rawUrl && (
+            <source
+              src={(item as AudioItem).rawUrl ?? undefined}
+              type={(item as AudioItem).rawContentType ?? undefined}
+            />
+          )}
+          <source src={(item as AudioItem).streamUrl} type="audio/mp4" />
           <track kind="captions" />
         </audio>
       )}
@@ -647,7 +656,10 @@ type ServerProject = {
     audioKey: string | null;
     thumbnails: { id: string; atSec: number; key: string; width: number; height: number }[];
   })[];
-  audios: Omit<AudioItem, "streamUrl">[];
+  audios: (Omit<AudioItem, "streamUrl" | "rawUrl" | "rawContentType"> & {
+    rawKey: string | null;
+    rawContentType: string | null;
+  })[];
 };
 
 function toClient(p: ServerProject): ProjectDetailData {
@@ -669,6 +681,8 @@ function toClient(p: ServerProject): ProjectDetailData {
     audios: p.audios.map((a) => ({
       ...a,
       streamUrl: `/api/projects/${p.id}/audios/${a.id}/stream`,
+      rawUrl: a.rawKey ? `/api/projects/${p.id}/audios/${a.id}/raw` : null,
+      rawContentType: a.rawContentType,
     })),
   };
 }

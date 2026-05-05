@@ -172,6 +172,32 @@ export async function extractAudio(input: string, output: string): Promise<void>
   ]);
 }
 
+// AAC m4a (audio/mp4) に正規化。extractAudio と同じ出力設定を音声単独入力に使う
+export const transcodeAudio = extractAudio;
+
+// ブラウザのHTMLMediaElementが再生し得る codec/container の保守的な許容セット。
+// 「ほとんどの主要ブラウザで再生可」を基準とし、保留 (alac/wma/opus-in-ogg-Safariなど) は除外しない方向で広めに
+const BROWSER_AUDIO_CODECS = new Set([
+  "aac",
+  "mp3",
+  "opus",
+  "vorbis",
+  "flac",
+  "pcm_s16le",
+  "pcm_s24le",
+  "pcm_s32le",
+  "pcm_f32le",
+  "pcm_f64le",
+  "pcm_s16be",
+  "pcm_s24be",
+]);
+const BROWSER_AUDIO_FORMAT_TOKENS = ["mp3", "mp4", "m4a", "ogg", "flac", "wav", "webm", "matroska"];
+
+export function isBrowserPlayableAudio(codec: string, formatName: string): boolean {
+  if (!BROWSER_AUDIO_CODECS.has(codec)) return false;
+  return formatName.split(",").some((t) => BROWSER_AUDIO_FORMAT_TOKENS.includes(t.trim()));
+}
+
 export type ThumbnailFile = {
   atSec: number;
   path: string;
