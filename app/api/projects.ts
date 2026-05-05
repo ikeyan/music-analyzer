@@ -4,6 +4,7 @@ import { unlink } from "node:fs/promises";
 import { type AuthContext, requireUser } from "../lib/auth";
 import {
   MAX_DURATION_SEC,
+  MAX_UPLOAD_BYTES,
   extractAudio,
   extractThumbnails,
   ffprobe,
@@ -173,6 +174,9 @@ export const projects = new Hono<AuthContext>()
     if (!(file instanceof File) || file.size === 0) {
       return c.json({ error: "file required" }, 400);
     }
+    if (file.size > MAX_UPLOAD_BYTES) {
+      return c.json({ error: `file too large (max ${MAX_UPLOAD_BYTES} bytes)` }, 413);
+    }
     const name = (form.get("name") as string | null)?.trim() || file.name || "video";
 
     const videoId = crypto.randomUUID();
@@ -224,6 +228,13 @@ export const projects = new Hono<AuthContext>()
         if (!v) return { error: "transcode produced no video stream", status: 500 as const };
         if (!Number.isFinite(finalProbe.durationSec) || finalProbe.durationSec <= 0) {
           return { error: "transcode produced unknown duration", status: 500 as const };
+        }
+        // pre-probe の durationSec が壊れた入力で過小報告された場合に備えて再判定
+        if (finalProbe.durationSec > MAX_DURATION_SEC) {
+          return {
+            error: `duration must be > 0 and <= ${MAX_DURATION_SEC}s`,
+            status: 400 as const,
+          };
         }
 
         const thumbs = await extractThumbnails(
@@ -365,6 +376,9 @@ export const projects = new Hono<AuthContext>()
     if (!(file instanceof File) || file.size === 0) {
       return c.json({ error: "file required" }, 400);
     }
+    if (file.size > MAX_UPLOAD_BYTES) {
+      return c.json({ error: `file too large (max ${MAX_UPLOAD_BYTES} bytes)` }, 413);
+    }
     const name = (form.get("name") as string | null)?.trim() || file.name || "audio";
     const ext = (extname(file.name) || ".bin").slice(1).toLowerCase();
     const contentType = file.type || "application/octet-stream";
@@ -410,6 +424,12 @@ export const projects = new Hono<AuthContext>()
         const finalProbe = await ffprobe(transcodedPath);
         if (!Number.isFinite(finalProbe.durationSec) || finalProbe.durationSec <= 0) {
           return { error: "transcode produced unknown duration", status: 500 as const };
+        }
+        if (finalProbe.durationSec > MAX_DURATION_SEC) {
+          return {
+            error: `duration must be > 0 and <= ${MAX_DURATION_SEC}s`,
+            status: 400 as const,
+          };
         }
 
         const keepRaw = isBrowserPlayableAudio(probe.audioStream.codec, probe.formatName);

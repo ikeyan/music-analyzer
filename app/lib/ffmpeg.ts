@@ -3,6 +3,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 export const MAX_DURATION_SEC = 3600;
+// 1h動画の transcode 入力として現実的な上限。8GB は 1h@~17Mbps 相当で
+// 仕様 (1080p/8Mbps出力) に対し十分余裕がある。disk と ffmpeg を専有しないように
+// この閾値で 413 を返す
+export const MAX_UPLOAD_BYTES = 8 * 1024 * 1024 * 1024;
 export const THUMBNAIL_INTERVAL_SEC = 10;
 export const THUMBNAIL_WIDTH = 320;
 
