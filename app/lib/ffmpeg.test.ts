@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { isBrowserPlayableAudio } from "./ffmpeg";
+import { isBrowserPlayableAudio, parseFiniteNumber } from "./ffmpeg";
 
 describe("isBrowserPlayableAudio", () => {
   it("accepts AAC in mp4 container (m4a)", () => {
@@ -42,5 +42,28 @@ describe("isBrowserPlayableAudio", () => {
     expect(isBrowserPlayableAudio("", "")).toBe(false);
     expect(isBrowserPlayableAudio("aac", "")).toBe(false);
     expect(isBrowserPlayableAudio("", "mp4")).toBe(false);
+  });
+});
+
+describe("parseFiniteNumber", () => {
+  it("returns the number for valid numeric strings", () => {
+    expect(parseFiniteNumber("0")).toBe(0);
+    expect(parseFiniteNumber("128000")).toBe(128000);
+    expect(parseFiniteNumber("3.14")).toBe(3.14);
+    expect(parseFiniteNumber("-1")).toBe(-1);
+  });
+
+  it("returns null for ffprobe N/A and similar non-numeric strings", () => {
+    expect(parseFiniteNumber("N/A")).toBeNull();
+    expect(parseFiniteNumber("abc")).toBeNull();
+    expect(parseFiniteNumber("Infinity")).toBeNull();
+    expect(parseFiniteNumber("-Infinity")).toBeNull();
+    expect(parseFiniteNumber("NaN")).toBeNull();
+  });
+
+  it("returns null for empty / null / undefined", () => {
+    expect(parseFiniteNumber("")).toBeNull();
+    expect(parseFiniteNumber(null)).toBeNull();
+    expect(parseFiniteNumber(undefined)).toBeNull();
   });
 });

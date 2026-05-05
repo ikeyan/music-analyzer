@@ -73,11 +73,10 @@ export async function ffprobe(path: string): Promise<ProbeResult> {
   const streams = json.streams ?? [];
   const v = streams.find((s) => s.codec_type === "video");
   const a = streams.find((s) => s.codec_type === "audio");
-  const durationSec = Number(json.format?.duration ?? 0);
   return {
-    durationSec,
+    durationSec: parseFiniteNumber(json.format?.duration) ?? Number.NaN,
     formatName: json.format?.format_name ?? "",
-    sizeBytes: Number(json.format?.size ?? 0),
+    sizeBytes: parseFiniteNumber(json.format?.size) ?? 0,
     videoStream:
       v && v.width && v.height
         ? {
@@ -85,18 +84,26 @@ export async function ffprobe(path: string): Promise<ProbeResult> {
             height: v.height,
             fps: parseFps(v.avg_frame_rate ?? v.r_frame_rate ?? "0/1"),
             codec: v.codec_name ?? "",
-            bitrate: v.bit_rate ? Number(v.bit_rate) : null,
+            bitrate: parseFiniteNumber(v.bit_rate),
           }
         : null,
     audioStream: a
       ? {
-          sampleRate: Number(a.sample_rate ?? 0),
+          sampleRate: parseFiniteNumber(a.sample_rate) ?? 0,
           channels: a.channels ?? 0,
           codec: a.codec_name ?? "",
-          bitrate: a.bit_rate ? Number(a.bit_rate) : null,
+          bitrate: parseFiniteNumber(a.bit_rate),
         }
       : null,
   };
+}
+
+// ffprobe は値が取れないと "N/A" や undefined を返すので Number() で NaN になりうる。
+// Prisma の Int 列に NaN を持ち込まないため、有限数だけ通して残りは null にする
+export function parseFiniteNumber(value: string | undefined | null): number | null {
+  if (value == null || value === "") return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
 }
 
 function parseFps(rate: string): number {

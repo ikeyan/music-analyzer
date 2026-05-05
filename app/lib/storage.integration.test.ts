@@ -84,4 +84,29 @@ describe("deletePrefix", () => {
     const keys = (all.contents ?? []).map((o) => o.key);
     expect(keys).toContain("other/x.bin");
   });
+
+  // Bun S3 の continuationToken ページネーションが想定通り動くことを実測。
+  // maxKeys を小さくして同じプレフィックスで意図的に複数ページを発生させる
+  it("paginates via continuationToken until all pages consumed", async () => {
+    const N = 7;
+    for (let i = 0; i < N; i++) await put(`page/${i}.bin`, "x");
+
+    const collected: string[] = [];
+    let token: string | undefined;
+    let pages = 0;
+    do {
+      pages++;
+      const result = await getS3().list({ prefix: "page/", maxKeys: 3, continuationToken: token });
+      for (const o of result.contents ?? []) if (o.key) collected.push(o.key);
+      token = result.isTruncated ? result.nextContinuationToken : undefined;
+    } while (token);
+
+    expect(pages).toBeGreaterThanOrEqual(3);
+    expect(collected).toHaveLength(N);
+    expect(new Set(collected).size).toBe(N);
+
+    await deletePrefix("page/");
+    const after = await getS3().list({ prefix: "page/" });
+    expect(after.contents ?? []).toHaveLength(0);
+  });
 });
