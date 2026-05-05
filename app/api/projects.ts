@@ -404,6 +404,14 @@ export const projects = new Hono<AuthContext>()
           return { error: "ffmpeg cannot decode this audio", status: 400 as const };
         }
 
+        // audioKey は transcoded を指すので、persistする durationSec は
+        // re-probe した transcoded の長さに揃える (priming/padding や入力 metadata の
+        // ズレで pre-probe と差が出るため)
+        const finalProbe = await ffprobe(transcodedPath);
+        if (!Number.isFinite(finalProbe.durationSec) || finalProbe.durationSec <= 0) {
+          return { error: "transcode produced unknown duration", status: 500 as const };
+        }
+
         const keepRaw = isBrowserPlayableAudio(probe.audioStream.codec, probe.formatName);
         const transcodedKey = audioTranscodedKey(project.id, audioId);
         const rawKey = keepRaw ? audioRawKey(project.id, audioId, ext) : null;
@@ -413,7 +421,7 @@ export const projects = new Hono<AuthContext>()
           ...(rawKey ? [uploadFile(rawKey, inputPath, contentType)] : []),
         ]);
 
-        const duration = probe.durationSec;
+        const duration = finalProbe.durationSec;
         const row = await withSlotRetry(() =>
           prisma.$transaction(async (tx) => {
             const { order, projStart } = await allocSlot(tx, project.id);
