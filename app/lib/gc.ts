@@ -20,33 +20,66 @@ export function nextRetryDelayMs(attempts: number, rand: () => number = Math.ran
   return exp * (0.5 + rand() * 0.5);
 }
 
+// テストから fake の prisma / deletePrefix / now / rand を差し込めるよう、
+// 純粋にループ処理だけを行う形で切り出した内部実装
+type SweeperPrismaMark = { id: string; prefix: string; attempts: number };
+export type SweeperDeps = {
+  prisma: {
+    deletionMark: {
+      findMany: (args: {
+        where: { nextRetryAt: { lte: Date } };
+        orderBy: { nextRetryAt: "asc" };
+        take: number;
+      }) => Promise<SweeperPrismaMark[]>;
+      deleteMany: (args: { where: { prefix: string } }) => Promise<unknown>;
+      update: (args: {
+        where: { id: string };
+        data: {
+          attempts: { increment: number };
+          lastError: string;
+          nextRetryAt: Date;
+        };
+      }) => Promise<unknown>;
+    };
+  };
+  deletePrefix: (prefix: string) => Promise<void>;
+  now?: () => Date;
+  rand?: () => number;
+};
+
+export async function runSweepOnce(deps: SweeperDeps): Promise<void> {
+  const now = deps.now ?? (() => new Date());
+  const rand = deps.rand ?? Math.random;
+  const marks = await deps.prisma.deletionMark.findMany({
+    where: { nextRetryAt: { lte: now() } },
+    orderBy: { nextRetryAt: "asc" },
+    take: BATCH_SIZE,
+  });
+  for (const m of marks) {
+    try {
+      await deps.deletePrefix(m.prefix);
+      await deps.prisma.deletionMark.deleteMany({ where: { prefix: m.prefix } });
+    } catch (err) {
+      const delay = nextRetryDelayMs(m.attempts + 1, rand);
+      await deps.prisma.deletionMark
+        .update({
+          where: { id: m.id },
+          data: {
+            attempts: { increment: 1 },
+            lastError: describeError(err),
+            nextRetryAt: new Date(now().getTime() + delay),
+          },
+        })
+        .catch(() => {});
+    }
+  }
+}
+
 export async function sweepPendingDeletions(): Promise<void> {
   if (running) return;
   running = true;
   try {
-    const marks = await prisma.deletionMark.findMany({
-      where: { nextRetryAt: { lte: new Date() } },
-      orderBy: { nextRetryAt: "asc" },
-      take: BATCH_SIZE,
-    });
-    for (const m of marks) {
-      try {
-        await deletePrefix(m.prefix);
-        await prisma.deletionMark.deleteMany({ where: { prefix: m.prefix } });
-      } catch (err) {
-        const delay = nextRetryDelayMs(m.attempts + 1);
-        await prisma.deletionMark
-          .update({
-            where: { id: m.id },
-            data: {
-              attempts: { increment: 1 },
-              lastError: describeError(err),
-              nextRetryAt: new Date(Date.now() + delay),
-            },
-          })
-          .catch(() => {});
-      }
-    }
+    await runSweepOnce({ prisma, deletePrefix });
   } finally {
     running = false;
   }

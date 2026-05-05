@@ -1,5 +1,12 @@
-import { describe, expect, it } from "bun:test";
-import { BASE_RETRY_DELAY_MS, nextRetryDelayMs } from "./gc";
+import { describe, expect, it, mock } from "bun:test";
+import {
+  BASE_RETRY_DELAY_MS,
+  nextRetryDelayMs,
+  runSweepOnce,
+  startDeletionSweeper,
+  stopDeletionSweeper,
+  type SweeperDeps,
+} from "./gc";
 
 describe("nextRetryDelayMs", () => {
   it("returns base delay range for attempts=0", () => {
@@ -28,5 +35,161 @@ describe("nextRetryDelayMs", () => {
 
   it("rounds non-integer attempts down", () => {
     expect(nextRetryDelayMs(1.9, () => 1)).toBe(BASE_RETRY_DELAY_MS * 2);
+  });
+});
+
+function makeDeps(overrides: {
+  marks?: { id: string; prefix: string; attempts: number }[];
+  deletePrefix?: (p: string) => Promise<void>;
+  now?: Date;
+  rand?: number;
+}): {
+  deps: SweeperDeps;
+  findMany: ReturnType<typeof mock>;
+  deleteMany: ReturnType<typeof mock>;
+  update: ReturnType<typeof mock>;
+  deletePrefix: ReturnType<typeof mock>;
+} {
+  const findMany = mock(async () => overrides.marks ?? []);
+  const deleteMany = mock(async () => ({ count: 1 }));
+  const update = mock(async () => ({}));
+  const deletePrefix = mock(overrides.deletePrefix ?? (async () => {}));
+  const deps: SweeperDeps = {
+    prisma: { deletionMark: { findMany, deleteMany, update } },
+    deletePrefix: deletePrefix as unknown as (p: string) => Promise<void>,
+    now: () => overrides.now ?? new Date(0),
+    rand: () => overrides.rand ?? 0.5,
+  };
+  return { deps, findMany, deleteMany, update, deletePrefix };
+}
+
+describe("runSweepOnce", () => {
+  it("filters by nextRetryAt <= now and orders ascending", async () => {
+    const NOW = new Date("2026-05-05T00:00:00Z");
+    const { deps, findMany } = makeDeps({ now: NOW });
+    await runSweepOnce(deps);
+    expect(findMany).toHaveBeenCalledTimes(1);
+    expect(findMany.mock.calls[0]?.[0]).toEqual({
+      where: { nextRetryAt: { lte: NOW } },
+      orderBy: { nextRetryAt: "asc" },
+      take: 50,
+    });
+  });
+
+  it("deletes S3 prefix and unmarks on success", async () => {
+    const { deps, deletePrefix, deleteMany, update } = makeDeps({
+      marks: [
+        { id: "1", prefix: "p/a/", attempts: 0 },
+        { id: "2", prefix: "p/b/", attempts: 3 },
+      ],
+    });
+    await runSweepOnce(deps);
+    expect(deletePrefix).toHaveBeenCalledTimes(2);
+    expect(deletePrefix.mock.calls[0]?.[0]).toBe("p/a/");
+    expect(deletePrefix.mock.calls[1]?.[0]).toBe("p/b/");
+    expect(deleteMany).toHaveBeenCalledTimes(2);
+    expect(deleteMany.mock.calls[0]?.[0]).toEqual({ where: { prefix: "p/a/" } });
+    expect(deleteMany.mock.calls[1]?.[0]).toEqual({ where: { prefix: "p/b/" } });
+    expect(update).not.toHaveBeenCalled();
+  });
+
+  it("schedules exponential backoff on failure", async () => {
+    const NOW = new Date(1_000_000);
+    const { deps, deleteMany, update } = makeDeps({
+      marks: [{ id: "x", prefix: "boom/", attempts: 2 }],
+      deletePrefix: async () => {
+        throw new Error("network is down");
+      },
+      now: NOW,
+      rand: 1, // 最大 jitter
+    });
+    await runSweepOnce(deps);
+    expect(deleteMany).not.toHaveBeenCalled();
+    expect(update).toHaveBeenCalledTimes(1);
+    const arg = update.mock.calls[0]?.[0];
+    expect(arg.where).toEqual({ id: "x" });
+    expect(arg.data.attempts).toEqual({ increment: 1 });
+    expect(arg.data.lastError).toBe("network is down");
+    // attempts 2 => 失敗後の次は 3 として計算: BASE * 2^3 * (0.5 + 1*0.5) = BASE * 8
+    const expectedDelay = BASE_RETRY_DELAY_MS * 8;
+    expect(arg.data.nextRetryAt.getTime()).toBe(NOW.getTime() + expectedDelay);
+  });
+
+  it("continues processing remaining marks when one fails", async () => {
+    const failureFor = "fail/";
+    const { deps, deletePrefix, deleteMany, update } = makeDeps({
+      marks: [
+        { id: "1", prefix: "ok/", attempts: 0 },
+        { id: "2", prefix: failureFor, attempts: 0 },
+        { id: "3", prefix: "ok2/", attempts: 0 },
+      ],
+      deletePrefix: async (p: string) => {
+        if (p === failureFor) throw new Error("nope");
+      },
+    });
+    await runSweepOnce(deps);
+    expect(deletePrefix).toHaveBeenCalledTimes(3);
+    // ok/ と ok2/ は unmark、fail/ は update
+    expect(deleteMany).toHaveBeenCalledTimes(2);
+    expect(update).toHaveBeenCalledTimes(1);
+  });
+
+  it("truncates very long error messages", async () => {
+    const longMsg = "x".repeat(2000);
+    const { deps, update } = makeDeps({
+      marks: [{ id: "1", prefix: "p/", attempts: 0 }],
+      deletePrefix: async () => {
+        throw new Error(longMsg);
+      },
+    });
+    await runSweepOnce(deps);
+    expect(update.mock.calls[0]?.[0].data.lastError.length).toBe(500);
+  });
+
+  it("stringifies non-Error throws", async () => {
+    const { deps, update } = makeDeps({
+      marks: [{ id: "1", prefix: "p/", attempts: 0 }],
+      deletePrefix: async () => {
+        throw "string thrown";
+      },
+    });
+    await runSweepOnce(deps);
+    expect(update.mock.calls[0]?.[0].data.lastError).toBe("string thrown");
+  });
+
+  it("swallows update errors so one bad row does not stop the batch", async () => {
+    const { deps } = makeDeps({
+      marks: [
+        { id: "1", prefix: "a/", attempts: 0 },
+        { id: "2", prefix: "b/", attempts: 0 },
+      ],
+      deletePrefix: async () => {
+        throw new Error("nope");
+      },
+    });
+    deps.prisma.deletionMark.update = mock(async () => {
+      throw new Error("DB down");
+    });
+    await expect(runSweepOnce(deps)).resolves.toBeUndefined();
+  });
+});
+
+describe("startDeletionSweeper / stopDeletionSweeper", () => {
+  it("starts an interval and stops it cleanly", () => {
+    startDeletionSweeper(10_000_000); // 大きい値で実際のtickは試験中に発火しない
+    stopDeletionSweeper();
+    // start → stop → start でハンドルが再生成されること
+    startDeletionSweeper(10_000_000);
+    stopDeletionSweeper();
+  });
+
+  it("is idempotent: second start is a no-op", () => {
+    startDeletionSweeper(10_000_000);
+    startDeletionSweeper(10_000_000);
+    stopDeletionSweeper();
+  });
+
+  it("stop without prior start is a no-op", () => {
+    expect(() => stopDeletionSweeper()).not.toThrow();
   });
 });
