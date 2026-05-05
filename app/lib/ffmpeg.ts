@@ -112,14 +112,22 @@ function parseFps(rate: string): number {
   return num / den;
 }
 
-async function runFfmpeg(args: string[]): Promise<void> {
+async function runFfmpeg(args: string[], signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) throw new Error("ffmpeg aborted before start");
   const proc = Bun.spawn([FFMPEG, "-hide_banner", "-loglevel", "error", "-y", ...args], {
     stdout: "pipe",
     stderr: "pipe",
   });
-  const [stderr, exitCode] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
-  if (exitCode !== 0) {
-    throw new Error(`ffmpeg failed (exit ${exitCode}): ${stderr.slice(0, 1000)}`);
+  const onAbort = () => proc.kill();
+  signal?.addEventListener("abort", onAbort, { once: true });
+  try {
+    const [stderr, exitCode] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
+    if (signal?.aborted) throw new Error("ffmpeg aborted");
+    if (exitCode !== 0) {
+      throw new Error(`ffmpeg failed (exit ${exitCode}): ${stderr.slice(0, 1000)}`);
+    }
+  } finally {
+    signal?.removeEventListener("abort", onAbort);
   }
 }
 
@@ -128,59 +136,70 @@ export async function transcodeVideo(
   input: string,
   output: string,
   hasAudio: boolean,
+  signal?: AbortSignal,
 ): Promise<void> {
   const audioArgs = hasAudio
     ? ["-c:a", "aac", "-profile:a", "aac_low", "-ar", "48000", "-ac", "2", "-b:a", "192k"]
     : ["-an"];
-  await runFfmpeg([
-    "-i",
-    input,
-    "-vf",
-    "scale='min(1920,iw)':'min(1080,ih)':force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p",
-    "-fpsmax",
-    "60",
-    "-c:v",
-    "libx264",
-    "-preset",
-    "veryfast",
-    "-b:v",
-    "8M",
-    "-maxrate",
-    "8M",
-    "-bufsize",
-    "16M",
-    "-pix_fmt",
-    "yuv420p",
-    ...audioArgs,
-    "-movflags",
-    "+faststart",
-    "-f",
-    "mp4",
-    output,
-  ]);
+  await runFfmpeg(
+    [
+      "-i",
+      input,
+      "-vf",
+      "scale='min(1920,iw)':'min(1080,ih)':force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p",
+      "-fpsmax",
+      "60",
+      "-c:v",
+      "libx264",
+      "-preset",
+      "veryfast",
+      "-b:v",
+      "8M",
+      "-maxrate",
+      "8M",
+      "-bufsize",
+      "16M",
+      "-pix_fmt",
+      "yuv420p",
+      ...audioArgs,
+      "-movflags",
+      "+faststart",
+      "-f",
+      "mp4",
+      output,
+    ],
+    signal,
+  );
 }
 
-export async function extractAudio(input: string, output: string): Promise<void> {
-  await runFfmpeg([
-    "-i",
-    input,
-    "-vn",
-    "-c:a",
-    "aac",
-    "-profile:a",
-    "aac_low",
-    "-ar",
-    "48000",
-    "-ac",
-    "2",
-    "-b:a",
-    "192k",
-    "-movflags",
-    "+faststart",
-    "-f",
-    "mp4",
-    output,
-  ]);
+export async function extractAudio(
+  input: string,
+  output: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  await runFfmpeg(
+    [
+      "-i",
+      input,
+      "-vn",
+      "-c:a",
+      "aac",
+      "-profile:a",
+      "aac_low",
+      "-ar",
+      "48000",
+      "-ac",
+      "2",
+      "-b:a",
+      "192k",
+      "-movflags",
+      "+faststart",
+      "-f",
+      "mp4",
+      output,
+    ],
+    signal,
+  );
 }
 
 // AAC m4a (audio/mp4) に正規化。extractAudio と同じ出力設定を音声単独入力に使う

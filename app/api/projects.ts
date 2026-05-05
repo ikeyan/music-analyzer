@@ -215,11 +215,18 @@ export const projects = new Hono<AuthContext>()
         const videoOut = join(tmp, "video.mp4");
         const audioOut = join(tmp, "audio.m4a");
         const thumbDir = join(tmp, "thumbs");
-        const tasks: Promise<unknown>[] = [transcodeVideo(inputPath, videoOut, hasAudio)];
-        if (hasAudio) tasks.push(extractAudio(inputPath, audioOut));
+        // 片方が落ちた瞬間にもう片方も abort して CPU/disk を解放する
+        const ac = new AbortController();
+        const tasks: Promise<unknown>[] = [
+          transcodeVideo(inputPath, videoOut, hasAudio, ac.signal),
+        ];
+        if (hasAudio) tasks.push(extractAudio(inputPath, audioOut, ac.signal));
         try {
           await Promise.all(tasks);
         } catch {
+          ac.abort();
+          // 残りの ffmpeg がプロセスを抱えたまま return しないよう settle 待ち
+          await Promise.allSettled(tasks);
           return { error: "ffmpeg cannot decode this video", status: 400 as const };
         }
 
@@ -455,9 +462,10 @@ export const projects = new Hono<AuthContext>()
                 rawKey,
                 rawContentType: keepRaw ? contentType : null,
                 durationSec: duration,
-                sampleRate: probe.audioStream?.sampleRate || null,
-                channels: probe.audioStream?.channels || null,
-                bitrate: probe.audioStream?.bitrate ?? null,
+                // audioKey は transcoded を指すので metadata も transcoded probe 由来に揃える
+                sampleRate: finalProbe.audioStream?.sampleRate || null,
+                channels: finalProbe.audioStream?.channels || null,
+                bitrate: finalProbe.audioStream?.bitrate ?? null,
                 sizeBytes: BigInt(probe.sizeBytes),
                 srcStartSec: 0,
                 srcEndSec: duration,
