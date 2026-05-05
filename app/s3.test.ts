@@ -1,69 +1,19 @@
-import { afterAll, beforeAll, describe, expect, it } from "bun:test";
+import { beforeAll, beforeEach, describe, expect, it } from "bun:test";
 import { Hono } from "hono";
-import { GenericContainer, type StartedTestContainer, Wait } from "testcontainers";
-import { MINIO_IMAGE } from "./test-images";
+import { clearS3Bucket, ensureS3Fixture } from "./test-fixtures/s3";
 
-const MINIO_USER = "minioadmin";
-const MINIO_PASSWORD = "minioadmin";
-const TEST_BUCKET = "test-bucket";
-const CONTAINER_STARTUP_MS = 120_000;
+const STARTUP_TIMEOUT_MS = 120_000;
 
-const S3_ENV_VARS = [
-  "S3_ENDPOINT",
-  "S3_REGION",
-  "S3_ACCESS_KEY_ID",
-  "S3_SECRET_ACCESS_KEY",
-  "S3_BUCKET",
-] as const;
-
-let container: StartedTestContainer;
 let app: Hono;
-let originalEnv: Partial<Record<(typeof S3_ENV_VARS)[number], string | undefined>> = {};
 
 beforeAll(async () => {
-  // minio imageにもBunのS3Clientにもbucket作成APIがないので起動前にディレクトリを作る
-  container = await new GenericContainer(MINIO_IMAGE)
-    .withExposedPorts(9000)
-    .withEnvironment({
-      MINIO_ROOT_USER: MINIO_USER,
-      MINIO_ROOT_PASSWORD: MINIO_PASSWORD,
-    })
-    .withEntrypoint(["/bin/sh", "-c"])
-    .withCommand([`mkdir -p /data/${TEST_BUCKET} && exec minio server /data --address :9000`])
-    .withWaitStrategy(Wait.forLogMessage(/API:/))
-    .withStartupTimeout(CONTAINER_STARTUP_MS)
-    .start();
-
-  originalEnv = Object.fromEntries(S3_ENV_VARS.map((k) => [k, process.env[k]]));
-
-  const endpoint = `http://${container.getHost()}:${container.getMappedPort(9000)}`;
-  process.env.S3_ENDPOINT = endpoint;
-  process.env.S3_REGION = "us-east-1";
-  process.env.S3_ACCESS_KEY_ID = MINIO_USER;
-  process.env.S3_SECRET_ACCESS_KEY = MINIO_PASSWORD;
-  process.env.S3_BUCKET = TEST_BUCKET;
-
-  const { resetS3ForTest } = await import("./lib/s3");
-  resetS3ForTest();
-
+  await ensureS3Fixture();
   const { blobs } = await import("./api/blobs");
   app = new Hono().route("/api/blobs", blobs);
-}, CONTAINER_STARTUP_MS);
+}, STARTUP_TIMEOUT_MS);
 
-afterAll(async () => {
-  for (const k of S3_ENV_VARS) {
-    const prev = originalEnv[k];
-    if (prev === undefined) {
-      delete process.env[k];
-    } else {
-      process.env[k] = prev;
-    }
-  }
-
-  const { resetS3ForTest } = await import("./lib/s3");
-  resetS3ForTest();
-
-  await container?.stop();
+beforeEach(async () => {
+  await clearS3Bucket();
 });
 
 describe("/api/blobs", () => {
