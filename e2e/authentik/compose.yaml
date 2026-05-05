@@ -91,11 +91,14 @@ services:
       dockerfile: e2e/authentik/Dockerfile.app
     environment:
       DATABASE_URL: file:/data/dev.db
+      AUTH_PROXY_SECRET: ${AUTH_PROXY_SECRET:?proxy secret required}
     volumes:
       - app-data:/data
 
   caddy:
     image: docker.io/library/caddy:2-alpine
+    environment:
+      AUTH_PROXY_SECRET: ${AUTH_PROXY_SECRET}
     ports:
       - "${BIND_ADDR:-127.0.0.1}:${CADDY_PORT_HTTP:-8080}:80"
     volumes:

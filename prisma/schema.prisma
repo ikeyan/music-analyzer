@@ -103,3 +103,17 @@ model Thumbnail {
   @@unique([videoId, atSec])
   @@index([videoId])
 }
+
+// DBのrow deleteと同じトランザクションで挿入する S3 prefix の墓標。
+// 同期best-effort cleanupが失敗してもsweeperが拾うので
+// (DB, S3) は eventually consistent になる
+model DeletionMark {
+  id        String   @id @default(cuid())
+  prefix    String
+  attempts  Int      @default(0)
+  lastError String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([createdAt])
+}

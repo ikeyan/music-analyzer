@@ -70,6 +70,23 @@ async function allocSlot(
   };
 }
 
+// (DB row delete + DeletionMark insert) を1 transactionにまとめる。
+// S3 cleanup の同期 best-effort と sweeper による retry の両方が
+// 同じ prefix を狙えるので、最終的な (DB, S3) は eventually consistent
+async function markPrefixForDeletion(prefix: string): Promise<void> {
+  await prisma.deletionMark.create({ data: { prefix } }).catch(() => {});
+}
+
+// 同期best-effort cleanup。失敗してもsweeperがmarkを拾うのでthrowしない
+async function eagerCleanupAndUnmark(prefix: string): Promise<void> {
+  try {
+    await deletePrefix(prefix);
+    await prisma.deletionMark.deleteMany({ where: { prefix } });
+  } catch {
+    /* sweeperに任せる */
+  }
+}
+
 // SQLite + Prisma は transaction で write を直列化するが、保険として
 // (projectId, order) のunique衝突 (P2002) はリトライする
 async function withSlotRetry<T>(fn: () => Promise<T>): Promise<T> {
@@ -123,11 +140,15 @@ export const projects = new Hono<AuthContext>()
     const user = c.var.user;
     const project = await findProjectOr404(user.id, c.req.param("id"));
     if (!project) return c.notFound();
-    await deletePrefix(`${projectKey(project.id)}/`);
-    await prisma.thumbnail.deleteMany({ where: { video: { projectId: project.id } } });
-    await prisma.video.deleteMany({ where: { projectId: project.id } });
-    await prisma.audio.deleteMany({ where: { projectId: project.id } });
-    await prisma.project.delete({ where: { id: project.id } });
+    const prefix = `${projectKey(project.id)}/`;
+    await prisma.$transaction(async (tx) => {
+      await tx.deletionMark.create({ data: { prefix } });
+      await tx.thumbnail.deleteMany({ where: { video: { projectId: project.id } } });
+      await tx.video.deleteMany({ where: { projectId: project.id } });
+      await tx.audio.deleteMany({ where: { projectId: project.id } });
+      await tx.project.delete({ where: { id: project.id } });
+    });
+    await eagerCleanupAndUnmark(prefix);
     return c.body(null, 204);
   })
 
@@ -197,7 +218,9 @@ export const projects = new Hono<AuthContext>()
           ),
         ]);
       } catch (err) {
-        await deletePrefix(`${projectKey(project.id)}/videos/${videoId}/`).catch(() => {});
+        const _videoCleanupPrefix = `${projectKey(project.id)}/videos/${videoId}/`;
+        await markPrefixForDeletion(_videoCleanupPrefix);
+        void eagerCleanupAndUnmark(_videoCleanupPrefix);
         throw err;
       }
 
@@ -241,7 +264,9 @@ export const projects = new Hono<AuthContext>()
         );
         return { video: row };
       } catch (err) {
-        await deletePrefix(`${projectKey(project.id)}/videos/${videoId}/`).catch(() => {});
+        const _videoCleanupPrefix = `${projectKey(project.id)}/videos/${videoId}/`;
+        await markPrefixForDeletion(_videoCleanupPrefix);
+        void eagerCleanupAndUnmark(_videoCleanupPrefix);
         throw err;
       }
     });
@@ -258,9 +283,13 @@ export const projects = new Hono<AuthContext>()
       where: { id: c.req.param("videoId"), projectId: project.id },
     });
     if (!video) return c.notFound();
-    await deletePrefix(`${projectKey(project.id)}/videos/${video.id}/`);
-    await prisma.thumbnail.deleteMany({ where: { videoId: video.id } });
-    await prisma.video.delete({ where: { id: video.id } });
+    const prefix = `${projectKey(project.id)}/videos/${video.id}/`;
+    await prisma.$transaction(async (tx) => {
+      await tx.deletionMark.create({ data: { prefix } });
+      await tx.thumbnail.deleteMany({ where: { videoId: video.id } });
+      await tx.video.delete({ where: { id: video.id } });
+    });
+    await eagerCleanupAndUnmark(prefix);
     return c.body(null, 204);
   })
 
@@ -344,7 +373,9 @@ export const projects = new Hono<AuthContext>()
           ...(rawKey ? [uploadFile(rawKey, inputPath, contentType)] : []),
         ]);
       } catch (err) {
-        await deletePrefix(`${projectKey(project.id)}/audios/${audioId}/`).catch(() => {});
+        const _audioCleanupPrefix = `${projectKey(project.id)}/audios/${audioId}/`;
+        await markPrefixForDeletion(_audioCleanupPrefix);
+        void eagerCleanupAndUnmark(_audioCleanupPrefix);
         throw err;
       }
 
@@ -379,7 +410,9 @@ export const projects = new Hono<AuthContext>()
         await unlink(inputPath).catch(() => {});
         return { audio: row };
       } catch (err) {
-        await deletePrefix(`${projectKey(project.id)}/audios/${audioId}/`).catch(() => {});
+        const _audioCleanupPrefix = `${projectKey(project.id)}/audios/${audioId}/`;
+        await markPrefixForDeletion(_audioCleanupPrefix);
+        void eagerCleanupAndUnmark(_audioCleanupPrefix);
         throw err;
       }
     });
@@ -396,8 +429,12 @@ export const projects = new Hono<AuthContext>()
       where: { id: c.req.param("audioId"), projectId: project.id },
     });
     if (!audio) return c.notFound();
-    await deletePrefix(`${projectKey(project.id)}/audios/${audio.id}/`);
-    await prisma.audio.delete({ where: { id: audio.id } });
+    const prefix = `${projectKey(project.id)}/audios/${audio.id}/`;
+    await prisma.$transaction(async (tx) => {
+      await tx.deletionMark.create({ data: { prefix } });
+      await tx.audio.delete({ where: { id: audio.id } });
+    });
+    await eagerCleanupAndUnmark(prefix);
     return c.body(null, 204);
   })
 

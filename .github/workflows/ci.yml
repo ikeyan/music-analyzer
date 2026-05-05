@@ -117,13 +117,16 @@ jobs:
           pg_pass=$(openssl rand -hex 16)
           bootstrap_pwd=$(openssl rand -hex 16)
           bootstrap_token=$(openssl rand -hex 32)
+          proxy_secret=$(openssl rand -hex 32)
           echo "::add-mask::$pg_pass"
           echo "::add-mask::$bootstrap_pwd"
           echo "::add-mask::$bootstrap_token"
+          echo "::add-mask::$proxy_secret"
           {
             echo "PG_PASS=$pg_pass"
             echo "AUTHENTIK_BOOTSTRAP_PASSWORD=$bootstrap_pwd"
             echo "AUTHENTIK_BOOTSTRAP_TOKEN=$bootstrap_token"
+            echo "AUTH_PROXY_SECRET=$proxy_secret"
           } >> "$GITHUB_ENV"
 
       # testcontainers経由ではなく直接compose upすることでテスト失敗後もログ採取可能にする
@@ -136,6 +139,7 @@ jobs:
           AUTHENTIK_BOOTSTRAP_EMAIL=${AUTHENTIK_BOOTSTRAP_EMAIL}
           AUTHENTIK_BOOTSTRAP_PASSWORD=${AUTHENTIK_BOOTSTRAP_PASSWORD}
           AUTHENTIK_BOOTSTRAP_TOKEN=${AUTHENTIK_BOOTSTRAP_TOKEN}
+          AUTH_PROXY_SECRET=${AUTH_PROXY_SECRET}
           CADDY_PORT_HTTP=8080
           AUTHENTIK_PORT_HTTP=9000
           AUTHENTIK_PORT_HTTPS=9443
