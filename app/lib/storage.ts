@@ -49,8 +49,11 @@ export async function streamS3(
     const startStr = m[1];
     const endStr = m[2];
     const start = startStr === "" ? Math.max(0, total - Number(endStr)) : Number(startStr);
-    const end = startStr === "" || endStr === "" ? total - 1 : Number(endStr);
-    if (Number.isNaN(start) || Number.isNaN(end) || start > end || end >= total) {
+    // RFC 7233 §2.1: last-byte-pos が現在長以上なら EOF まで読む扱い。
+    // 一部の media client が probing で大きめの end を投げてくるのでクランプする
+    const rawEnd = startStr === "" || endStr === "" ? total - 1 : Number(endStr);
+    const end = Math.min(rawEnd, total - 1);
+    if (Number.isNaN(start) || Number.isNaN(rawEnd) || start > end || start >= total) {
       return new Response(null, { status: 416, headers: { "content-range": `bytes */${total}` } });
     }
     const slice = file.slice(start, end + 1);
