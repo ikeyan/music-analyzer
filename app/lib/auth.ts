@@ -42,9 +42,11 @@ export const requireUser: MiddlewareHandler<AuthContext> = async (c, next) => {
   const sub = headerSub ?? (expectedSecret || !isDevelopment ? null : DEV_SUB);
   if (!sub) return c.json({ error: "unauthenticated" }, 401);
 
-  const username = c.req.header("x-authentik-username") ?? null;
-  const email = c.req.header("x-authentik-email") ?? null;
-  const name = c.req.header("x-authentik-name") ?? null;
+  // header が absent (undefined) のときは update に渡さず既存値を保つ。
+  // Prisma は undefined フィールドを update から無視する
+  const username = c.req.header("x-authentik-username");
+  const email = c.req.header("x-authentik-email");
+  const name = c.req.header("x-authentik-name");
 
   const user = await prisma.user.upsert({
     where: { authentikSub: sub },

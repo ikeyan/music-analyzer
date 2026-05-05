@@ -466,7 +466,7 @@ export const projects = new Hono<AuthContext>()
                 sampleRate: finalProbe.audioStream?.sampleRate || null,
                 channels: finalProbe.audioStream?.channels || null,
                 bitrate: finalProbe.audioStream?.bitrate ?? null,
-                sizeBytes: BigInt(probe.sizeBytes),
+                sizeBytes: BigInt(finalProbe.sizeBytes),
                 srcStartSec: 0,
                 srcEndSec: duration,
                 projStartSec: projStart,
