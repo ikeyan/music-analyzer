@@ -21,13 +21,18 @@ const ensureDocker = async () => {
   }
 };
 
+const setupSandbox = async () => {
+  await ensureDocker();
+  await $`${process.env.CLAUDE_PROJECT_DIR}/.setup-sandbox.sh`;
+};
+
 const pullAgentFiles = async () => {
   if (!existsSync("/root/agent-files")) return;
   await $`git -C /root/agent-files pull --ff-only`;
 };
 
 await Promise.all([
-  ensureDocker(),
+  setupSandbox(),
   $`git -C ${process.env.CLAUDE_PROJECT_DIR} remote set-head origin -a`,
   pullAgentFiles(),
 ]);
