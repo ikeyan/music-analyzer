@@ -171,7 +171,12 @@ export const projects = new Hono<AuthContext>()
       const inputPath = join(tmp, "input" + (extname(file.name) || ".bin"));
       await Bun.write(inputPath, file);
 
-      const probe = await ffprobe(inputPath);
+      let probe;
+      try {
+        probe = await ffprobe(inputPath);
+      } catch {
+        return { error: "could not parse uploaded file", status: 400 as const };
+      }
       if (!probe.videoStream) {
         return { error: "no video stream", status: 400 as const };
       }
@@ -189,7 +194,11 @@ export const projects = new Hono<AuthContext>()
       const thumbDir = join(tmp, "thumbs");
       const tasks: Promise<unknown>[] = [transcodeVideo(inputPath, videoOut, hasAudio)];
       if (hasAudio) tasks.push(extractAudio(inputPath, audioOut));
-      await Promise.all(tasks);
+      try {
+        await Promise.all(tasks);
+      } catch {
+        return { error: "ffmpeg cannot decode this video", status: 400 as const };
+      }
 
       const finalProbe = await ffprobe(videoOut);
       const v = finalProbe.videoStream;
@@ -345,7 +354,12 @@ export const projects = new Hono<AuthContext>()
     const result = await withTempDir("audio-upload", async (tmp) => {
       const inputPath = join(tmp, "input." + ext);
       await Bun.write(inputPath, file);
-      const probe = await ffprobe(inputPath);
+      let probe;
+      try {
+        probe = await ffprobe(inputPath);
+      } catch {
+        return { error: "could not parse uploaded file", status: 400 as const };
+      }
       if (!probe.audioStream) return { error: "no audio stream", status: 400 as const };
       if (
         !Number.isFinite(probe.durationSec) ||
