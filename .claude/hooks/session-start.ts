@@ -21,9 +21,10 @@ const ensureDocker = async () => {
   }
 };
 
-const setupSandbox = async () => {
-  await ensureDocker();
-  await $`${process.env.CLAUDE_PROJECT_DIR}/.setup-sandbox.sh`;
+const installDeps = async () => {
+  const cwd = process.env.CLAUDE_PROJECT_DIR!;
+  await $`bun install --frozen-lockfile`.cwd(cwd);
+  await $`bun run db:generate`.cwd(cwd);
 };
 
 const pullAgentFiles = async () => {
@@ -32,7 +33,8 @@ const pullAgentFiles = async () => {
 };
 
 await Promise.all([
-  setupSandbox(),
+  ensureDocker(),
+  installDeps(),
   $`git -C ${process.env.CLAUDE_PROJECT_DIR} remote set-head origin -a`,
   pullAgentFiles(),
 ]);
