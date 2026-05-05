@@ -66,10 +66,16 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
     return all.toSorted((a, b) => a.data.order - b.data.order);
   }, [data]);
 
-  const projectDuration = useMemo(() => {
-    const ends = tracks.map((t) => Math.max(t.data.projStartSec, t.data.projEndSec));
-    return Math.max(60, ...ends);
-  }, [tracks]);
+  // playEnd は実メディアの終端 (再生停止位置)、displayDuration は ruler の最低幅。
+  // dead-air tail を出さないため再生は playEnd で止め、見た目だけ 60s を確保する
+  const playEnd = useMemo(
+    () =>
+      tracks.length === 0
+        ? 0
+        : Math.max(...tracks.map((t) => Math.max(t.data.projStartSec, t.data.projEndSec))),
+    [tracks],
+  );
+  const displayDuration = useMemo(() => Math.max(60, playEnd), [playEnd]);
 
   const mediaRefs = useRef(new Map<string, HTMLMediaElement>());
   const lastTickRef = useRef<number | null>(null);
@@ -88,9 +94,9 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
       lastTickRef.current = ts;
       setCurrentTime((prev) => {
         const next = prev + dt;
-        if (next >= projectDuration) {
+        if (next >= playEnd) {
           setPlaying(false);
-          return projectDuration;
+          return playEnd;
         }
         return next;
       });
@@ -100,7 +106,7 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
     return () => {
       if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
     };
-  }, [playing, projectDuration]);
+  }, [playing, playEnd]);
 
   useEffect(() => {
     for (const t of tracks) {
@@ -199,7 +205,7 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
     else setError(`削除失敗 (HTTP ${res.status})`);
   }
 
-  const totalWidth = projectDuration * pxPerSec;
+  const totalWidth = displayDuration * pxPerSec;
 
   return (
     <div>
@@ -247,7 +253,7 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
           ⏮
         </button>
         <span style={{ fontVariantNumeric: "tabular-nums" }}>
-          {formatTime(currentTime)} / {formatTime(projectDuration)}
+          {formatTime(currentTime)} / {formatTime(playEnd)}
         </span>
         <label style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: "0.4rem" }}>
           ズーム
@@ -272,7 +278,7 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
         }}
       >
         <div style={{ position: "relative", width: totalWidth, minHeight: 80 }}>
-          <TimeRuler duration={projectDuration} pxPerSec={pxPerSec} />
+          <TimeRuler duration={displayDuration} pxPerSec={pxPerSec} />
           <div style={{ position: "relative" }}>
             {tracks.map((t, idx) => (
               <TrackRow
@@ -282,7 +288,7 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
                 pxPerSec={pxPerSec}
                 onSeek={(time) => {
                   setPlaying(false);
-                  setCurrentTime(Math.max(0, Math.min(projectDuration, time)));
+                  setCurrentTime(Math.max(0, Math.min(displayDuration, time)));
                 }}
                 onDelete={() => deleteTrack(t)}
                 attachRef={(el) => {

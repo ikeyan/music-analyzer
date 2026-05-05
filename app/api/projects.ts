@@ -157,7 +157,12 @@ export const projects = new Hono<AuthContext>()
     const project = await findProjectOr404(user.id, c.req.param("id"));
     if (!project) return c.notFound();
 
-    const form = await c.req.raw.formData();
+    let form;
+    try {
+      form = await c.req.raw.formData();
+    } catch {
+      return c.json({ error: "invalid multipart body" }, 400);
+    }
     const file = form.get("file");
     if (!(file instanceof File) || file.size === 0) {
       return c.json({ error: "file required" }, 400);
@@ -340,7 +345,12 @@ export const projects = new Hono<AuthContext>()
     const project = await findProjectOr404(user.id, c.req.param("id"));
     if (!project) return c.notFound();
 
-    const form = await c.req.raw.formData();
+    let form;
+    try {
+      form = await c.req.raw.formData();
+    } catch {
+      return c.json({ error: "invalid multipart body" }, 400);
+    }
     const file = form.get("file");
     if (!(file instanceof File) || file.size === 0) {
       return c.json({ error: "file required" }, 400);
