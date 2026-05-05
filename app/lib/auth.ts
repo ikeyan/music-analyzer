@@ -16,7 +16,7 @@ const DEV_SUB = "dev:local";
 // authentikを通っていない直接アクセスを fail-closed にするための
 // defense-in-depth (header signing/JWT検証ではないが、proxyを必ず通したい
 // 運用要件を最低限担保する)
-function constantTimeEqual(a: string, b: string): boolean {
+export function constantTimeEqual(a: string, b: string): boolean {
   const ab = Buffer.from(a, "utf8");
   const bb = Buffer.from(b, "utf8");
   if (ab.length !== bb.length) return false;

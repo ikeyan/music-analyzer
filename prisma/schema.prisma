@@ -108,12 +108,15 @@ model Thumbnail {
 // 同期best-effort cleanupが失敗してもsweeperが拾うので
 // (DB, S3) は eventually consistent になる
 model DeletionMark {
-  id        String   @id @default(cuid())
-  prefix    String
-  attempts  Int      @default(0)
-  lastError String?
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  id          String   @id @default(cuid())
+  prefix      String
+  attempts    Int      @default(0)
+  lastError   String?
+  // 次に sweeper が拾える時刻。挿入時は upload grace 分先 (orphan 防止用墓標を
+  // upload 完了より前に置くため、sweeper が in-progress な S3 を消さないよう grace を取る)
+  nextRetryAt DateTime @default(now())
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
 
-  @@index([createdAt])
+  @@index([nextRetryAt])
 }

@@ -29,6 +29,27 @@ export async function deletePrefix(prefix: string): Promise<void> {
   } while (continuationToken);
 }
 
+// HTTP Range の解析。RFC 7233 §2.1 に準拠して end >= total は EOF にクランプ。
+// suffix range (`bytes=-N`) は末尾Nバイトを返す
+export type RangeResolved = { start: number; end: number };
+export function parseRange(
+  rangeHeader: string | null | undefined,
+  total: number,
+): RangeResolved | "invalid" | null {
+  if (!rangeHeader) return null;
+  const m = /^bytes=(\d*)-(\d*)$/.exec(rangeHeader);
+  if (!m) return "invalid";
+  const startStr = m[1];
+  const endStr = m[2];
+  if (startStr === "" && endStr === "") return "invalid";
+  const start = startStr === "" ? Math.max(0, total - Number(endStr)) : Number(startStr);
+  const rawEnd = startStr === "" || endStr === "" ? total - 1 : Number(endStr);
+  const end = Math.min(rawEnd, total - 1);
+  if (Number.isNaN(start) || Number.isNaN(rawEnd) || start > end || start >= total)
+    return "invalid";
+  return { start, end };
+}
+
 export async function streamS3(
   c: Context,
   key: string,
@@ -41,21 +62,12 @@ export async function streamS3(
   const total = stat.size;
   const type = stat.type || fallbackContentType || "application/octet-stream";
 
-  const range = c.req.header("range");
-  if (range) {
-    const m = /^bytes=(\d*)-(\d*)$/.exec(range);
-    if (!m)
-      return new Response(null, { status: 416, headers: { "content-range": `bytes */${total}` } });
-    const startStr = m[1];
-    const endStr = m[2];
-    const start = startStr === "" ? Math.max(0, total - Number(endStr)) : Number(startStr);
-    // RFC 7233 §2.1: last-byte-pos が現在長以上なら EOF まで読む扱い。
-    // 一部の media client が probing で大きめの end を投げてくるのでクランプする
-    const rawEnd = startStr === "" || endStr === "" ? total - 1 : Number(endStr);
-    const end = Math.min(rawEnd, total - 1);
-    if (Number.isNaN(start) || Number.isNaN(rawEnd) || start > end || start >= total) {
-      return new Response(null, { status: 416, headers: { "content-range": `bytes */${total}` } });
-    }
+  const parsed = parseRange(c.req.header("range"), total);
+  if (parsed === "invalid") {
+    return new Response(null, { status: 416, headers: { "content-range": `bytes */${total}` } });
+  }
+  if (parsed) {
+    const { start, end } = parsed;
     const slice = file.slice(start, end + 1);
     return new Response(slice.stream(), {
       status: 206,

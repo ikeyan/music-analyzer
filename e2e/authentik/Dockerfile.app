@@ -19,6 +19,7 @@ COPY app ./app
 
 RUN mkdir -p /data
 ENV DATABASE_URL=file:/data/dev.db
+ENV NODE_ENV=development
 
 EXPOSE 5173
 
