@@ -7,20 +7,23 @@ if (process.env.CLAUDE_CODE_REMOTE !== "true") process.exit(0);
 const dockerReady = async () =>
   (await $`docker ps`.quiet().nothrow()).exitCode === 0;
 
-if (!(await dockerReady())) {
+const ensureDocker = async () => {
+  if (await dockerReady()) return;
   const log = openSync("/tmp/dockerd.log", "a");
   Bun.spawn(["sudo", "dockerd"], {
     stdin: "ignore",
     stdout: log,
     stderr: log,
   }).unref();
-
   const deadline = Date.now() + 30_000;
   while (!(await dockerReady())) {
     if (Date.now() > deadline) throw new Error("dockerd not ready in 30s");
     await Bun.sleep(200);
   }
-}
+};
 
-await $`git -C ${process.env.CLAUDE_PROJECT_DIR} remote set-head origin -a`;
-await $`git -C /root/agent-files pull --ff-only`;
+await Promise.all([
+  ensureDocker(),
+  $`git -C ${process.env.CLAUDE_PROJECT_DIR} remote set-head origin -a`,
+  $`git -C /root/agent-files pull --ff-only`,
+]);
