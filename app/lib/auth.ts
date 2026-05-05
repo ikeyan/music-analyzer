@@ -25,20 +25,21 @@ export function constantTimeEqual(a: string, b: string): boolean {
 
 export const requireUser: MiddlewareHandler<AuthContext> = async (c, next) => {
   const expectedSecret = process.env.AUTH_PROXY_SECRET;
-  const isProduction = process.env.NODE_ENV === "production";
+  // dev fallback (DEV_SUB) は NODE_ENV=development のときだけ。staging/test/unset は fail-closed
+  const isDevelopment = process.env.NODE_ENV === "development";
 
   if (expectedSecret) {
     const provided = c.req.header("x-auth-proxy-secret");
     if (!provided || !constantTimeEqual(provided, expectedSecret)) {
       return c.json({ error: "unauthenticated" }, 401);
     }
-  } else if (isProduction) {
-    // 本番でsecret未設定はheader spoofを許す状態なので fail-closed にする
+  } else if (!isDevelopment) {
+    // secret 未設定 + 非 development は header spoof を許す状態なので fail-closed
     return c.json({ error: "AUTH_PROXY_SECRET not configured" }, 503);
   }
 
   const headerSub = c.req.header("x-authentik-uid");
-  const sub = headerSub ?? (expectedSecret || isProduction ? null : DEV_SUB);
+  const sub = headerSub ?? (expectedSecret || !isDevelopment ? null : DEV_SUB);
   if (!sub) return c.json({ error: "unauthenticated" }, 401);
 
   const username = c.req.header("x-authentik-username") ?? null;
