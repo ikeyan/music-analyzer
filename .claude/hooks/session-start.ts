@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 import { $ } from "bun";
-import { openSync } from "node:fs";
+import { existsSync, openSync } from "node:fs";
 
 if (process.env.CLAUDE_CODE_REMOTE !== "true") process.exit(0);
 
@@ -21,8 +21,13 @@ const ensureDocker = async () => {
   }
 };
 
+const pullAgentFiles = async () => {
+  if (!existsSync("/root/agent-files")) return;
+  await $`git -C /root/agent-files pull --ff-only`;
+};
+
 await Promise.all([
   ensureDocker(),
   $`git -C ${process.env.CLAUDE_PROJECT_DIR} remote set-head origin -a`,
-  $`git -C /root/agent-files pull --ff-only`,
+  pullAgentFiles(),
 ]);
