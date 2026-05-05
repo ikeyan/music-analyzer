@@ -1,0 +1,6 @@
+[test]
+# bun test --coverage で出すレポートから自動生成と e2e helper を除外
+# (e2e は別 job で走らせるためここの unit test では import していない)
+coveragePathIgnorePatterns = ["**/app/generated/**", "**/e2e/**"]
+coverageReporter = ["text", "lcov"]
+coverageDir = "coverage"

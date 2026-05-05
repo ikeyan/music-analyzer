@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
-import { bigintReplacer } from "./json";
+import { Hono } from "hono";
+import { bigintReplacer, jsonResponse } from "./json";
 
 describe("bigintReplacer", () => {
   it("converts bigint to number", () => {
@@ -21,5 +22,22 @@ describe("bigintReplacer", () => {
     const proto = BigInt.prototype as unknown as { toJSON?: unknown };
     expect(proto.toJSON).toBeUndefined();
     expect(() => JSON.stringify(123n)).toThrow();
+  });
+});
+
+describe("jsonResponse", () => {
+  it("serializes bigint and sets json content-type with status", async () => {
+    const app = new Hono().get("/", (c) => jsonResponse(c, { size: 9_000_000_000n }, 201));
+    const res = await app.request("/");
+    expect(res.status).toBe(201);
+    expect(res.headers.get("content-type")).toMatch(/^application\/json/);
+    expect(await res.json()).toEqual({ size: 9_000_000_000 });
+  });
+
+  it("defaults to status 200", async () => {
+    const app = new Hono().get("/", (c) => jsonResponse(c, { ok: true }));
+    const res = await app.request("/");
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true });
   });
 });
