@@ -1,8 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { Hono } from "hono";
-import { clearDb } from "../test-fixtures/db";
+import { useDbFixture } from "../test-fixtures/db";
 import { type AuthContext, constantTimeEqual, requireUser } from "./auth";
 import { prisma } from "./prisma";
+
+useDbFixture();
 
 describe("constantTimeEqual", () => {
   it("returns true for equal strings", () => {
@@ -47,7 +49,6 @@ function makeApp() {
 
 beforeEach(async () => {
   savedEnv = Object.fromEntries(ENV_KEYS.map((k) => [k, process.env[k]]));
-  await clearDb();
 });
 
 afterEach(() => {

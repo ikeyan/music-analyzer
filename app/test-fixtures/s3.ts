@@ -1,7 +1,7 @@
 // テストプロセス内で共有される MinIO フィクスチャ。
-// 複数のテストファイルから ensureS3Fixture() を呼んでも MinIO container は1度しか起動しない。
-// container 自体は testcontainers の Ryuk によりプロセス終了時に自動回収されるので明示的な
-// teardown は不要。test 間でバケットを空に戻したい場合は clearS3Bucket() を beforeEach 等で呼ぶ
+// 複数のテストファイルが useS3Fixture() を呼んでも MinIO container は1度しか起動しない。
+// container 自体は testcontainers の Ryuk によりプロセス終了時に自動回収される
+import { beforeAll, beforeEach } from "bun:test";
 import { GenericContainer, Wait } from "testcontainers";
 import { MINIO_IMAGE } from "../test-images";
 
@@ -37,14 +37,13 @@ async function init(): Promise<void> {
   resetS3ForTest();
 }
 
-export async function ensureS3Fixture(): Promise<void> {
+async function ensureS3Fixture(): Promise<void> {
   if (!initPromise) initPromise = init();
   await initPromise;
 }
 
-// バケット内の全オブジェクトを削除する。テスト間の干渉を切りたいときに beforeEach で呼ぶ
-export async function clearS3Bucket(): Promise<void> {
-  await ensureS3Fixture();
+// バケット内の全オブジェクトを削除する。テスト間の干渉を切るため beforeEach から呼ぶ
+async function clearS3Bucket(): Promise<void> {
   const { getS3 } = await import("../lib/s3");
   const s3 = getS3();
   let token: string | undefined;
@@ -55,4 +54,9 @@ export async function clearS3Bucket(): Promise<void> {
     }
     token = result.isTruncated ? result.nextContinuationToken : undefined;
   } while (token);
+}
+
+export function useS3Fixture(): void {
+  beforeAll(ensureS3Fixture, STARTUP_TIMEOUT_MS);
+  beforeEach(clearS3Bucket);
 }

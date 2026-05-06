@@ -1,19 +1,13 @@
-import { beforeAll, beforeEach, describe, expect, it } from "bun:test";
+import { beforeAll, describe, expect, it } from "bun:test";
 import { Hono } from "hono";
-import { clearS3Bucket, ensureS3Fixture } from "./test-fixtures/s3";
+import { useS3Fixture } from "./test-fixtures/s3";
 
-const STARTUP_TIMEOUT_MS = 120_000;
+useS3Fixture();
 
 let app: Hono;
-
 beforeAll(async () => {
-  await ensureS3Fixture();
   const { blobs } = await import("./api/blobs");
   app = new Hono().route("/api/blobs", blobs);
-}, STARTUP_TIMEOUT_MS);
-
-beforeEach(async () => {
-  await clearS3Bucket();
 });
 
 describe("/api/blobs", () => {

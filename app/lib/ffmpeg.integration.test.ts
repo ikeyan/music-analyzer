@@ -1,7 +1,7 @@
-import { beforeAll, describe, expect, it } from "bun:test";
+import { describe, expect, it } from "bun:test";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
-import { ensureMediaFixture, type MediaFixture } from "../test-fixtures/media";
+import { useMediaFixture } from "../test-fixtures/media";
 import {
   extractAudio,
   extractThumbnails,
@@ -11,17 +11,11 @@ import {
   withTempDir,
 } from "./ffmpeg";
 
-const STARTUP_TIMEOUT_MS = 30_000;
-
-let media: MediaFixture;
-
-beforeAll(async () => {
-  media = await ensureMediaFixture();
-}, STARTUP_TIMEOUT_MS);
+const getMedia = useMediaFixture();
 
 describe("ffprobe", () => {
   it("returns video and audio streams for a normal mp4", async () => {
-    const probe = await ffprobe(media.videoMp4);
+    const probe = await ffprobe(getMedia().videoMp4);
     expect(probe.videoStream).not.toBeNull();
     expect(probe.audioStream).not.toBeNull();
     expect(probe.videoStream?.codec).toBe("h264");
@@ -34,27 +28,27 @@ describe("ffprobe", () => {
   });
 
   it("returns null audioStream for a silent mp4", async () => {
-    const probe = await ffprobe(media.silentMp4);
+    const probe = await ffprobe(getMedia().silentMp4);
     expect(probe.videoStream).not.toBeNull();
     expect(probe.audioStream).toBeNull();
   });
 
   it("identifies an mp3 audio file", async () => {
-    const probe = await ffprobe(media.audioMp3);
+    const probe = await ffprobe(getMedia().audioMp3);
     expect(probe.videoStream).toBeNull();
     expect(probe.audioStream?.codec).toBe("mp3");
     expect(probe.formatName).toContain("mp3");
   });
 
   it("identifies a wav audio file", async () => {
-    const probe = await ffprobe(media.audioWav);
+    const probe = await ffprobe(getMedia().audioWav);
     expect(probe.videoStream).toBeNull();
     expect(probe.audioStream?.codec).toMatch(/^pcm_/);
     expect(probe.formatName).toContain("wav");
   });
 
   it("throws on a non-media file", async () => {
-    await expect(ffprobe(media.corruptFile)).rejects.toThrow(/ffprobe failed/);
+    await expect(ffprobe(getMedia().corruptFile)).rejects.toThrow(/ffprobe failed/);
   });
 });
 
@@ -62,7 +56,7 @@ describe("transcodeVideo", () => {
   it("produces a playable mp4 with audio when input has audio", async () => {
     await withTempDir("test-transcode-", async (dir) => {
       const out = join(dir, "out.mp4");
-      await transcodeVideo(media.videoMp4, out, true);
+      await transcodeVideo(getMedia().videoMp4, out, true);
       expect(existsSync(out)).toBe(true);
       const probe = await ffprobe(out);
       expect(probe.videoStream?.codec).toBe("h264");
@@ -73,7 +67,7 @@ describe("transcodeVideo", () => {
   it("produces a silent mp4 when hasAudio=false (-an)", async () => {
     await withTempDir("test-transcode-silent-", async (dir) => {
       const out = join(dir, "out.mp4");
-      await transcodeVideo(media.silentMp4, out, false);
+      await transcodeVideo(getMedia().silentMp4, out, false);
       const probe = await ffprobe(out);
       expect(probe.videoStream).not.toBeNull();
       expect(probe.audioStream).toBeNull();
@@ -85,7 +79,9 @@ describe("transcodeVideo", () => {
       const out = join(dir, "out.mp4");
       const ac = new AbortController();
       ac.abort();
-      await expect(transcodeVideo(media.videoMp4, out, true, ac.signal)).rejects.toThrow(/aborted/);
+      await expect(transcodeVideo(getMedia().videoMp4, out, true, ac.signal)).rejects.toThrow(
+        /aborted/,
+      );
     });
   });
 });
@@ -94,7 +90,7 @@ describe("extractAudio / transcodeAudio", () => {
   it("extracts AAC audio from a video", async () => {
     await withTempDir("test-extract-", async (dir) => {
       const out = join(dir, "out.m4a");
-      await extractAudio(media.videoMp4, out);
+      await extractAudio(getMedia().videoMp4, out);
       const probe = await ffprobe(out);
       expect(probe.audioStream?.codec).toBe("aac");
       expect(probe.videoStream).toBeNull();
@@ -104,7 +100,7 @@ describe("extractAudio / transcodeAudio", () => {
   it("normalizes mp3 input to AAC m4a (transcodeAudio is alias of extractAudio)", async () => {
     await withTempDir("test-transcode-audio-", async (dir) => {
       const out = join(dir, "out.m4a");
-      await transcodeAudio(media.audioMp3, out);
+      await transcodeAudio(getMedia().audioMp3, out);
       const probe = await ffprobe(out);
       expect(probe.audioStream?.codec).toBe("aac");
       expect(probe.audioStream?.sampleRate).toBe(48000);
@@ -116,9 +112,9 @@ describe("extractAudio / transcodeAudio", () => {
 describe("extractThumbnails", () => {
   it("emits thumbnails at 10s intervals for an 11s video (t=0 と t=10)", async () => {
     await withTempDir("test-thumbs-", async (dir) => {
-      const probe = await ffprobe(media.videoMp4);
+      const probe = await ffprobe(getMedia().videoMp4);
       const thumbs = await extractThumbnails(
-        media.videoMp4,
+        getMedia().videoMp4,
         dir,
         probe.durationSec,
         probe.videoStream?.width ?? 320,

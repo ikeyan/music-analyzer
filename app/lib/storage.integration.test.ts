@@ -1,18 +1,10 @@
-import { beforeAll, beforeEach, describe, expect, it } from "bun:test";
+import { describe, expect, it } from "bun:test";
 import { Hono } from "hono";
-import { clearS3Bucket, ensureS3Fixture } from "../test-fixtures/s3";
+import { useS3Fixture } from "../test-fixtures/s3";
 import { getS3 } from "./s3";
 import { deletePrefix, streamS3 } from "./storage";
 
-const STARTUP_TIMEOUT_MS = 120_000;
-
-beforeAll(async () => {
-  await ensureS3Fixture();
-}, STARTUP_TIMEOUT_MS);
-
-beforeEach(async () => {
-  await clearS3Bucket();
-});
+useS3Fixture();
 
 async function put(key: string, body: string, type = "application/octet-stream"): Promise<void> {
   await getS3().write(key, body, { type });
