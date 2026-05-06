@@ -1,4 +1,5 @@
 import { beforeAll, beforeEach } from "bun:test";
+import assert from "node:assert";
 import { prisma } from "../lib/prisma";
 
 // FK 順: thumbnail → video, audio, deletionMark → project → user
@@ -11,18 +12,13 @@ export async function clearDb(): Promise<void> {
   await prisma.user.deleteMany();
 }
 
-function assertDatabaseUrlSet(url: string | undefined): asserts url is string {
-  if (!url?.startsWith("file:")) {
-    throw new Error(
-      "useDbFixture: DATABASE_URL not set. Run via `bun test` so bunfig preload runs.",
-    );
-  }
-}
-
 // prisma を使う test は先頭で1回呼ぶ。beforeEach(clearDb) が自動で入る
 export function useDbFixture(): void {
   beforeAll(() => {
-    assertDatabaseUrlSet(process.env.DATABASE_URL);
+    assert(
+      process.env.DATABASE_URL?.startsWith("file:"),
+      "useDbFixture: DATABASE_URL not set. Run via `bun test` so bunfig preload runs.",
+    );
   });
   beforeEach(clearDb);
 }

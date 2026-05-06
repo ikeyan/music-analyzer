@@ -406,7 +406,7 @@ export const projects = new Hono<AuthContext>()
     if (!project) return c.json({ error: "project not found" }, 404);
 
     const declared = Number(c.req.header("content-length") ?? "");
-    if (Number.isFinite(declared) && declared > MAX_UPLOAD_BYTES) {
+    if (Number.isFinite(declared) && declared > MAX_UPLOAD_BYTES + MULTIPART_OVERHEAD_SLACK) {
       return c.json({ error: `file too large (max ${MAX_UPLOAD_BYTES} bytes)` }, 413);
     }
 
