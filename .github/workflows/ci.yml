@@ -86,9 +86,10 @@ jobs:
           chmod +x "${RUNNER_TEMP}/bin/ffmpeg" "${RUNNER_TEMP}/bin/ffprobe"
           echo "${RUNNER_TEMP}/bin" >> "$GITHUB_PATH"
 
-      # Bun.WebView (frontend テスト用)。snap chromium は sandbox 制限で動かないので
-      # chrome-for-testing zip を直接展開し、root 実行で sandbox が無効になる問題は
-      # --no-sandbox を強制する wrapper script で吸収する
+      # Bun.WebView (frontend テスト用)。chrome-for-testing zip を runner temp に
+      # 展開し、Chrome の zygote sandbox が runner で動かないので --no-sandbox を
+      # 強制する wrapper script を介して呼ぶ。
+      # 共有ライブラリ (libnss3 等) は runner image の preinstall Chrome 用に揃っている前提
       - name: Install Chrome for testing
         run: |
           set -euo pipefail
@@ -98,12 +99,6 @@ jobs:
           curl -fsSL "https://storage.googleapis.com/chrome-for-testing-public/${version}/linux64/chrome-linux64.zip" -o "${RUNNER_TEMP}/chrome.zip"
           unzip -q -o "${RUNNER_TEMP}/chrome.zip" -d "${RUNNER_TEMP}/chrome-extracted"
           cp -r "${RUNNER_TEMP}/chrome-extracted/chrome-linux64/." "$dir/"
-          # 必要な共有ライブラリ
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 libxkbcommon0 \
-            libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 libpango-1.0-0 \
-            libcairo2 libasound2t64
           wrap="${RUNNER_TEMP}/chrome-wrap"
           printf '#!/bin/sh\nexec "%s/chrome" --no-sandbox "$@"\n' "$dir" > "$wrap"
           chmod +x "$wrap"
