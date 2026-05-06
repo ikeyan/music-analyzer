@@ -167,7 +167,11 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
 
   // ブラウザのautoplay policyはuser-gesture同期コンテキストで呼ばれた play() しか許さない。
   // useEffect 経由だと初回再生で NotAllowedError になるので、クリックハンドラ内で
-  // 全媒体を一度 play() して unlock した上で playing=true にする
+  // 全媒体を一度 play() して unlock した上で playing=true にする。
+  // 範囲外の要素も「play() を resolve させてから pause」する順番が大事:
+  // 同期的に play().then-pause せずに pause を被せると AbortError 扱いになり、
+  // 元の play() が「成功した」とブラウザに見なされず unlock がされない
+  // (後から playhead が到達したときに NotAllowedError で再生不能になる)
   function startPlayback() {
     let blocked = false;
     for (const t of tracks) {
@@ -177,18 +181,20 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
       const projHigh = Math.max(t.data.projStartSec, t.data.projEndSec);
       const inRange = currentTime >= projLow && currentTime <= projHigh;
       const promise = el.play();
-      if (promise && typeof promise.catch === "function") {
-        promise.catch((err: unknown) => {
-          // pause() を被せた時の AbortError は想定内、それ以外は autoplay block
-          if (err instanceof DOMException && err.name === "AbortError") return;
-          if (!blocked) {
-            blocked = true;
-            setPlaying(false);
-            setError("ブラウザのautoplay制限で再生できませんでした。もう一度押してください。");
-          }
-        });
+      if (promise && typeof promise.then === "function") {
+        promise
+          .then(() => {
+            if (!inRange) el.pause();
+          })
+          .catch((err: unknown) => {
+            if (err instanceof DOMException && err.name === "AbortError") return;
+            if (!blocked) {
+              blocked = true;
+              setPlaying(false);
+              setError("ブラウザのautoplay制限で再生できませんでした。もう一度押してください。");
+            }
+          });
       }
-      if (!inRange) el.pause();
     }
     setError(null);
     setPlaying(true);
