@@ -283,9 +283,23 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
           background: "#fafafa",
         }}
       >
-        <div style={{ position: "relative", width: totalWidth, minHeight: 80 }}>
+        <div
+          style={{
+            position: "relative",
+            width: totalWidth,
+            // TrackRow は absolute なので親がコンテンツ高さを取れない。
+            // ruler 24px + 各 row + gap でレーン全体を確保し、2件以上でも
+            // overflowY: hidden で潰れないようにする
+            minHeight: 24 + Math.max(1, tracks.length) * (TRACK_HEIGHT + TRACK_GAP),
+          }}
+        >
           <TimeRuler duration={displayDuration} pxPerSec={pxPerSec} />
-          <div style={{ position: "relative" }}>
+          <div
+            style={{
+              position: "relative",
+              height: tracks.length * (TRACK_HEIGHT + TRACK_GAP),
+            }}
+          >
             {tracks.map((t, idx) => (
               <TrackRow
                 key={trackKey(t)}
