@@ -263,13 +263,18 @@ export const projects = new Hono<AuthContext>()
         const vKey = videoSourceKey(project.id, videoId);
         const aKey = hasAudio ? videoAudioKey(project.id, videoId) : null;
 
-        await Promise.all([
+        // Promise.all の fast-fail だと未完了の upload が残ったまま eager cleanup
+        // が走り、cleanup → slower upload 完了の順で orphan を生むので allSettled
+        // で全 upload の決着を待ってから throw する
+        const uploadResults = await Promise.allSettled([
           uploadFile(vKey, videoOut, "video/mp4"),
           ...(aKey ? [uploadFile(aKey, audioOut, "audio/mp4")] : []),
           ...thumbs.map((t) =>
             uploadFile(videoThumbKey(project.id, videoId, t.atSec), t.path, "image/jpeg"),
           ),
         ]);
+        const failed = uploadResults.find((r) => r.status === "rejected");
+        if (failed) throw failed.reason;
 
         const duration = finalProbe.durationSec;
         const row = await withSlotRetry(() =>
@@ -457,10 +462,12 @@ export const projects = new Hono<AuthContext>()
         const transcodedKey = audioTranscodedKey(project.id, audioId);
         const rawKey = keepRaw ? audioRawKey(project.id, audioId, ext) : null;
 
-        await Promise.all([
+        const uploadResults = await Promise.allSettled([
           uploadFile(transcodedKey, transcodedPath, "audio/mp4"),
           ...(rawKey ? [uploadFile(rawKey, inputPath, contentType)] : []),
         ]);
+        const failed = uploadResults.find((r) => r.status === "rejected");
+        if (failed) throw failed.reason;
 
         const duration = finalProbe.durationSec;
         const row = await withSlotRetry(() =>
