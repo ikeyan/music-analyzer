@@ -30,9 +30,7 @@ export type AudioItem = {
   srcEndSec: number;
   projStartSec: number;
   projEndSec: number;
-  // 標準化AAC m4aの再生URL (常に存在)
   streamUrl: string;
-  // ブラウザ再生可能と判断した raw 入力のURL (存在する場合)
   rawUrl: string | null;
   rawContentType: string | null;
 };
@@ -66,8 +64,7 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
     return all.toSorted((a, b) => a.data.order - b.data.order);
   }, [data]);
 
-  // playEnd は実メディアの終端 (再生停止位置)、displayDuration は ruler の最低幅。
-  // dead-air tail を出さないため再生は playEnd で止め、見た目だけ 60s を確保する
+  // playEnd で再生停止、displayDuration (>=60s) で ruler の最低幅を確保
   const playEnd = useMemo(
     () =>
       tracks.length === 0
@@ -165,9 +162,7 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
     }
   }
 
-  // 全 track を click handler 内で play() し、resolve 後に pause で unlock する。
-  // 同期 pause は play() を AbortError にして unlock 失敗扱いになるので使えない。
-  // 範囲外 track は play→pause の間に音漏れしないよう一時 mute して restore する
+  // user-gesture 内で play().then(pause) して全 track を unlock。範囲外は mute で音漏れを防ぐ
   function startPlayback() {
     let blocked = false;
     for (const t of tracks) {
@@ -573,9 +568,7 @@ function TrackRow({
           style={{ display: "none" }}
           aria-hidden="true"
         >
-          {/* timeline の durationSec / projEndSec は transcoded probe 由来なので
-              再生対象も transcoded を第一候補にして drift を出さない。raw は
-              transcoded が decode できなかった場合のフォールバック */}
+          {/* timing は transcoded probe 由来なので再生対象も transcoded を優先する */}
           <source src={(item as AudioItem).streamUrl} type="audio/mp4" />
           {(item as AudioItem).rawUrl && (
             <source

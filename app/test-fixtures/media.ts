@@ -1,11 +1,8 @@
-// ffmpeg 統合テスト用の小さな fixture media を temp に生成する。
-// プロセス内で1度だけ生成 (lazy cache) して、複数の test file から useMediaFixture() で参照する
 import { $ } from "bun";
 import { beforeAll } from "bun:test";
-import { rmSync } from "node:fs";
-import { mkdtemp, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { makePersistentTempDir } from "./temp";
 
 const FFMPEG = process.env.FFMPEG_PATH ?? "ffmpeg";
 const STARTUP_TIMEOUT_MS = 30_000;
@@ -36,22 +33,14 @@ async function runFfmpeg(args: string[]): Promise<void> {
 }
 
 async function init(): Promise<MediaFixture> {
-  const dir = await mkdtemp(join(tmpdir(), "music-analyzer-test-media-"));
-  process.on("exit", () => {
-    try {
-      rmSync(dir, { recursive: true, force: true });
-    } catch {
-      /* exit handler では throw できない */
-    }
-  });
-
+  const dir = await makePersistentTempDir("music-analyzer-test-media-");
   const videoMp4 = join(dir, "video.mp4");
   const silentMp4 = join(dir, "silent.mp4");
   const audioMp3 = join(dir, "audio.mp3");
   const audioWav = join(dir, "audio.wav");
   const corruptFile = join(dir, "corrupt.bin");
 
-  // 青色映像 + 440Hz サイン波 11秒。preset ultrafast で高速生成
+  // 11秒なのは extractThumbnails が 10s 間隔で 2枚出すサンプルが必要なため
   await runFfmpeg([
     "-f",
     "lavfi",
@@ -73,7 +62,6 @@ async function init(): Promise<MediaFixture> {
     videoMp4,
   ]);
 
-  // 赤色映像 11秒、音声なし
   await runFfmpeg([
     "-f",
     "lavfi",
@@ -102,7 +90,7 @@ async function ensureMediaFixture(): Promise<MediaFixture> {
   return await initPromise;
 }
 
-// media を使う test ファイルが先頭で1回呼ぶ。返り値の getter で fixture path を取る
+// media を使う test は先頭で1回呼ぶ。getter で fixture path を取る
 export function useMediaFixture(): () => MediaFixture {
   beforeAll(async () => {
     await ensureMediaFixture();

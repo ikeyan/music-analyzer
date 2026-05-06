@@ -1,11 +1,10 @@
+import { addAbortListener } from "node:events";
 import { mkdir, mkdtemp, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 export const MAX_DURATION_SEC = 3600;
-// 1h動画の transcode 入力として現実的な上限。8GB は 1h@~17Mbps 相当で
-// 仕様 (1080p/8Mbps出力) に対し十分余裕がある。disk と ffmpeg を専有しないように
-// この閾値で 413 を返す
+// 1h@~17Mbps 相当。仕様 (1080p/8Mbps 出力) に十分余裕
 export const MAX_UPLOAD_BYTES = 8 * 1024 * 1024 * 1024;
 export const THUMBNAIL_INTERVAL_SEC = 10;
 export const THUMBNAIL_WIDTH = 320;
@@ -118,16 +117,11 @@ async function runFfmpeg(args: string[], signal?: AbortSignal): Promise<void> {
     stdout: "pipe",
     stderr: "pipe",
   });
-  const onAbort = () => proc.kill();
-  signal?.addEventListener("abort", onAbort, { once: true });
-  try {
-    const [stderr, exitCode] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
-    if (signal?.aborted) throw new Error("ffmpeg aborted");
-    if (exitCode !== 0) {
-      throw new Error(`ffmpeg failed (exit ${exitCode}): ${stderr.slice(0, 1000)}`);
-    }
-  } finally {
-    signal?.removeEventListener("abort", onAbort);
+  using _abort = signal ? addAbortListener(signal, () => proc.kill()) : null;
+  const [stderr, exitCode] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
+  if (signal?.aborted) throw new Error("ffmpeg aborted");
+  if (exitCode !== 0) {
+    throw new Error(`ffmpeg failed (exit ${exitCode}): ${stderr.slice(0, 1000)}`);
   }
 }
 
@@ -202,11 +196,9 @@ export async function extractAudio(
   );
 }
 
-// AAC m4a (audio/mp4) に正規化。extractAudio と同じ出力設定を音声単独入力に使う
 export const transcodeAudio = extractAudio;
 
-// ブラウザのHTMLMediaElementが再生し得る codec/container の保守的な許容セット。
-// 「ほとんどの主要ブラウザで再生可」を基準とし、保留 (alac/wma/opus-in-ogg-Safariなど) は除外しない方向で広めに
+// HTMLMediaElement が再生しうる codec / container の許容セット
 const BROWSER_AUDIO_CODECS = new Set([
   "aac",
   "mp3",
@@ -235,7 +227,7 @@ export type ThumbnailFile = {
   height: number;
 };
 
-// 0,10,20,...秒のサムネイルをoutDirへ出力。ファイル名はthumb-000010.jpg
+// 0, 10, 20... 秒のサムネイルを outDir/thumb-NNNNNN.jpg に出力する
 export async function extractThumbnails(
   input: string,
   outDir: string,
@@ -276,11 +268,15 @@ export async function extractThumbnails(
     .filter((t) => t.atSec <= durationSec);
 }
 
-export async function withTempDir<T>(prefix: string, fn: (dir: string) => Promise<T>): Promise<T> {
-  const dir = await mkdtemp(join(tmpdir(), `${prefix}-`));
-  try {
-    return await fn(dir);
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
+export type DisposableTempDir = { path: string } & AsyncDisposable;
+
+// await using でスコープ終了時に rm するテンポラリディレクトリ
+export async function tempDir(prefix: string): Promise<DisposableTempDir> {
+  const path = await mkdtemp(join(tmpdir(), `${prefix}-`));
+  return {
+    path,
+    [Symbol.asyncDispose]: async () => {
+      await rm(path, { recursive: true, force: true });
+    },
+  };
 }

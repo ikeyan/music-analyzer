@@ -11,11 +11,6 @@ export type AuthContext = {
 
 const DEV_SUB = "dev:local";
 
-// Caddy → 本サービス間で共有する secret。設定されていれば全リクエストの
-// X-Auth-Proxy-Secret と timing-safe 比較し、一致しないものは 401 にする。
-// authentikを通っていない直接アクセスを fail-closed にするための
-// defense-in-depth (header signing/JWT検証ではないが、proxyを必ず通したい
-// 運用要件を最低限担保する)
 export function constantTimeEqual(a: string, b: string): boolean {
   const ab = Buffer.from(a, "utf8");
   const bb = Buffer.from(b, "utf8");
@@ -42,8 +37,7 @@ export const requireUser: MiddlewareHandler<AuthContext> = async (c, next) => {
   const sub = headerSub ?? (expectedSecret || !isDevelopment ? null : DEV_SUB);
   if (!sub) return c.json({ error: "unauthenticated" }, 401);
 
-  // header が absent (undefined) のときは update に渡さず既存値を保つ。
-  // Prisma は undefined フィールドを update から無視する
+  // undefined を update に渡すと Prisma は no-op するので、header 欠落時に既存値を消さない
   const username = c.req.header("x-authentik-username");
   const email = c.req.header("x-authentik-email");
   const name = c.req.header("x-authentik-name");

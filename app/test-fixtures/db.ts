@@ -1,7 +1,3 @@
-// bunfig.toml の preload (db-preload.ts) で temp DB と schema は process 単位で
-// 1度だけセットされる。ここでは bun:test の lifecycle hook に乗せて、テスト
-// ファイルが先頭で useDbFixture() を呼ぶだけで beforeEach (clearDb) が
-// 自動で入るようにする (prisma を使うテストは必ず空 DB から始まる契約)
 import { beforeAll, beforeEach } from "bun:test";
 import { prisma } from "../lib/prisma";
 
@@ -15,6 +11,7 @@ export async function clearDb(): Promise<void> {
   await prisma.user.deleteMany();
 }
 
+// prisma を使う test は先頭で1回呼ぶ。beforeEach(clearDb) が自動で入る
 export function useDbFixture(): void {
   beforeAll(() => {
     if (!process.env.DATABASE_URL?.startsWith("file:")) {

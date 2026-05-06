@@ -2,6 +2,7 @@
 // 複数のテストファイルが useS3Fixture() を呼んでも MinIO container は1度しか起動しない。
 // container 自体は testcontainers の Ryuk によりプロセス終了時に自動回収される
 import { beforeAll, beforeEach } from "bun:test";
+import pMap from "p-map";
 import { GenericContainer, Wait } from "testcontainers";
 import { MINIO_IMAGE } from "../test-images";
 
@@ -9,6 +10,7 @@ const MINIO_USER = "minioadmin";
 const MINIO_PASSWORD = "minioadmin";
 const TEST_BUCKET = "music-analyzer-test";
 const STARTUP_TIMEOUT_MS = 120_000;
+const CLEAR_BUCKET_CONCURRENCY = 16;
 
 let initPromise: Promise<void> | null = null;
 
@@ -49,9 +51,8 @@ async function clearS3Bucket(): Promise<void> {
   let token: string | undefined;
   do {
     const result = await s3.list({ continuationToken: token });
-    for (const o of result.contents ?? []) {
-      if (o.key) await s3.delete(o.key);
-    }
+    const keys = (result.contents ?? []).flatMap((o) => (o.key ? [o.key] : []));
+    await pMap(keys, (k) => s3.delete(k), { concurrency: CLEAR_BUCKET_CONCURRENCY });
     token = result.isTruncated ? result.nextContinuationToken : undefined;
   } while (token);
 }

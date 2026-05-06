@@ -1,6 +1,5 @@
 import { Hono } from "hono";
 import { extname, join } from "node:path";
-import { unlink } from "node:fs/promises";
 import { type AuthContext, requireUser } from "../lib/auth";
 import {
   MAX_DURATION_SEC,
@@ -11,7 +10,7 @@ import {
   isBrowserPlayableAudio,
   transcodeAudio,
   transcodeVideo,
-  withTempDir,
+  tempDir,
 } from "../lib/ffmpeg";
 import { jsonResponse } from "../lib/json";
 import { prisma } from "../lib/prisma";
@@ -34,11 +33,8 @@ async function findProjectOr404(userId: string, projectId: string) {
 
 type TxClient = Parameters<Parameters<typeof prisma.$transaction>[0]>[0];
 
-// (projectId, order) のunique制約と projStart の隣接配置を満たす次スロットを採取する。
-// 呼び出しは tx 内で行い、create と原子化する。
-// video/audio の unique は table 別なので片方だけでは cross-table race を防げない。
-// project行を先に update して SQLite の write lock を獲得し、同一 project への
-// 並行 alloc を直列化する
+// project 行への update で SQLite write lock を先取りし、同一 project への並行 alloc を直列化する
+// (table 別 unique では video/audio cross-table race を検出できない)
 async function allocSlot(
   tx: TxClient,
   projectId: string,
@@ -72,19 +68,17 @@ async function allocSlot(
   };
 }
 
-// upload開始前に立てる墓標の有効期限。これを越えると sweeper が S3 を消し始める。
-// 1h動画の transcode + upload を含めても十分余裕がある値
+// 1h 動画の transcode + upload に十分余裕のある grace
 const UPLOAD_GRACE_MS = 4 * 60 * 60 * 1000;
 
-// upload経路で先に立てる墓標。S3にbyteを書く前に呼び、handlerが完走したら
-// DB tx の中で同じ prefix の mark を消す。途中で死んだら sweeper が grace 後に拾う
+// upload 完了前に死んだら sweeper が grace 後に拾うので S3 に orphan が残らない
 async function markPrefixForDeletion(prefix: string, graceMs = 0): Promise<void> {
   await prisma.deletionMark.create({
     data: { prefix, nextRetryAt: new Date(Date.now() + graceMs) },
   });
 }
 
-// 同期best-effort cleanup。失敗してもsweeperがmarkを拾うのでthrowしない
+// 失敗しても sweeper が mark を拾うので throw しない
 async function eagerCleanupAndUnmark(prefix: string): Promise<void> {
   try {
     await deletePrefix(prefix);
@@ -94,8 +88,7 @@ async function eagerCleanupAndUnmark(prefix: string): Promise<void> {
   }
 }
 
-// SQLite + Prisma は transaction で write を直列化するが、保険として
-// (projectId, order) のunique衝突 (P2002) と書き込み競合 (P2034) はリトライする
+// (projectId, order) unique衝突 (P2002) と SQLite write conflict (P2034) を保険でリトライする
 async function withSlotRetry<T>(fn: () => Promise<T>): Promise<T> {
   const MAX_ATTEMPTS = 5;
   for (let i = 0; i < MAX_ATTEMPTS; i++) {
@@ -164,8 +157,7 @@ export const projects = new Hono<AuthContext>()
     const project = await findProjectOr404(user.id, c.req.param("id"));
     if (!project) return c.notFound();
 
-    // multipart parse 前に Content-Length で fast-fail。クライアントが嘘をつけるので
-    // parse 後の file.size チェックも残し二段で守る
+    // Content-Length で fast-fail。client は嘘をつけるので parse 後の file.size でも再チェックする
     const declared = Number(c.req.header("content-length") ?? "");
     if (Number.isFinite(declared) && declared > MAX_UPLOAD_BYTES) {
       return c.json({ error: `file too large (max ${MAX_UPLOAD_BYTES} bytes)` }, 413);
@@ -189,13 +181,13 @@ export const projects = new Hono<AuthContext>()
 
     const videoId = crypto.randomUUID();
     const prefix = `${projectKey(project.id)}/videos/${videoId}/`;
-    // S3 にバイトを置く前に墓標を立てる。完走したら DB tx の中で消す。
-    // 途中で死んだら sweeper が grace 経過後に拾う (orphan が S3 に残らない)
     await markPrefixForDeletion(prefix, UPLOAD_GRACE_MS);
 
     let result;
     try {
-      result = await withTempDir("video-upload", async (tmp) => {
+      result = await (async () => {
+        await using td = await tempDir("video-upload");
+        const tmp = td.path;
         const inputPath = join(tmp, "input" + (extname(file.name) || ".bin"));
         await Bun.write(inputPath, file);
 
@@ -223,7 +215,7 @@ export const projects = new Hono<AuthContext>()
         const videoOut = join(tmp, "video.mp4");
         const audioOut = join(tmp, "audio.m4a");
         const thumbDir = join(tmp, "thumbs");
-        // 片方が落ちた瞬間にもう片方も abort して CPU/disk を解放する
+        // 片方の reject で他方も abort し CPU/disk を解放
         const ac = new AbortController();
         const tasks: Promise<unknown>[] = [
           transcodeVideo(inputPath, videoOut, hasAudio, ac.signal),
@@ -233,7 +225,7 @@ export const projects = new Hono<AuthContext>()
           await Promise.all(tasks);
         } catch {
           ac.abort();
-          // 残りの ffmpeg がプロセスを抱えたまま return しないよう settle 待ち
+          // 残った ffmpeg を抱えたまま return しないよう settle 待ち
           await Promise.allSettled(tasks);
           return { error: "ffmpeg cannot decode this video", status: 400 as const };
         }
@@ -244,7 +236,7 @@ export const projects = new Hono<AuthContext>()
         if (!Number.isFinite(finalProbe.durationSec) || finalProbe.durationSec <= 0) {
           return { error: "transcode produced unknown duration", status: 500 as const };
         }
-        // pre-probe の durationSec が壊れた入力で過小報告された場合に備えて再判定
+        // pre-probe で過小報告された壊れた入力に備えて再判定
         if (finalProbe.durationSec > MAX_DURATION_SEC) {
           return {
             error: `duration must be > 0 and <= ${MAX_DURATION_SEC}s`,
@@ -263,9 +255,7 @@ export const projects = new Hono<AuthContext>()
         const vKey = videoSourceKey(project.id, videoId);
         const aKey = hasAudio ? videoAudioKey(project.id, videoId) : null;
 
-        // Promise.all の fast-fail だと未完了の upload が残ったまま eager cleanup
-        // が走り、cleanup → slower upload 完了の順で orphan を生むので allSettled
-        // で全 upload の決着を待ってから throw する
+        // 全 upload が settle してから throw しないと cleanup が遅延 upload 完了の orphan を逃す
         const uploadResults = await Promise.allSettled([
           uploadFile(vKey, videoOut, "video/mp4"),
           ...(aKey ? [uploadFile(aKey, audioOut, "audio/mp4")] : []),
@@ -315,15 +305,13 @@ export const projects = new Hono<AuthContext>()
           }),
         );
         return { video: row };
-      });
+      })();
     } catch (err) {
-      // sweeper が grace 経過後に拾うが、user を待たせないよう即時 cleanup も試す
       void eagerCleanupAndUnmark(prefix).catch(() => {});
       throw err;
     }
 
     if ("error" in result) {
-      // 早期 validation 失敗。S3 にはまだ何も置いていないが mark は立っているので消す
       void eagerCleanupAndUnmark(prefix).catch(() => {});
       return c.json({ error: result.error }, result.status);
     }
@@ -415,7 +403,9 @@ export const projects = new Hono<AuthContext>()
 
     let result;
     try {
-      result = await withTempDir("audio-upload", async (tmp) => {
+      result = await (async () => {
+        await using td = await tempDir("audio-upload");
+        const tmp = td.path;
         const inputPath = join(tmp, "input." + ext);
         await Bun.write(inputPath, file);
         let probe;
@@ -436,7 +426,7 @@ export const projects = new Hono<AuthContext>()
           };
         }
 
-        // 標準化AAC m4aは常に作る。失敗 = ffmpegが扱えない入力なので400で拒否
+        // 標準形 AAC m4a を常に持つ。decode できないなら 400 で拒否
         const transcodedPath = join(tmp, "transcoded.m4a");
         try {
           await transcodeAudio(inputPath, transcodedPath);
@@ -444,9 +434,7 @@ export const projects = new Hono<AuthContext>()
           return { error: "ffmpeg cannot decode this audio", status: 400 as const };
         }
 
-        // audioKey は transcoded を指すので、persistする durationSec は
-        // re-probe した transcoded の長さに揃える (priming/padding や入力 metadata の
-        // ズレで pre-probe と差が出るため)
+        // audioKey が指す transcoded.m4a の長さに persist された durationSec を揃える
         const finalProbe = await ffprobe(transcodedPath);
         if (!Number.isFinite(finalProbe.durationSec) || finalProbe.durationSec <= 0) {
           return { error: "transcode produced unknown duration", status: 500 as const };
@@ -483,7 +471,6 @@ export const projects = new Hono<AuthContext>()
                 rawKey,
                 rawContentType: keepRaw ? contentType : null,
                 durationSec: duration,
-                // audioKey は transcoded を指すので metadata も transcoded probe 由来に揃える
                 sampleRate: finalProbe.audioStream?.sampleRate || null,
                 channels: finalProbe.audioStream?.channels || null,
                 bitrate: finalProbe.audioStream?.bitrate ?? null,
@@ -498,9 +485,8 @@ export const projects = new Hono<AuthContext>()
             return created;
           }),
         );
-        await unlink(inputPath).catch(() => {});
         return { audio: row };
-      });
+      })();
     } catch (err) {
       void eagerCleanupAndUnmark(prefix).catch(() => {});
       throw err;
