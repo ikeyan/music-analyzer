@@ -43,11 +43,23 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
   const mediaRefs = useRef(new Map<string, HTMLMediaElement>());
   const lastTickRef = useRef<number | null>(null);
   const rafRef = useRef<number | null>(null);
+  // unlock 待ちの track を syncMediaElement の pause から除外する。
+  // 同期 pause で play() を AbortError にすると unlock 失敗になる
+  const unlockingRef = useRef(new Set<string>());
+
+  // 全媒体を unconditionally pause する場合 (playing=false に遷移した時) も
+  // unlock 中の元素を巻き込まないよう一覧でスキップする
+  function pauseAllExceptUnlocking(): void {
+    for (const [key, el] of mediaRefs.current) {
+      if (unlockingRef.current.has(key)) continue;
+      el.pause();
+    }
+  }
 
   useEffect(() => {
     if (!playing) {
       lastTickRef.current = null;
-      for (const el of mediaRefs.current.values()) el.pause();
+      pauseAllExceptUnlocking();
       if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
       return;
     }
@@ -73,7 +85,10 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
 
   useEffect(() => {
     for (const t of tracks) {
-      const el = mediaRefs.current.get(trackKey(t));
+      const key = trackKey(t);
+      // unlock 中は play() を pause で abort せず .then の resolve に任せる
+      if (unlockingRef.current.has(key)) continue;
+      const el = mediaRefs.current.get(key);
       if (!el) continue;
       syncMediaElement(el, t.data, currentTime, playing, () => {
         setPlaying(false);
@@ -122,17 +137,22 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
     }
   }
 
-  // user-gesture 内で play().then(pause) して全 track を unlock。範囲外は mute で音漏れを防ぐ
+  // user-gesture 内で play().then(pause) して全 track を unlock。範囲外は mute で音漏れを防ぐ。
+  // 範囲外要素は unlocking フラグで syncMediaElement の同期 pause から除外する
   function startPlayback() {
     let blocked = false;
     for (const t of tracks) {
-      const el = mediaRefs.current.get(trackKey(t));
+      const key = trackKey(t);
+      const el = mediaRefs.current.get(key);
       if (!el) continue;
       const projLow = Math.min(t.data.projStartSec, t.data.projEndSec);
       const projHigh = Math.max(t.data.projStartSec, t.data.projEndSec);
       const inRange = currentTime >= projLow && currentTime <= projHigh;
       const wasMuted = el.muted;
-      if (!inRange) el.muted = true;
+      if (!inRange) {
+        el.muted = true;
+        unlockingRef.current.add(key);
+      }
       const promise = el.play();
       if (promise && typeof promise.then === "function") {
         promise
@@ -140,10 +160,14 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
             if (!inRange) {
               el.pause();
               el.muted = wasMuted;
+              unlockingRef.current.delete(key);
             }
           })
           .catch((err: unknown) => {
-            if (!inRange) el.muted = wasMuted;
+            if (!inRange) {
+              el.muted = wasMuted;
+              unlockingRef.current.delete(key);
+            }
             if (err instanceof DOMException && err.name === "AbortError") return;
             if (!blocked) {
               blocked = true;
@@ -151,6 +175,8 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
               setError("ブラウザのautoplay制限で再生できませんでした。もう一度押してください。");
             }
           });
+      } else if (!inRange) {
+        unlockingRef.current.delete(key);
       }
     }
     setError(null);

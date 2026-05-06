@@ -37,16 +37,25 @@ export const requireUser: MiddlewareHandler<AuthContext> = async (c, next) => {
   const sub = headerSub ?? (expectedSecret || !isDevelopment ? null : DEV_SUB);
   if (!sub) return c.json({ error: "unauthenticated" }, 401);
 
-  // undefined を update に渡すと Prisma は no-op するので、header 欠落時に既存値を消さない
   const username = c.req.header("x-authentik-username");
   const email = c.req.header("x-authentik-email");
   const name = c.req.header("x-authentik-name");
 
-  const user = await prisma.user.upsert({
-    where: { authentikSub: sub },
-    create: { authentikSub: sub, username, email, name },
-    update: { username, email, name },
-  });
+  // 全 request が upsert すると read-only な media GET でも User 行を毎回 update し
+  // SQLite write lock が連射される。find して差分があるときだけ書く
+  let user = await prisma.user.findUnique({ where: { authentikSub: sub } });
+  if (!user) {
+    user = await prisma.user.create({ data: { authentikSub: sub, username, email, name } });
+  } else if (
+    (username !== undefined && user.username !== username) ||
+    (email !== undefined && user.email !== email) ||
+    (name !== undefined && user.name !== name)
+  ) {
+    user = await prisma.user.update({
+      where: { authentikSub: sub },
+      data: { username, email, name },
+    });
+  }
   c.set("user", user);
   await next();
 };
