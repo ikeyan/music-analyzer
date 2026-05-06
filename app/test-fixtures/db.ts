@@ -11,14 +11,18 @@ export async function clearDb(): Promise<void> {
   await prisma.user.deleteMany();
 }
 
+function assertDatabaseUrlSet(url: string | undefined): asserts url is string {
+  if (!url?.startsWith("file:")) {
+    throw new Error(
+      "useDbFixture: DATABASE_URL not set. Run via `bun test` so bunfig preload runs.",
+    );
+  }
+}
+
 // prisma を使う test は先頭で1回呼ぶ。beforeEach(clearDb) が自動で入る
 export function useDbFixture(): void {
   beforeAll(() => {
-    if (!process.env.DATABASE_URL?.startsWith("file:")) {
-      throw new Error(
-        "useDbFixture: DATABASE_URL not set. Run via `bun test` so bunfig preload runs.",
-      );
-    }
+    assertDatabaseUrlSet(process.env.DATABASE_URL);
   });
   beforeEach(clearDb);
 }

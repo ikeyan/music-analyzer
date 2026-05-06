@@ -191,4 +191,15 @@ describe("requireUser middleware", () => {
     const count = await prisma.user.count({ where: { authentikSub: "user-counted" } });
     expect(count).toBe(1);
   });
+
+  it("concurrent first-login requests both succeed and converge to one row", async () => {
+    process.env.AUTH_PROXY_SECRET = SECRET;
+    const headers = { "x-auth-proxy-secret": SECRET, "x-authentik-uid": "user-concurrent" };
+    const responses = await Promise.all(
+      Array.from({ length: 4 }, () => makeApp().request("/whoami", { headers })),
+    );
+    for (const res of responses) expect(res.status).toBe(200);
+    const count = await prisma.user.count({ where: { authentikSub: "user-concurrent" } });
+    expect(count).toBe(1);
+  });
 });

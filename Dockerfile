@@ -30,4 +30,4 @@ EXPOSE 3000
 # --accept-data-loss は旧 schema (Message table 等) が残った volume で起動するときに
 # 破壊的変更を許可するため。本サービスの DB は upload metadata のみで、起動時の
 # 整合は失った行を sweeper / S3 で補修できるので非対話で進めてよい
-CMD ["sh", "-c", "bun run prisma db push --accept-data-loss && exec bun run ./index.js"]
+CMD ["sh", "-c", "bun run db:push --accept-data-loss && exec bun run ./index.js"]

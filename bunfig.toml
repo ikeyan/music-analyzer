@@ -2,8 +2,7 @@
 # 全 test 開始前に temp SQLite を作って prisma schema を push する。
 # 以降 lib/prisma.ts は process.env.DATABASE_URL を読んで test DB を見る
 preload = ["./app/test-fixtures/db-preload.ts"]
-# 自動生成された prisma client は coverage 対象から外す。
-# e2e helper (e2e/authentik/scripts) は e2e job で計測したいので除外しない
-coveragePathIgnorePatterns = ["**/app/generated/**"]
+# prisma generated client と test fixture (process.on("exit") など test-only ヘルパ) は対象外
+coveragePathIgnorePatterns = ["**/app/generated/**", "**/app/test-fixtures/**"]
 coverageReporter = ["text", "lcov"]
 coverageDir = "coverage"

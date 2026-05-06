@@ -2,6 +2,7 @@ import { $ } from "bun";
 import { beforeAll } from "bun:test";
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { runShell } from "../lib/shell";
 import { makePersistentTempDir } from "./temp";
 
 const FFMPEG = process.env.FFMPEG_PATH ?? "ffmpeg";
@@ -24,12 +25,7 @@ let cache: MediaFixture | null = null;
 let initPromise: Promise<MediaFixture> | null = null;
 
 async function runFfmpeg(args: string[]): Promise<void> {
-  const result = await $`${FFMPEG} -hide_banner -loglevel error -y ${args}`.quiet().nothrow();
-  if (result.exitCode !== 0) {
-    throw new Error(
-      `ffmpeg fixture generation failed (exit ${result.exitCode}): ${result.stderr.toString().slice(0, 500)}`,
-    );
-  }
+  await runShell("ffmpeg fixture generation", $`${FFMPEG} -hide_banner -loglevel error -y ${args}`);
 }
 
 async function init(): Promise<MediaFixture> {
