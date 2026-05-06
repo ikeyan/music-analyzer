@@ -164,6 +164,13 @@ export const projects = new Hono<AuthContext>()
     const project = await findProjectOr404(user.id, c.req.param("id"));
     if (!project) return c.notFound();
 
+    // multipart parse 前に Content-Length で fast-fail。クライアントが嘘をつけるので
+    // parse 後の file.size チェックも残し二段で守る
+    const declared = Number(c.req.header("content-length") ?? "");
+    if (Number.isFinite(declared) && declared > MAX_UPLOAD_BYTES) {
+      return c.json({ error: `file too large (max ${MAX_UPLOAD_BYTES} bytes)` }, 413);
+    }
+
     let form;
     try {
       form = await c.req.raw.formData();
@@ -373,6 +380,11 @@ export const projects = new Hono<AuthContext>()
     const user = c.var.user;
     const project = await findProjectOr404(user.id, c.req.param("id"));
     if (!project) return c.notFound();
+
+    const declared = Number(c.req.header("content-length") ?? "");
+    if (Number.isFinite(declared) && declared > MAX_UPLOAD_BYTES) {
+      return c.json({ error: `file too large (max ${MAX_UPLOAD_BYTES} bytes)` }, 413);
+    }
 
     let form;
     try {
