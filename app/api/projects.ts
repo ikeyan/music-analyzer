@@ -15,6 +15,7 @@ import {
   transcodeVideo,
 } from "../lib/ffmpeg";
 import { prisma } from "../lib/prisma";
+import { awaitAllOrAggregate } from "../lib/promise";
 import {
   audioRawKey,
   audioTranscodedKey,
@@ -279,15 +280,13 @@ export const projects = new Hono<AuthContext>()
         const aKey = hasAudio ? videoAudioKey(project.id, videoId) : null;
 
         // 全 upload が settle してから throw しないと cleanup が遅延 upload 完了の orphan を逃す
-        const uploadResults = await Promise.allSettled([
+        await awaitAllOrAggregate([
           uploadFile(vKey, videoOut, "video/mp4"),
           ...(aKey ? [uploadFile(aKey, audioOut, "audio/mp4")] : []),
           ...thumbs.map((t) =>
             uploadFile(videoThumbKey(project.id, videoId, t.atSec), t.path, "image/jpeg"),
           ),
         ]);
-        const failed = uploadResults.find((r) => r.status === "rejected");
-        if (failed) throw failed.reason;
 
         const duration = finalProbe.durationSec;
         const row = await withSlotRetry(() =>
@@ -481,12 +480,10 @@ export const projects = new Hono<AuthContext>()
         const transcodedKey = audioTranscodedKey(project.id, audioId);
         const rawKey = keepRaw ? audioRawKey(project.id, audioId, ext) : null;
 
-        const uploadResults = await Promise.allSettled([
+        await awaitAllOrAggregate([
           uploadFile(transcodedKey, transcodedPath, "audio/mp4"),
           ...(rawKey ? [uploadFile(rawKey, inputPath, contentType)] : []),
         ]);
-        const failed = uploadResults.find((r) => r.status === "rejected");
-        if (failed) throw failed.reason;
 
         const duration = finalProbe.durationSec;
         const row = await withSlotRetry(() =>

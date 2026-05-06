@@ -36,6 +36,24 @@ const ensureFfmpeg = async () => {
   await $`sudo chmod +x /usr/local/bin/ffmpeg /usr/local/bin/ffprobe`;
 };
 
+// .bun-version pin に合わせて /root/.bun/bin/bun を入れ替える。bun.com/install は
+// sandbox から 403 になるので GitHub release zip を直接展開
+const ensureBunVersion = async () => {
+  const cwd = process.env.CLAUDE_PROJECT_DIR!;
+  const target = (await Bun.file(`${cwd}/.bun-version`).text()).trim();
+  if (Bun.version === target) return;
+  const arch = process.arch === "arm64" ? "aarch64" : "x64";
+  const dirName = `bun-linux-${arch}`;
+  const url = `https://github.com/oven-sh/bun/releases/download/bun-v${target}/${dirName}.zip`;
+  const tmp = `/tmp/bun-upgrade-${target}`;
+  await $`rm -rf ${tmp}`.quiet();
+  await $`mkdir -p ${tmp}`.quiet();
+  await $`curl -fsSL ${url} -o ${tmp}/bun.zip`.quiet();
+  await $`unzip -q -o ${tmp}/bun.zip -d ${tmp}`.quiet();
+  await $`install -m 755 ${tmp}/${dirName}/bun /root/.bun/bin/bun`.quiet();
+  await $`rm -rf ${tmp}`.quiet();
+};
+
 const installDeps = async () => {
   const cwd = process.env.CLAUDE_PROJECT_DIR!;
   await $`bun install --frozen-lockfile`.cwd(cwd);
@@ -48,11 +66,12 @@ const pullAgentFiles = async () => {
 };
 
 // docker は ensureFfmpeg だけが必要とするので chain でのみ await。
-// installDeps / git remote / agent-files は docker と独立に走らせる
+// installDeps は新しい bun が要るので ensureBunVersion 完了を待つ
 const docker = ensureDocker();
+const bun = ensureBunVersion();
 await Promise.all([
   docker.then(() => ensureFfmpeg()),
-  installDeps(),
+  bun.then(() => installDeps()),
   $`git -C ${process.env.CLAUDE_PROJECT_DIR} remote set-head origin -a`,
   pullAgentFiles(),
 ]);
