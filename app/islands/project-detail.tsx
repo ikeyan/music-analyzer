@@ -558,7 +558,7 @@ function TrackRow({
         <video
           ref={attachRef as (el: HTMLVideoElement | null) => void}
           src={(item as VideoItem).streamUrl}
-          preload="auto"
+          preload="metadata"
           style={{ display: "none" }}
           aria-hidden="true"
         >
@@ -567,7 +567,7 @@ function TrackRow({
       ) : (
         <audio
           ref={attachRef as (el: HTMLAudioElement | null) => void}
-          preload="auto"
+          preload="metadata"
           style={{ display: "none" }}
           aria-hidden="true"
         >
