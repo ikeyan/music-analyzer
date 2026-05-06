@@ -39,6 +39,10 @@ import {
   toApiVideo,
 } from "./types";
 
+// multipart envelope (boundary / Content-Disposition / filename) で数百〜数KBの
+// overhead が乗るので Content-Length 早期チェックは余裕を持たせる
+const MULTIPART_OVERHEAD_SLACK = 64 * 1024;
+
 const idParamSchema = v.object({ id: v.string() });
 const videoIdParamSchema = v.object({ id: v.string(), videoId: v.string() });
 const audioIdParamSchema = v.object({ id: v.string(), audioId: v.string() });
@@ -178,7 +182,7 @@ export const projects = new Hono<AuthContext>()
 
     // Content-Length で fast-fail。client は嘘をつけるので parse 後の file.size でも再チェックする
     const declared = Number(c.req.header("content-length") ?? "");
-    if (Number.isFinite(declared) && declared > MAX_UPLOAD_BYTES) {
+    if (Number.isFinite(declared) && declared > MAX_UPLOAD_BYTES + MULTIPART_OVERHEAD_SLACK) {
       return c.json({ error: `file too large (max ${MAX_UPLOAD_BYTES} bytes)` }, 413);
     }
 
