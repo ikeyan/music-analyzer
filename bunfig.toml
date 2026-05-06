@@ -1,6 +1,6 @@
 [test]
-# bun test --coverage で出すレポートから自動生成と e2e helper を除外
-# (e2e は別 job で走らせるためここの unit test では import していない)
-coveragePathIgnorePatterns = ["**/app/generated/**", "**/e2e/**"]
+# 自動生成された prisma client は coverage 対象から外す。
+# e2e helper (e2e/authentik/scripts) は e2e job で計測したいので除外しない
+coveragePathIgnorePatterns = ["**/app/generated/**"]
 coverageReporter = ["text", "lcov"]
 coverageDir = "coverage"
