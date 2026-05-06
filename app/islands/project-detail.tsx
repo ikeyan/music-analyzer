@@ -166,7 +166,8 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
   }
 
   // 全 track を click handler 内で play() し、resolve 後に pause で unlock する。
-  // 同期 pause は play() を AbortError にして unlock 失敗扱いになるので使えない
+  // 同期 pause は play() を AbortError にして unlock 失敗扱いになるので使えない。
+  // 範囲外 track は play→pause の間に音漏れしないよう一時 mute して restore する
   function startPlayback() {
     let blocked = false;
     for (const t of tracks) {
@@ -175,13 +176,19 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
       const projLow = Math.min(t.data.projStartSec, t.data.projEndSec);
       const projHigh = Math.max(t.data.projStartSec, t.data.projEndSec);
       const inRange = currentTime >= projLow && currentTime <= projHigh;
+      const wasMuted = el.muted;
+      if (!inRange) el.muted = true;
       const promise = el.play();
       if (promise && typeof promise.then === "function") {
         promise
           .then(() => {
-            if (!inRange) el.pause();
+            if (!inRange) {
+              el.pause();
+              el.muted = wasMuted;
+            }
           })
           .catch((err: unknown) => {
+            if (!inRange) el.muted = wasMuted;
             if (err instanceof DOMException && err.name === "AbortError") return;
             if (!blocked) {
               blocked = true;
