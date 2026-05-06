@@ -45,16 +45,13 @@ export const requireUser: MiddlewareHandler<AuthContext> = async (c, next) => {
   // SQLite write lock が連射される。find して差分があるときだけ書く
   let user = await prisma.user.findUnique({ where: { authentikSub: sub } });
   if (!user) {
-    // 同一 sub の初回ログインが並行すると unique 衝突 (P2002) や SQLite write
-    // conflict (P2034) で create が落ちるので、勝った request の row を再 fetch する
-    try {
-      user = await prisma.user.create({ data: { authentikSub: sub, username, email, name } });
-    } catch (err) {
-      const code = (err as { code?: string } | null)?.code;
-      if (code !== "P2002" && code !== "P2034") throw err;
-      user = await prisma.user.findUnique({ where: { authentikSub: sub } });
-      if (!user) throw err;
-    }
+    // 同一 sub の並行初回ログインで create が unique 衝突しないよう、prisma の
+    // 原子 upsert に任せる。update は no-op で勝った request の row をそのまま返す
+    user = await prisma.user.upsert({
+      where: { authentikSub: sub },
+      create: { authentikSub: sub, username, email, name },
+      update: {},
+    });
   } else if (
     (username !== undefined && user.username !== username) ||
     (email !== undefined && user.email !== email) ||

@@ -25,4 +25,4 @@ EXPOSE 5173
 
 # Generate the prisma client, push the schema, seed, then start vite bound to
 # all interfaces so Caddy can reach it over the compose network.
-CMD ["sh", "-c", "bun run db:generate && bun run db:push && bun run db:seed && bun run dev --host 0.0.0.0 --port 5173"]
+CMD ["sh", "-c", "bun run db:generate && bun run db:push --accept-data-loss && bun run db:seed && bun run dev --host 0.0.0.0 --port 5173"]
