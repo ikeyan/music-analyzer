@@ -75,18 +75,20 @@ jobs:
       - name: Test (with coverage)
         run: |
           set -o pipefail
-          bun run test:coverage 2>&1 | tee "${RUNNER_TEMP}/coverage-unit.log"
+          bun run test:coverage 2>&1 | tee coverage-unit.log
 
       - name: Coverage summary (unit)
         if: always()
         run: |
-          {
-            echo "### Unit test coverage"
-            echo ""
-            echo '```'
-            cat "${RUNNER_TEMP}/coverage-unit.log"
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+          if [ -f coverage-unit.log ]; then
+            {
+              echo "### Unit test coverage"
+              echo ""
+              echo '```'
+              cat coverage-unit.log
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Upload coverage (unit)
         if: always()
@@ -208,24 +210,20 @@ jobs:
           # bunの--coverageは bun test専用 (bun run scriptは非対応)。
           # e2eテストプロセス内で実行されるhelper code (e2e/authentik/scripts/*)
           # の coverage が出る。container内のmusic-analyzer本体は別プロセスなので
-          # 計測対象外
-          bun test \
-            --coverage \
-            --coverage-dir coverage/e2e \
-            --coverage-reporter text \
-            --coverage-reporter lcov \
-            e2e/authentik/flow.test.ts \
-            2>&1 | tee "${RUNNER_TEMP}/coverage-e2e.log"
+          # 計測対象外。
+          # --coverage-dir はbunfig.tomlのcoverageDir(=coverage)に上書きされるため
+          # 既定の coverage/lcov.info を生成→artifact 名で unit と区別する
+          bun test --coverage e2e/authentik/flow.test.ts 2>&1 | tee coverage-e2e.log
 
       - name: Coverage summary (e2e)
         if: always()
         run: |
-          if [ -f "${RUNNER_TEMP}/coverage-e2e.log" ]; then
+          if [ -f coverage-e2e.log ]; then
             {
               echo "### E2E test coverage"
               echo ""
               echo '```'
-              cat "${RUNNER_TEMP}/coverage-e2e.log"
+              cat coverage-e2e.log
               echo '```'
             } >> "$GITHUB_STEP_SUMMARY"
           fi
@@ -235,7 +233,7 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: coverage-e2e-${{ github.run_id }}-${{ github.run_attempt }}
-          path: coverage/e2e/lcov.info
+          path: coverage/lcov.info
           retention-days: 14
           if-no-files-found: warn
 
