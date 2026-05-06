@@ -1,5 +1,7 @@
+import { vValidator } from "@hono/valibot-validator";
 import { Hono } from "hono";
 import { extname, join } from "node:path";
+import * as v from "valibot";
 import { type AuthContext, requireUser } from "../lib/auth";
 import {
   MAX_DURATION_SEC,
@@ -8,11 +10,10 @@ import {
   extractThumbnails,
   ffprobe,
   isBrowserPlayableAudio,
+  tempDir,
   transcodeAudio,
   transcodeVideo,
-  tempDir,
 } from "../lib/ffmpeg";
-import { jsonResponse } from "../lib/json";
 import { prisma } from "../lib/prisma";
 import {
   audioRawKey,
@@ -25,6 +26,26 @@ import {
   videoSourceKey,
   videoThumbKey,
 } from "../lib/storage";
+import {
+  type ApiAudio,
+  type ApiProject,
+  type ApiProjectDetail,
+  type ApiProjectSummary,
+  type ApiVideo,
+  toApiAudio,
+  toApiProject,
+  toApiProjectDetail,
+  toApiProjectSummary,
+  toApiVideo,
+} from "./types";
+
+const idParamSchema = v.object({ id: v.string() });
+const videoIdParamSchema = v.object({ id: v.string(), videoId: v.string() });
+const audioIdParamSchema = v.object({ id: v.string(), audioId: v.string() });
+const thumbIdParamSchema = v.object({ id: v.string(), videoId: v.string(), thumbId: v.string() });
+const createProjectSchema = v.object({
+  name: v.pipe(v.string(), v.trim(), v.minLength(1)),
+});
 
 async function findProjectOr404(userId: string, projectId: string) {
   const p = await prisma.project.findFirst({ where: { id: projectId, userId } });
@@ -111,20 +132,18 @@ export const projects = new Hono<AuthContext>()
       orderBy: { createdAt: "desc" },
       include: { _count: { select: { videos: true, audios: true } } },
     });
-    return c.json({ projects: list });
+    return c.json({ projects: list.map(toApiProjectSummary) satisfies ApiProjectSummary[] });
   })
-  .post("/", async (c) => {
+  .post("/", vValidator("json", createProjectSchema), async (c) => {
     const user = c.var.user;
-    const body = (await c.req.json().catch(() => ({}))) as { name?: unknown };
-    const name = typeof body.name === "string" ? body.name.trim() : "";
-    if (!name) return c.json({ error: "name required" }, 400);
+    const { name } = c.req.valid("json");
     const project = await prisma.project.create({ data: { userId: user.id, name } });
-    return c.json({ project }, 201);
+    return c.json({ project: toApiProject(project) satisfies ApiProject }, 201);
   })
-  .get("/:id", async (c) => {
+  .get("/:id", vValidator("param", idParamSchema), async (c) => {
     const user = c.var.user;
     const project = await prisma.project.findFirst({
-      where: { id: c.req.param("id"), userId: user.id },
+      where: { id: c.req.valid("param").id, userId: user.id },
       include: {
         videos: {
           orderBy: { order: "asc" },
@@ -133,13 +152,13 @@ export const projects = new Hono<AuthContext>()
         audios: { orderBy: { order: "asc" } },
       },
     });
-    if (!project) return c.notFound();
-    return jsonResponse(c, { project });
+    if (!project) return c.json({ error: "project not found" }, 404);
+    return c.json({ project: toApiProjectDetail(project) satisfies ApiProjectDetail });
   })
-  .delete("/:id", async (c) => {
+  .delete("/:id", vValidator("param", idParamSchema), async (c) => {
     const user = c.var.user;
-    const project = await findProjectOr404(user.id, c.req.param("id"));
-    if (!project) return c.notFound();
+    const project = await findProjectOr404(user.id, c.req.valid("param").id);
+    if (!project) return c.json({ error: "project not found" }, 404);
     const prefix = `${projectKey(project.id)}/`;
     await prisma.$transaction(async (tx) => {
       await tx.deletionMark.create({ data: { prefix } });
@@ -152,10 +171,10 @@ export const projects = new Hono<AuthContext>()
     return c.body(null, 204);
   })
 
-  .post("/:id/videos", async (c) => {
+  .post("/:id/videos", vValidator("param", idParamSchema), async (c) => {
     const user = c.var.user;
-    const project = await findProjectOr404(user.id, c.req.param("id"));
-    if (!project) return c.notFound();
+    const project = await findProjectOr404(user.id, c.req.valid("param").id);
+    if (!project) return c.json({ error: "project not found" }, 404);
 
     // Content-Length で fast-fail。client は嘘をつけるので parse 後の file.size でも再チェックする
     const declared = Number(c.req.header("content-length") ?? "");
@@ -231,8 +250,8 @@ export const projects = new Hono<AuthContext>()
         }
 
         const finalProbe = await ffprobe(videoOut);
-        const v = finalProbe.videoStream;
-        if (!v) return { error: "transcode produced no video stream", status: 500 as const };
+        const vs = finalProbe.videoStream;
+        if (!vs) return { error: "transcode produced no video stream", status: 500 as const };
         if (!Number.isFinite(finalProbe.durationSec) || finalProbe.durationSec <= 0) {
           return { error: "transcode produced unknown duration", status: 500 as const };
         }
@@ -248,8 +267,8 @@ export const projects = new Hono<AuthContext>()
           videoOut,
           thumbDir,
           finalProbe.durationSec,
-          v.width,
-          v.height,
+          vs.width,
+          vs.height,
         );
 
         const vKey = videoSourceKey(project.id, videoId);
@@ -279,10 +298,10 @@ export const projects = new Hono<AuthContext>()
                 videoKey: vKey,
                 audioKey: aKey,
                 durationSec: duration,
-                width: v.width,
-                height: v.height,
-                fps: v.fps,
-                videoBitrate: v.bitrate,
+                width: vs.width,
+                height: vs.height,
+                fps: vs.fps,
+                videoBitrate: vs.bitrate,
                 audioBitrate: finalProbe.audioStream?.bitrate ?? null,
                 sizeBytes: BigInt(finalProbe.sizeBytes),
                 srcStartSec: 0,
@@ -315,17 +334,18 @@ export const projects = new Hono<AuthContext>()
       void eagerCleanupAndUnmark(prefix).catch(() => {});
       return c.json({ error: result.error }, result.status);
     }
-    return jsonResponse(c, { video: result.video }, 201);
+    return c.json({ video: toApiVideo(result.video) satisfies ApiVideo }, 201);
   })
 
-  .delete("/:id/videos/:videoId", async (c) => {
+  .delete("/:id/videos/:videoId", vValidator("param", videoIdParamSchema), async (c) => {
     const user = c.var.user;
-    const project = await findProjectOr404(user.id, c.req.param("id"));
-    if (!project) return c.notFound();
+    const { id, videoId } = c.req.valid("param");
+    const project = await findProjectOr404(user.id, id);
+    if (!project) return c.json({ error: "project not found" }, 404);
     const video = await prisma.video.findFirst({
-      where: { id: c.req.param("videoId"), projectId: project.id },
+      where: { id: videoId, projectId: project.id },
     });
-    if (!video) return c.notFound();
+    if (!video) return c.json({ error: "video not found" }, 404);
     const prefix = `${projectKey(project.id)}/videos/${video.id}/`;
     await prisma.$transaction(async (tx) => {
       await tx.deletionMark.create({ data: { prefix } });
@@ -336,43 +356,50 @@ export const projects = new Hono<AuthContext>()
     return c.body(null, 204);
   })
 
-  .get("/:id/videos/:videoId/stream", async (c) => {
+  .get("/:id/videos/:videoId/stream", vValidator("param", videoIdParamSchema), async (c) => {
     const user = c.var.user;
-    const project = await findProjectOr404(user.id, c.req.param("id"));
+    const { id, videoId } = c.req.valid("param");
+    const project = await findProjectOr404(user.id, id);
     if (!project) return c.notFound();
     const video = await prisma.video.findFirst({
-      where: { id: c.req.param("videoId"), projectId: project.id },
+      where: { id: videoId, projectId: project.id },
     });
     if (!video) return c.notFound();
     return await streamS3(c, video.videoKey, "video/mp4");
   })
 
-  .get("/:id/videos/:videoId/audio", async (c) => {
+  .get("/:id/videos/:videoId/audio", vValidator("param", videoIdParamSchema), async (c) => {
     const user = c.var.user;
-    const project = await findProjectOr404(user.id, c.req.param("id"));
+    const { id, videoId } = c.req.valid("param");
+    const project = await findProjectOr404(user.id, id);
     if (!project) return c.notFound();
     const video = await prisma.video.findFirst({
-      where: { id: c.req.param("videoId"), projectId: project.id },
+      where: { id: videoId, projectId: project.id },
     });
     if (!video || !video.audioKey) return c.notFound();
     return await streamS3(c, video.audioKey, "audio/mp4");
   })
 
-  .get("/:id/videos/:videoId/thumbnails/:thumbId", async (c) => {
-    const user = c.var.user;
-    const project = await findProjectOr404(user.id, c.req.param("id"));
-    if (!project) return c.notFound();
-    const thumb = await prisma.thumbnail.findFirst({
-      where: { id: c.req.param("thumbId"), video: { projectId: project.id } },
-    });
-    if (!thumb) return c.notFound();
-    return await streamS3(c, thumb.key, "image/jpeg");
-  })
+  .get(
+    "/:id/videos/:videoId/thumbnails/:thumbId",
+    vValidator("param", thumbIdParamSchema),
+    async (c) => {
+      const user = c.var.user;
+      const { id, thumbId } = c.req.valid("param");
+      const project = await findProjectOr404(user.id, id);
+      if (!project) return c.notFound();
+      const thumb = await prisma.thumbnail.findFirst({
+        where: { id: thumbId, video: { projectId: project.id } },
+      });
+      if (!thumb) return c.notFound();
+      return await streamS3(c, thumb.key, "image/jpeg");
+    },
+  )
 
-  .post("/:id/audios", async (c) => {
+  .post("/:id/audios", vValidator("param", idParamSchema), async (c) => {
     const user = c.var.user;
-    const project = await findProjectOr404(user.id, c.req.param("id"));
-    if (!project) return c.notFound();
+    const project = await findProjectOr404(user.id, c.req.valid("param").id);
+    if (!project) return c.json({ error: "project not found" }, 404);
 
     const declared = Number(c.req.header("content-length") ?? "");
     if (Number.isFinite(declared) && declared > MAX_UPLOAD_BYTES) {
@@ -496,17 +523,18 @@ export const projects = new Hono<AuthContext>()
       void eagerCleanupAndUnmark(prefix).catch(() => {});
       return c.json({ error: result.error }, result.status);
     }
-    return jsonResponse(c, { audio: result.audio }, 201);
+    return c.json({ audio: toApiAudio(result.audio) satisfies ApiAudio }, 201);
   })
 
-  .delete("/:id/audios/:audioId", async (c) => {
+  .delete("/:id/audios/:audioId", vValidator("param", audioIdParamSchema), async (c) => {
     const user = c.var.user;
-    const project = await findProjectOr404(user.id, c.req.param("id"));
-    if (!project) return c.notFound();
+    const { id, audioId } = c.req.valid("param");
+    const project = await findProjectOr404(user.id, id);
+    if (!project) return c.json({ error: "project not found" }, 404);
     const audio = await prisma.audio.findFirst({
-      where: { id: c.req.param("audioId"), projectId: project.id },
+      where: { id: audioId, projectId: project.id },
     });
-    if (!audio) return c.notFound();
+    if (!audio) return c.json({ error: "audio not found" }, 404);
     const prefix = `${projectKey(project.id)}/audios/${audio.id}/`;
     await prisma.$transaction(async (tx) => {
       await tx.deletionMark.create({ data: { prefix } });
@@ -516,24 +544,28 @@ export const projects = new Hono<AuthContext>()
     return c.body(null, 204);
   })
 
-  .get("/:id/audios/:audioId/stream", async (c) => {
+  .get("/:id/audios/:audioId/stream", vValidator("param", audioIdParamSchema), async (c) => {
     const user = c.var.user;
-    const project = await findProjectOr404(user.id, c.req.param("id"));
+    const { id, audioId } = c.req.valid("param");
+    const project = await findProjectOr404(user.id, id);
     if (!project) return c.notFound();
     const audio = await prisma.audio.findFirst({
-      where: { id: c.req.param("audioId"), projectId: project.id },
+      where: { id: audioId, projectId: project.id },
     });
     if (!audio) return c.notFound();
     return await streamS3(c, audio.audioKey, "audio/mp4");
   })
 
-  .get("/:id/audios/:audioId/raw", async (c) => {
+  .get("/:id/audios/:audioId/raw", vValidator("param", audioIdParamSchema), async (c) => {
     const user = c.var.user;
-    const project = await findProjectOr404(user.id, c.req.param("id"));
+    const { id, audioId } = c.req.valid("param");
+    const project = await findProjectOr404(user.id, id);
     if (!project) return c.notFound();
     const audio = await prisma.audio.findFirst({
-      where: { id: c.req.param("audioId"), projectId: project.id },
+      where: { id: audioId, projectId: project.id },
     });
     if (!audio || !audio.rawKey) return c.notFound();
     return await streamS3(c, audio.rawKey, audio.rawContentType ?? "application/octet-stream");
   });
+
+export type ProjectsAppType = typeof projects;

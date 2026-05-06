@@ -1,7 +1,8 @@
 import { createRoute } from "honox/factory";
+import { toApiProjectSummary } from "../../api/types";
+import ProjectList from "../../islands/project-list";
 import { requireUser } from "../../lib/auth";
 import { prisma } from "../../lib/prisma";
-import ProjectList from "../../islands/project-list";
 
 export default createRoute(requireUser, async (c) => {
   const user = c.var.user;
@@ -11,13 +12,7 @@ export default createRoute(requireUser, async (c) => {
     include: { _count: { select: { videos: true, audios: true } } },
   });
 
-  const initial = projects.map((p) => ({
-    id: p.id,
-    name: p.name,
-    createdAt: p.createdAt.toISOString(),
-    videoCount: p._count.videos,
-    audioCount: p._count.audios,
-  }));
+  const initial = projects.map(toApiProjectSummary);
 
   return c.render(
     <main

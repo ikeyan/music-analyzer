@@ -1,12 +1,8 @@
 import { useState } from "react";
+import type { ApiProjectSummary } from "../api/types";
+import { apiClient } from "../lib/api-client";
 
-export type ProjectSummary = {
-  id: string;
-  name: string;
-  createdAt: string;
-  videoCount: number;
-  audioCount: number;
-};
+export type ProjectSummary = ApiProjectSummary;
 
 export default function ProjectList({ initial }: { initial: ProjectSummary[] }) {
   const [items, setItems] = useState(initial);
@@ -20,28 +16,13 @@ export default function ProjectList({ initial }: { initial: ProjectSummary[] }) 
     setBusy(true);
     setError(null);
     try {
-      const res = await fetch("/api/projects", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ name }),
-      });
+      const res = await apiClient.projects.$post({ json: { name } });
       if (!res.ok) {
         setError(`作成失敗 (HTTP ${res.status})`);
         return;
       }
-      const body = (await res.json()) as {
-        project: { id: string; name: string; createdAt: string };
-      };
-      setItems((prev) => [
-        {
-          id: body.project.id,
-          name: body.project.name,
-          createdAt: body.project.createdAt,
-          videoCount: 0,
-          audioCount: 0,
-        },
-        ...prev,
-      ]);
+      const body = await res.json();
+      setItems((prev) => [{ ...body.project, videoCount: 0, audioCount: 0 }, ...prev]);
       setName("");
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -52,8 +33,8 @@ export default function ProjectList({ initial }: { initial: ProjectSummary[] }) 
 
   async function remove(id: string) {
     if (!confirm("プロジェクトを削除しますか？")) return;
-    const res = await fetch(`/api/projects/${id}`, { method: "DELETE" });
-    if (res.ok || res.status === 204) {
+    const res = await apiClient.projects[":id"].$delete({ param: { id } });
+    if (res.ok) {
       setItems((prev) => prev.filter((p) => p.id !== id));
     } else {
       setError(`削除失敗 (HTTP ${res.status})`);

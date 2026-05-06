@@ -1,7 +1,7 @@
 import { createApp } from "honox/server";
 import { showRoutes } from "hono/dev";
+import { api } from "./api";
 import { blobs } from "./api/blobs";
-import { projects } from "./api/projects";
 import { startDeletionSweeper } from "./lib/gc";
 
 // /api/blobs はバケット全体を素通しする dev/scratch 用 endpoint なので
@@ -12,7 +12,7 @@ const ENABLE_BLOBS = process.env.NODE_ENV === "development";
 const app = createApp({
   init(hono) {
     if (ENABLE_BLOBS) hono.route("/api/blobs", blobs);
-    hono.route("/api/projects", projects);
+    hono.route("/api", api);
   },
 });
 

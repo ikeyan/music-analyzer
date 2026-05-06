@@ -1,45 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import type { ApiAudio, ApiProjectDetail, ApiThumbnail, ApiVideo } from "../api/types";
+import { apiClient } from "../lib/api-client";
 
-export type Thumb = { id: string; atSec: number; url: string; width: number; height: number };
-export type VideoItem = {
-  id: string;
-  name: string;
-  order: number;
-  durationSec: number;
-  width: number;
-  height: number;
-  fps: number;
-  sizeBytes: number;
-  srcStartSec: number;
-  srcEndSec: number;
-  projStartSec: number;
-  projEndSec: number;
-  streamUrl: string;
-  audioUrl: string | null;
-  thumbnails: Thumb[];
-};
-export type AudioItem = {
-  id: string;
-  name: string;
-  order: number;
-  durationSec: number;
-  sampleRate: number | null;
-  channels: number | null;
-  sizeBytes: number;
-  srcStartSec: number;
-  srcEndSec: number;
-  projStartSec: number;
-  projEndSec: number;
-  streamUrl: string;
-  rawUrl: string | null;
-  rawContentType: string | null;
-};
-export type ProjectDetailData = {
-  id: string;
-  name: string;
-  videos: VideoItem[];
-  audios: AudioItem[];
-};
+export type Thumb = ApiThumbnail;
+export type VideoItem = ApiVideo;
+export type AudioItem = ApiAudio;
+export type ProjectDetailData = ApiProjectDetail;
 
 type Track = { kind: "video"; data: VideoItem } | { kind: "audio"; data: AudioItem };
 
@@ -119,23 +85,20 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
   }, [tracks, currentTime, playing]);
 
   async function refresh() {
-    const res = await fetch(`/api/projects/${data.id}`);
+    const res = await apiClient.projects[":id"].$get({ param: { id: data.id } });
     if (!res.ok) return;
-    const body = (await res.json()) as { project: ServerProject };
-    setData(toClient(body.project));
+    const body = await res.json();
+    setData(body.project);
   }
 
   async function uploadVideo(file: File) {
     setBusy("video");
     setError(null);
     try {
-      const fd = new FormData();
-      fd.append("file", file);
-      fd.append("name", file.name);
-      const res = await fetch(`/api/projects/${data.id}/videos`, { method: "POST", body: fd });
-      if (!res.ok) {
-        const body = (await res.json().catch(() => ({}))) as { error?: string };
-        setError(body.error ?? `アップロード失敗 (HTTP ${res.status})`);
+      const url = apiClient.projects[":id"].videos.$url({ param: { id: data.id } });
+      const result = await uploadFileTo(url.toString(), file);
+      if ("error" in result) {
+        setError(result.error);
         return;
       }
       await refresh();
@@ -147,13 +110,10 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
     setBusy("audio");
     setError(null);
     try {
-      const fd = new FormData();
-      fd.append("file", file);
-      fd.append("name", file.name);
-      const res = await fetch(`/api/projects/${data.id}/audios`, { method: "POST", body: fd });
-      if (!res.ok) {
-        const body = (await res.json().catch(() => ({}))) as { error?: string };
-        setError(body.error ?? `アップロード失敗 (HTTP ${res.status})`);
+      const url = apiClient.projects[":id"].audios.$url({ param: { id: data.id } });
+      const result = await uploadFileTo(url.toString(), file);
+      if ("error" in result) {
+        setError(result.error);
         return;
       }
       await refresh();
@@ -199,12 +159,15 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
 
   async function deleteTrack(t: Track) {
     if (!confirm("削除しますか？")) return;
-    const url =
+    const res =
       t.kind === "video"
-        ? `/api/projects/${data.id}/videos/${t.data.id}`
-        : `/api/projects/${data.id}/audios/${t.data.id}`;
-    const res = await fetch(url, { method: "DELETE" });
-    if (res.ok || res.status === 204) await refresh();
+        ? await apiClient.projects[":id"].videos[":videoId"].$delete({
+            param: { id: data.id, videoId: t.data.id },
+          })
+        : await apiClient.projects[":id"].audios[":audioId"].$delete({
+            param: { id: data.id, audioId: t.data.id },
+          });
+    if (res.ok) await refresh();
     else setError(`削除失敗 (HTTP ${res.status})`);
   }
 
@@ -327,6 +290,16 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
       </div>
     </div>
   );
+}
+
+async function uploadFileTo(url: string, file: File): Promise<{ ok: true } | { error: string }> {
+  const fd = new FormData();
+  fd.append("file", file);
+  fd.append("name", file.name);
+  const res = await fetch(url, { method: "POST", body: fd });
+  if (res.ok) return { ok: true };
+  const body = (await res.json().catch(() => ({}))) as { error?: string };
+  return { error: body.error ?? `アップロード失敗 (HTTP ${res.status})` };
 }
 
 function trackKey(t: Track): string {
@@ -671,42 +644,4 @@ function formatTime(sec: number): string {
   const m = Math.floor(sec / 60);
   const s = sec - m * 60;
   return `${m}:${s.toFixed(2).padStart(5, "0")}`;
-}
-
-type ServerProject = {
-  id: string;
-  name: string;
-  videos: (Omit<VideoItem, "streamUrl" | "audioUrl" | "thumbnails"> & {
-    audioKey: string | null;
-    thumbnails: { id: string; atSec: number; key: string; width: number; height: number }[];
-  })[];
-  audios: (Omit<AudioItem, "streamUrl" | "rawUrl" | "rawContentType"> & {
-    rawKey: string | null;
-    rawContentType: string | null;
-  })[];
-};
-
-function toClient(p: ServerProject): ProjectDetailData {
-  return {
-    id: p.id,
-    name: p.name,
-    videos: p.videos.map((v) => ({
-      ...v,
-      streamUrl: `/api/projects/${p.id}/videos/${v.id}/stream`,
-      audioUrl: v.audioKey ? `/api/projects/${p.id}/videos/${v.id}/audio` : null,
-      thumbnails: v.thumbnails.map((t) => ({
-        id: t.id,
-        atSec: t.atSec,
-        url: `/api/projects/${p.id}/videos/${v.id}/thumbnails/${t.id}`,
-        width: t.width,
-        height: t.height,
-      })),
-    })),
-    audios: p.audios.map((a) => ({
-      ...a,
-      streamUrl: `/api/projects/${p.id}/audios/${a.id}/stream`,
-      rawUrl: a.rawKey ? `/api/projects/${p.id}/audios/${a.id}/raw` : null,
-      rawContentType: a.rawContentType,
-    })),
-  };
 }
