@@ -72,6 +72,20 @@ jobs:
       - name: Typecheck
         run: bun run typecheck
 
+      # Dockerfile / Dockerfile.app と同じ static-ffmpeg バイナリを取り出して
+      # bun test (ffprobe / transcode 統合テスト) から呼べる場所に置く
+      - name: Install ffmpeg
+        run: |
+          set -euo pipefail
+          docker pull mwader/static-ffmpeg:7.1.1
+          docker create --name ffmpeg-extract mwader/static-ffmpeg:7.1.1
+          mkdir -p "${RUNNER_TEMP}/bin"
+          docker cp ffmpeg-extract:/ffmpeg "${RUNNER_TEMP}/bin/ffmpeg"
+          docker cp ffmpeg-extract:/ffprobe "${RUNNER_TEMP}/bin/ffprobe"
+          docker rm ffmpeg-extract
+          chmod +x "${RUNNER_TEMP}/bin/ffmpeg" "${RUNNER_TEMP}/bin/ffprobe"
+          echo "${RUNNER_TEMP}/bin" >> "$GITHUB_PATH"
+
       - name: Test (with coverage)
         run: |
           set -o pipefail

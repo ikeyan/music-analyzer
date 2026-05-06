@@ -244,12 +244,18 @@ export async function extractThumbnails(
   videoHeight: number,
 ): Promise<ThumbnailFile[]> {
   await mkdir(outDir, { recursive: true });
-  const fps = 1 / THUMBNAIL_INTERVAL_SEC;
+  // 1枚目はt=0、以降は前回選択から THUMBNAIL_INTERVAL_SEC 秒以上経った
+  // 最初のフレームを取る。fps filter は midpoint からサンプリングするので
+  // 短い動画で t=0 の最初のサムネが落ちることがあった。
+  // mjpeg encoder は full-range YUV (yuvj420p) を要求するので明示変換する
+  const select = `isnan(prev_selected_t)+gte(t-prev_selected_t\\,${THUMBNAIL_INTERVAL_SEC})`;
   await runFfmpeg([
     "-i",
     input,
     "-vf",
-    `fps=${fps},scale=${THUMBNAIL_WIDTH}:-2`,
+    `select=${select},scale=${THUMBNAIL_WIDTH}:-2,format=yuvj420p`,
+    "-vsync",
+    "vfr",
     "-q:v",
     "5",
     "-f",
