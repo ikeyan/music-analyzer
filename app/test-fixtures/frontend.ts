@@ -5,20 +5,6 @@ import { fileURLToPath } from "node:url";
 
 // HonoX SSR (import.meta.glob) は vite なしで import できないので、
 // vite build 済みの dist/index.js を子プロセスで起動して WebView で叩く
-type WebViewBackend = { type: "chrome"; path: string };
-type WebView = {
-  navigate(url: string): void;
-  evaluate<T = unknown>(js: string): Promise<T>;
-  click(selector: string): void;
-  type(text: string): void;
-  press(key: string): void;
-  close(): void;
-  readonly url: string;
-  readonly title: string;
-  readonly loading: boolean;
-};
-type WebViewCtor = new (opts: { url: string; backend?: WebViewBackend }) => WebView;
-const WebView = (Bun as unknown as { WebView: WebViewCtor }).WebView;
 
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const DIST_ENTRY = join(PROJECT_ROOT, "dist", "index.js");
@@ -62,7 +48,7 @@ async function waitForReady(url: string, timeoutMs: number): Promise<void> {
 }
 
 let server: { url: string; close: () => Promise<void> } | null = null;
-let view: WebView | null = null;
+let view: Bun.WebView | null = null;
 
 async function startServer(): Promise<{ url: string; close: () => Promise<void> }> {
   if (!existsSync(DIST_ENTRY)) {
@@ -91,7 +77,11 @@ async function startServer(): Promise<{ url: string; close: () => Promise<void> 
 // onNavigated は DidStartNavigation のタイミングで呼ばれて loading は true のまま、
 // loading=false まで待ってもまだ navigate を即発行すると "navigation pending"
 // になる。loading が true になるのを確認してから false へ落ちるのを待ち、軽い grace を入れる
-export async function navigateAndWait(wv: WebView, url: string, timeoutMs = 15_000): Promise<void> {
+export async function navigateAndWait(
+  wv: Bun.WebView,
+  url: string,
+  timeoutMs = 15_000,
+): Promise<void> {
   wv.navigate(url);
   const deadline = Date.now() + timeoutMs;
   while (!wv.loading) {
@@ -109,12 +99,12 @@ export async function navigateAndWait(wv: WebView, url: string, timeoutMs = 15_0
 // navigateAndWait で同じ URL に戻す
 export function useFrontend(): {
   server: () => string;
-  webview: () => WebView;
+  webview: () => Bun.WebView;
   goto: (path: string) => Promise<void>;
 } {
   beforeAll(async () => {
     server = await startServer();
-    view = new WebView({
+    view = new Bun.WebView({
       url: "about:blank",
       backend: { type: "chrome", path: resolveChromePath() },
     });
@@ -156,7 +146,7 @@ export function useFrontend(): {
 }
 
 // 指定 selector が現れるまで待つ。SSR は即時だが hydration や fetch 後の DOM 変化用
-export async function waitFor(wv: WebView, selector: string, timeoutMs = 5_000): Promise<void> {
+export async function waitFor(wv: Bun.WebView, selector: string, timeoutMs = 5_000): Promise<void> {
   const expr = `new Promise((resolve, reject) => {
     const start = Date.now();
     const tick = () => {

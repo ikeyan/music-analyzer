@@ -56,7 +56,7 @@ function makeDeps(overrides: {
   const deletePrefix = mock(overrides.deletePrefix ?? (async () => {}));
   const deps: SweeperDeps = {
     prisma: { deletionMark: { findMany, deleteMany, update } },
-    deletePrefix: deletePrefix as unknown as (p: string) => Promise<void>,
+    deletePrefix,
     now: () => overrides.now ?? new Date(0),
     rand: () => overrides.rand ?? 0.5,
   };
