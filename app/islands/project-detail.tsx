@@ -230,6 +230,7 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
       >
         <button
           type="button"
+          aria-label={playing ? "pause" : "play"}
           onClick={() => (playing ? setPlaying(false) : startPlayback())}
           disabled={tracks.length === 0}
         >
