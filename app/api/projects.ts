@@ -217,6 +217,9 @@ export const projects = new Hono<AuthContext>()
           }
           const videoMap = new Map(videos.map((row) => [row.id, row]));
           const audioMap = new Map(audios.map((row) => [row.id, row]));
+          // 同じ {kind,id} を複数回含めると重複 update + 抜けが発生して order が
+          // 壊れるので、長さが一致していても永続 set で permutation か検証する
+          const seen = new Set<string>();
           for (const t of newOrder) {
             const exists = t.kind === "video" ? videoMap.has(t.id) : audioMap.has(t.id);
             if (!exists) {
@@ -224,6 +227,13 @@ export const projects = new Hono<AuthContext>()
                 message: `track-order: unknown ${t.kind} id ${t.id}`,
               });
             }
+            const key = `${t.kind}:${t.id}`;
+            if (seen.has(key)) {
+              throw new HTTPException(400, {
+                message: `track-order: duplicate ${t.kind} id ${t.id}`,
+              });
+            }
+            seen.add(key);
           }
           // Phase 1: 既存 row を一時的に負の order に逃がして unique 衝突を回避
           for (const [i, t] of newOrder.entries()) {
