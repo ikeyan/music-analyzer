@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { type CSSProperties, useEffect, useMemo, useRef, useState } from "react";
 import type { ApiAudio, ApiProjectDetail, ApiThumbnail, ApiVideo } from "../api/types";
 import { apiClient } from "../lib/api-client";
 
@@ -197,6 +197,23 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
     else setError(`削除失敗 (HTTP ${res.status})`);
   }
 
+  async function moveTrack(index: number, direction: -1 | 1) {
+    const target = index + direction;
+    if (target < 0 || target >= tracks.length) return;
+    const next = [...tracks];
+    [next[index], next[target]] = [next[target]!, next[index]!];
+    const res = await apiClient.projects[":id"]["track-order"].$patch({
+      param: { id: data.id },
+      json: { tracks: next.map((t) => ({ kind: t.kind, id: t.data.id })) },
+    });
+    if (res.ok) {
+      const body = await res.json();
+      setData(body.project);
+    } else {
+      setError(`並び替え失敗 (HTTP ${res.status})`);
+    }
+  }
+
   const totalWidth = displayDuration * pxPerSec;
 
   return (
@@ -292,12 +309,14 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
                 key={trackKey(t)}
                 track={t}
                 index={idx}
+                total={tracks.length}
                 pxPerSec={pxPerSec}
                 onSeek={(time) => {
                   setPlaying(false);
                   setCurrentTime(Math.max(0, Math.min(displayDuration, time)));
                 }}
                 onDelete={() => deleteTrack(t)}
+                onMove={(dir) => moveTrack(idx, dir)}
                 attachRef={(el) => {
                   if (el) mediaRefs.current.set(trackKey(t), el);
                   else mediaRefs.current.delete(trackKey(t));
@@ -434,19 +453,34 @@ function Playhead({ time, pxPerSec, height }: { time: number; pxPerSec: number; 
   );
 }
 
+const trackButtonStyle: CSSProperties = {
+  background: "rgba(0,0,0,0.45)",
+  border: "none",
+  color: "white",
+  cursor: "pointer",
+  fontSize: 11,
+  padding: "0 6px",
+  borderRadius: 3,
+  lineHeight: "16px",
+};
+
 function TrackRow({
   track,
   index,
+  total,
   pxPerSec,
   onSeek,
   onDelete,
+  onMove,
   attachRef,
 }: {
   track: Track;
   index: number;
+  total: number;
   pxPerSec: number;
   onSeek: (time: number) => void;
   onDelete: () => void;
+  onMove: (direction: -1 | 1) => void;
   attachRef: (el: HTMLMediaElement | null) => void;
 }) {
   const item = track.data;
@@ -528,30 +562,52 @@ function TrackRow({
           <ThumbnailStrip video={item as VideoItem} pxPerSec={pxPerSec} trackWidth={width} />
         )}
       </div>
-      <button
-        type="button"
-        aria-label={`${item.name} を削除`}
-        onClick={(e) => {
-          e.stopPropagation();
-          onDelete();
-        }}
+      <div
         style={{
           position: "absolute",
-          // 22px 未満の短い clip でも button が clip の左端より外に出ないよう clamp
-          left: left + Math.max(0, width - 22),
+          left: 4,
           top: 4,
-          background: "rgba(0,0,0,0.45)",
-          border: "none",
-          color: "white",
-          cursor: "pointer",
-          fontSize: 11,
-          padding: "0 6px",
-          borderRadius: 3,
-          lineHeight: "16px",
+          display: "flex",
+          gap: 2,
+          zIndex: 1,
         }}
       >
-        ×
-      </button>
+        <button
+          type="button"
+          aria-label={`${item.name} を上に移動`}
+          disabled={index === 0}
+          onClick={(e) => {
+            e.stopPropagation();
+            onMove(-1);
+          }}
+          style={trackButtonStyle}
+        >
+          ↑
+        </button>
+        <button
+          type="button"
+          aria-label={`${item.name} を下に移動`}
+          disabled={index === total - 1}
+          onClick={(e) => {
+            e.stopPropagation();
+            onMove(1);
+          }}
+          style={trackButtonStyle}
+        >
+          ↓
+        </button>
+        <button
+          type="button"
+          aria-label={`${item.name} を削除`}
+          onClick={(e) => {
+            e.stopPropagation();
+            onDelete();
+          }}
+          style={trackButtonStyle}
+        >
+          ×
+        </button>
+      </div>
       {track.kind === "video" ? (
         <video
           ref={attachRef as (el: HTMLVideoElement | null) => void}

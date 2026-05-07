@@ -85,7 +85,7 @@ describe("ProjectDetail (frontend)", () => {
     expect(src).toMatch(/\/api\/projects\/[^/]+\/videos\/[^/]+\/stream$/);
   }, 90_000);
 
-  it("音声 upload 後に再生ボタンを押すと audio.currentTime が進む", async () => {
+  it("音声 upload 後に再生ボタンを押すと audio.currentTime が進み、一時停止で止まる", async () => {
     const id = await createProject("playback-test");
     await goto(`/projects/${id}`);
     await waitHydrated('input[type=file][accept="audio/*"]');
@@ -103,7 +103,6 @@ describe("ProjectDetail (frontend)", () => {
     // synthetic btn.click() は autoplay policy の user gesture にならないので
     // webview.click(selector) で CDP 経由の input event を撃つ
     await webview().click('button[aria-label="play"]');
-    // 再生開始後にメディアが進むのを待つ
     const advanced = await webview().evaluate<number>(`new Promise(res => {
       const audio = document.querySelector('audio');
       const start = Date.now();
@@ -115,5 +114,70 @@ describe("ProjectDetail (frontend)", () => {
       tick();
     })`);
     expect(advanced).toBeGreaterThan(0);
+    // 一時停止で audio.paused が true になり currentTime が止まる
+    await webview().click('button[aria-label="pause"]');
+    const before = await webview().evaluate<number>(`document.querySelector('audio').currentTime`);
+    await Bun.sleep(300);
+    const after = await webview().evaluate<{ time: number; paused: boolean }>(
+      `({ time: document.querySelector('audio').currentTime, paused: document.querySelector('audio').paused })`,
+    );
+    expect(after.paused).toBe(true);
+    // 300ms の grace 内に 50ms 以上前進していなければ止まったとみなす
+    expect(Math.abs(after.time - before)).toBeLessThan(0.05);
+  }, 60_000);
+
+  it("track の ↑↓ ボタンで並び替えると order が入れ替わる", async () => {
+    const id = await createProject("reorder-test");
+    await goto(`/projects/${id}`);
+    await waitHydrated('input[type=file][accept="audio/*"]');
+    await injectFileToInput(getMedia().audioMp3, "audio/*", "first.mp3", "audio/mpeg");
+    await waitFor(webview(), "audio source", 30_000);
+    await injectFileToInput(getMedia().audioMp3, "audio/*", "second.mp3", "audio/mpeg");
+    // 2 audio source が出るまで poll
+    await webview().evaluate(`new Promise((res, rej) => {
+      const start = Date.now();
+      const tick = () => {
+        if (document.querySelectorAll('audio').length >= 2) return res();
+        if (Date.now() - start > 30000) return rej(new Error("second audio timeout"));
+        setTimeout(tick, 100);
+      };
+      tick();
+    })`);
+    // 「first を下に移動」をクリック → first と second が swap
+    await webview().click('button[aria-label="first.mp3 を下に移動"]');
+    // refresh で API から取り直したあと name の順序を見る (order asc で並ぶ)
+    await webview().evaluate(`new Promise((res, rej) => {
+      const start = Date.now();
+      const tick = () => {
+        const names = Array.from(document.querySelectorAll('honox-island span'))
+          .map(s => s.textContent ?? "")
+          .filter(t => t.includes(".mp3"));
+        if (names.length >= 2 && names[0].includes("second") && names[1].includes("first")) return res();
+        if (Date.now() - start > 5000) return rej(new Error("reorder not reflected: " + JSON.stringify(names)));
+        setTimeout(tick, 50);
+      };
+      tick();
+    })`);
+  }, 90_000);
+
+  it("削除ボタンで track が消える", async () => {
+    const id = await createProject("delete-test");
+    await goto(`/projects/${id}`);
+    await waitHydrated('input[type=file][accept="audio/*"]');
+    // confirm() を auto-accept する
+    await webview().evaluate(`window.confirm = () => true`);
+    await injectFileToInput(getMedia().audioMp3, "audio/*", "delete-me.mp3", "audio/mpeg");
+    await waitFor(webview(), "audio source", 30_000);
+    await webview().click('button[aria-label="delete-me.mp3 を削除"]');
+    // refresh 後 <audio> が DOM から消える
+    await webview().evaluate(`new Promise((res, rej) => {
+      const start = Date.now();
+      const tick = () => {
+        if (document.querySelectorAll('audio').length === 0) return res();
+        if (Date.now() - start > 5000) return rej(new Error("audio still present"));
+        setTimeout(tick, 50);
+      };
+      tick();
+    })`);
   }, 60_000);
 });

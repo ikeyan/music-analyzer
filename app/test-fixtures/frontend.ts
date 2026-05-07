@@ -109,14 +109,16 @@ export function useFrontend(): {
       backend: { type: "chrome", path: resolveChromePath() },
     });
     // 初期 about:blank の load が pending のまま次の navigate を呼ぶと
-    // "navigation pending" になるので loading が落ち着くまで待つ
-    const deadline = Date.now() + 10_000;
+    // "navigation pending" になるので loading が落ち着くまで待つ。
+    // chrome 初回起動が遅いケース (MinIO 起動を別 fixture が並行している等) を
+    // 含めるため 30s
+    const deadline = Date.now() + 30_000;
     while (view.loading) {
       if (Date.now() > deadline) throw new Error("about:blank didn't finish loading");
       await Bun.sleep(10);
     }
     await Bun.sleep(20);
-  }, 30_000);
+  }, 60_000);
 
   afterAll(async () => {
     try {

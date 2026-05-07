@@ -1,5 +1,6 @@
 import { vValidator } from "@hono/valibot-validator";
 import { Hono } from "hono";
+import { HTTPException } from "hono/http-exception";
 import { extname, join } from "node:path";
 import * as v from "valibot";
 import { type AuthContext, requireUser } from "../lib/auth";
@@ -50,6 +51,14 @@ const audioIdParamSchema = v.object({ id: v.string(), audioId: v.string() });
 const thumbIdParamSchema = v.object({ id: v.string(), videoId: v.string(), thumbId: v.string() });
 const createProjectSchema = v.object({
   name: v.pipe(v.string(), v.trim(), v.minLength(1)),
+});
+const reorderTracksSchema = v.object({
+  tracks: v.array(
+    v.object({
+      kind: v.picklist(["video", "audio"]),
+      id: v.string(),
+    }),
+  ),
 });
 
 async function findProjectOr404(userId: string, projectId: string) {
@@ -175,6 +184,81 @@ export const projects = new Hono<AuthContext>()
     await eagerCleanupAndUnmark(prefix);
     return c.body(null, 204);
   })
+
+  // 全 track の並び順を一括更新する。video / audio 横断で order が unique なので
+  // 中間状態で衝突しないよう負の offset に一旦逃がしてから本来の order に書き戻し、
+  // 同時に projStartSec / projEndSec を新しい順に back-to-back で再配置する
+  .patch(
+    "/:id/track-order",
+    vValidator("param", idParamSchema),
+    vValidator("json", reorderTracksSchema),
+    async (c) => {
+      const user = c.var.user;
+      const project = await findProjectOr404(user.id, c.req.valid("param").id);
+      if (!project) return c.json({ error: "project not found" }, 404);
+      const { tracks: newOrder } = c.req.valid("json");
+
+      await withSlotRetry(() =>
+        prisma.$transaction(async (tx) => {
+          await tx.project.update({ where: { id: project.id }, data: { updatedAt: new Date() } });
+          const [videos, audios] = await Promise.all([
+            tx.video.findMany({
+              where: { projectId: project.id },
+              select: { id: true, projStartSec: true, projEndSec: true },
+            }),
+            tx.audio.findMany({
+              where: { projectId: project.id },
+              select: { id: true, projStartSec: true, projEndSec: true },
+            }),
+          ]);
+          const expected = videos.length + audios.length;
+          if (newOrder.length !== expected) {
+            throw new HTTPException(400, { message: "track-order: length mismatch" });
+          }
+          const videoMap = new Map(videos.map((row) => [row.id, row]));
+          const audioMap = new Map(audios.map((row) => [row.id, row]));
+          for (const t of newOrder) {
+            const exists = t.kind === "video" ? videoMap.has(t.id) : audioMap.has(t.id);
+            if (!exists) {
+              throw new HTTPException(400, {
+                message: `track-order: unknown ${t.kind} id ${t.id}`,
+              });
+            }
+          }
+          // Phase 1: 既存 row を一時的に負の order に逃がして unique 衝突を回避
+          for (const [i, t] of newOrder.entries()) {
+            const data = { order: -(i + 1) };
+            if (t.kind === "video") await tx.video.update({ where: { id: t.id }, data });
+            else await tx.audio.update({ where: { id: t.id }, data });
+          }
+          // Phase 2: 本来の order と back-to-back な projStart/End を書き込む
+          let cursor = 0;
+          for (const [i, t] of newOrder.entries()) {
+            const row = (t.kind === "video" ? videoMap : audioMap).get(t.id);
+            if (!row) throw new Error("unreachable");
+            const duration = row.projEndSec - row.projStartSec;
+            const data = { order: i, projStartSec: cursor, projEndSec: cursor + duration };
+            if (t.kind === "video") await tx.video.update({ where: { id: t.id }, data });
+            else await tx.audio.update({ where: { id: t.id }, data });
+            cursor += duration;
+          }
+        }),
+      );
+
+      const updated = await prisma.project.findFirst({
+        where: { id: project.id, userId: user.id },
+        include: {
+          videos: {
+            orderBy: { order: "asc" },
+            include: { thumbnails: { orderBy: { atSec: "asc" } } },
+          },
+          audios: { orderBy: { order: "asc" } },
+        },
+      });
+      if (!updated) return c.json({ error: "project not found" }, 404);
+      return c.json({ project: toApiProjectDetail(updated) satisfies ApiProjectDetail });
+    },
+  )
 
   .post("/:id/videos", vValidator("param", idParamSchema), async (c) => {
     const user = c.var.user;
