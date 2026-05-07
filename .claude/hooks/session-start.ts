@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 import { $ } from "bun";
 import { existsSync, openSync } from "node:fs";
+import { tempDir } from "../../app/lib/ffmpeg";
 
 if (process.env.CLAUDE_CODE_REMOTE !== "true") process.exit(0);
 
@@ -45,13 +46,10 @@ const ensureBunVersion = async () => {
   const arch = process.arch === "arm64" ? "aarch64" : "x64";
   const dirName = `bun-linux-${arch}`;
   const url = `https://github.com/oven-sh/bun/releases/download/bun-v${target}/${dirName}.zip`;
-  const tmp = `/tmp/bun-upgrade-${target}`;
-  await $`rm -rf ${tmp}`.quiet();
-  await $`mkdir -p ${tmp}`.quiet();
-  await $`curl -fsSL ${url} -o ${tmp}/bun.zip`.quiet();
-  await $`unzip -q -o ${tmp}/bun.zip -d ${tmp}`.quiet();
-  await $`install -m 755 ${tmp}/${dirName}/bun /root/.bun/bin/bun`.quiet();
-  await $`rm -rf ${tmp}`.quiet();
+  await using td = await tempDir(`bun-upgrade-${target}`);
+  await $`curl -fsSL ${url} -o ${td.path}/bun.zip`.quiet();
+  await $`unzip -q -o ${td.path}/bun.zip -d ${td.path}`.quiet();
+  await $`install -m 755 ${td.path}/${dirName}/bun /root/.bun/bin/bun`.quiet();
 };
 
 // Bun.WebView 用 Chrome (--no-sandbox 付きの wrapper script 経由)。session 跨ぎで
@@ -65,14 +63,11 @@ const ensureChrome = async () => {
   const arch = process.arch === "arm64" ? "linux64" : "linux64";
   const dirName = `chrome-${arch}`;
   const url = `https://storage.googleapis.com/chrome-for-testing-public/${CHROME_VERSION}/${arch}/${dirName}.zip`;
-  const tmp = `/tmp/chrome-${CHROME_VERSION}`;
-  await $`rm -rf ${tmp}`.quiet();
-  await $`mkdir -p ${tmp}`.quiet();
-  await $`curl -fsSL ${url} -o ${tmp}/chrome.zip`.quiet();
-  await $`unzip -q -o ${tmp}/chrome.zip -d ${tmp}`.quiet();
+  await using td = await tempDir(`chrome-${CHROME_VERSION}`);
+  await $`curl -fsSL ${url} -o ${td.path}/chrome.zip`.quiet();
+  await $`unzip -q -o ${td.path}/chrome.zip -d ${td.path}`.quiet();
   await $`sudo mkdir -p ${CHROME_DIR}`;
-  await $`sudo cp -r ${tmp}/${dirName}/. ${CHROME_DIR}/`;
-  await $`rm -rf ${tmp}`.quiet();
+  await $`sudo cp -r ${td.path}/${dirName}/. ${CHROME_DIR}/`;
   // root 実行で Chrome の zygote sandbox が動かないため wrapper で --no-sandbox を強制
   await $`sudo tee ${CHROME_WRAP}`
     .stdin(`#!/bin/sh\nexec ${CHROME_DIR}/chrome --no-sandbox "$@"\n`)
