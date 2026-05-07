@@ -104,15 +104,18 @@ jobs:
           chmod +x "$wrap"
           echo "BUN_CHROME_PATH=${wrap}" >> "$GITHUB_ENV"
 
-      # frontend テスト (project-list.frontend.test.ts) は dist/ を子プロセスで起動するため、
-      # test の前に build を済ませる
-      - name: Build
-        run: bun run build
-
       - name: Test (with coverage)
         run: |
           set -o pipefail
           bun run test:coverage 2>&1 | tee coverage-unit.log
+
+      # frontend テスト (project-list.frontend.test.ts) は dist/ を子プロセスで起動するため
+      # 先に build。 test:frontend は path-ignore の補集合で frontend.test.ts だけ走らせる
+      - name: Build
+        run: bun run build
+
+      - name: Test (frontend)
+        run: bun run test:frontend
 
       - name: Coverage summary (unit)
         if: always()
