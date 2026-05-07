@@ -10,12 +10,12 @@ import {
   extractThumbnails,
   ffprobe,
   isBrowserPlayableAudio,
-  tempDir,
   transcodeAudio,
   transcodeVideo,
 } from "../lib/ffmpeg";
 import { prisma } from "../lib/prisma";
 import { awaitAllOrAggregate } from "../lib/promise";
+import { tempDir } from "../lib/temp-dir";
 import {
   audioRawKey,
   audioTranscodedKey,

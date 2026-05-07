@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 import { $ } from "bun";
 import { existsSync, openSync } from "node:fs";
-import { tempDir } from "../../app/lib/ffmpeg";
+import { tempDir } from "../../app/lib/temp-dir";
 
 if (process.env.CLAUDE_CODE_REMOTE !== "true") process.exit(0);
 
