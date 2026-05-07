@@ -73,35 +73,24 @@ jobs:
         run: bun run typecheck
 
       # Dockerfile / Dockerfile.app と同じ static-ffmpeg バイナリを取り出して
-      # bun test (ffprobe / transcode 統合テスト) から呼べる場所に置く
+      # bun test (ffprobe / transcode 統合テスト) から呼べる場所に置く。
+      # session-start hook と install logic を共有
       - name: Install ffmpeg
         run: |
           set -euo pipefail
-          docker pull mwader/static-ffmpeg:7.1.1
-          docker create --name ffmpeg-extract mwader/static-ffmpeg:7.1.1
           mkdir -p "${RUNNER_TEMP}/bin"
-          docker cp ffmpeg-extract:/ffmpeg "${RUNNER_TEMP}/bin/ffmpeg"
-          docker cp ffmpeg-extract:/ffprobe "${RUNNER_TEMP}/bin/ffprobe"
-          docker rm ffmpeg-extract
-          chmod +x "${RUNNER_TEMP}/bin/ffmpeg" "${RUNNER_TEMP}/bin/ffprobe"
+          bun run scripts/install-ffmpeg.ts --out "${RUNNER_TEMP}/bin"
           echo "${RUNNER_TEMP}/bin" >> "$GITHUB_PATH"
 
-      # Bun.WebView (frontend テスト用)。chrome-for-testing zip を runner temp に
-      # 展開し、Chrome の zygote sandbox が runner で動かないので --no-sandbox を
-      # 強制する wrapper script を介して呼ぶ。
+      # Bun.WebView (frontend テスト用)。session-start hook と install logic を共有。
       # 共有ライブラリ (libnss3 等) は runner image の preinstall Chrome 用に揃っている前提
       - name: Install Chrome for testing
         run: |
           set -euo pipefail
-          version=141.0.7390.107
-          dir="${RUNNER_TEMP}/chrome-for-testing/${version}"
-          mkdir -p "$dir"
-          curl -fsSL "https://storage.googleapis.com/chrome-for-testing-public/${version}/linux64/chrome-linux64.zip" -o "${RUNNER_TEMP}/chrome.zip"
-          unzip -q -o "${RUNNER_TEMP}/chrome.zip" -d "${RUNNER_TEMP}/chrome-extracted"
-          cp -r "${RUNNER_TEMP}/chrome-extracted/chrome-linux64/." "$dir/"
+          dir="${RUNNER_TEMP}/chrome-for-testing"
           wrap="${RUNNER_TEMP}/chrome-wrap"
-          printf '#!/bin/sh\nexec "%s/chrome" --no-sandbox "$@"\n' "$dir" > "$wrap"
-          chmod +x "$wrap"
+          mkdir -p "$dir"
+          bun run scripts/install-chrome.ts --out "$dir" --wrapper "$wrap"
           echo "BUN_CHROME_PATH=${wrap}" >> "$GITHUB_ENV"
 
       - name: Test (with coverage)

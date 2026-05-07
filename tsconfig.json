@@ -20,5 +20,5 @@
       "@/*": ["./app/*"]
     }
   },
-  "include": ["app", "prisma", "vite.config.ts"]
+  "include": ["app", "prisma", "scripts", ".claude/hooks", "vite.config.ts"]
 }
