@@ -536,7 +536,8 @@ function TrackRow({
         }}
         style={{
           position: "absolute",
-          left: left + width - 22,
+          // 22px 未満の短い clip でも button が clip の左端より外に出ないよう clamp
+          left: left + Math.max(0, width - 22),
           top: 4,
           background: "rgba(0,0,0,0.45)",
           border: "none",
