@@ -11,7 +11,8 @@ WORKDIR /app
 
 # Install deps first for better layer caching.
 COPY package.json bun.lock ./
-RUN bun install --frozen-lockfile
+RUN --mount=type=cache,target=/root/.bun/install/cache,sharing=locked \
+    bun install --frozen-lockfile
 
 COPY prisma ./prisma
 COPY prisma.config.ts tsconfig.json vite.config.ts .oxlintrc.json .oxfmtrc.json ./
