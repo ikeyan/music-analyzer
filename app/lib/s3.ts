@@ -1,8 +1,10 @@
 import { S3Client } from "bun";
 
-const globalForS3 = globalThis as unknown as {
-  s3?: S3Client;
-};
+declare global {
+  // dev で HMR/再 import 時に S3Client を使い回すための単一スロット
+  // eslint-disable-next-line no-var
+  var __musicAnalyzerS3: S3Client | undefined;
+}
 
 function createS3Client(): S3Client {
   const accessKeyId = process.env.S3_ACCESS_KEY_ID;
@@ -25,12 +27,12 @@ function createS3Client(): S3Client {
 }
 
 export function getS3(): S3Client {
-  if (!globalForS3.s3) {
-    globalForS3.s3 = createS3Client();
+  if (!globalThis.__musicAnalyzerS3) {
+    globalThis.__musicAnalyzerS3 = createS3Client();
   }
-  return globalForS3.s3;
+  return globalThis.__musicAnalyzerS3;
 }
 
 export function resetS3ForTest(): void {
-  globalForS3.s3 = undefined;
+  globalThis.__musicAnalyzerS3 = undefined;
 }

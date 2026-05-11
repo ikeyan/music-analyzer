@@ -7,15 +7,9 @@ const adapter = new PrismaBunSqlite({
 const prisma = new PrismaClient({ adapter });
 
 async function main() {
-  const existing = await prisma.message.findFirst();
-  if (existing) {
-    console.log("Seed skipped: messages already exist");
-    return;
-  }
-  const created = await prisma.message.create({
-    data: { content: "Hello, World!" },
-  });
-  console.log("Seeded:", created);
+  // 接続検証だけ。スキーマは何もfixtureを必要としない
+  await prisma.$queryRaw`SELECT 1`;
+  console.log("Seed: schema in place, no fixtures to insert");
 }
 
 main()

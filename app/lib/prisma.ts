@@ -1,9 +1,11 @@
 import { PrismaBunSqlite } from "prisma-adapter-bun-sqlite";
 import { PrismaClient } from "../generated/prisma/client";
 
-const globalForPrisma = globalThis as unknown as {
-  prisma?: PrismaClient;
-};
+declare global {
+  // dev で HMR/再 import 時に PrismaClient を使い回すための単一スロット
+  // eslint-disable-next-line no-var
+  var __musicAnalyzerPrisma: PrismaClient | undefined;
+}
 
 function createPrismaClient() {
   const adapter = new PrismaBunSqlite({
@@ -12,8 +14,8 @@ function createPrismaClient() {
   return new PrismaClient({ adapter });
 }
 
-export const prisma = globalForPrisma.prisma ?? createPrismaClient();
+export const prisma = globalThis.__musicAnalyzerPrisma ?? createPrismaClient();
 
 if (process.env.NODE_ENV !== "production") {
-  globalForPrisma.prisma = prisma;
+  globalThis.__musicAnalyzerPrisma = prisma;
 }

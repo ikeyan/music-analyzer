@@ -58,6 +58,7 @@ beforeAll(async () => {
         AUTHENTIK_BOOTSTRAP_EMAIL: "admin@localhost",
         AUTHENTIK_BOOTSTRAP_PASSWORD: BOOTSTRAP_PASSWORD,
         AUTHENTIK_BOOTSTRAP_TOKEN: BOOTSTRAP_TOKEN,
+        AUTH_PROXY_SECRET: `e2e-proxy-${crypto.randomUUID()}`,
         // 並行実行のportコリジョン回避
         CADDY_PORT_HTTP: "0",
         AUTHENTIK_PORT_HTTP: "0",

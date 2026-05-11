@@ -1,0 +1,8 @@
+[test]
+# 全 test 開始前に temp SQLite を作って prisma schema を push する。
+# 以降 lib/prisma.ts は process.env.DATABASE_URL を読んで test DB を見る
+preload = ["./app/test-fixtures/db-preload.ts"]
+# 自動生成された prisma client と process.on("exit") ハンドラ (test 終了後に発火、計測不能) は対象外
+coveragePathIgnorePatterns = ["**/app/generated/**", "**/app/test-fixtures/exit-cleanup.ts"]
+coverageReporter = ["text", "lcov"]
+coverageDir = "coverage"

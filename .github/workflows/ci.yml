@@ -72,11 +72,61 @@ jobs:
       - name: Typecheck
         run: bun run typecheck
 
-      - name: Test
-        run: bun test
+      # Dockerfile / Dockerfile.app と同じ static-ffmpeg バイナリを取り出して
+      # bun test (ffprobe / transcode 統合テスト) から呼べる場所に置く。
+      # session-start hook と install logic を共有
+      - name: Install ffmpeg
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/bin"
+          bun run scripts/install-ffmpeg.ts --out "${RUNNER_TEMP}/bin"
+          echo "${RUNNER_TEMP}/bin" >> "$GITHUB_PATH"
 
+      # Bun.WebView (frontend テスト用)。session-start hook と install logic を共有。
+      # 共有ライブラリ (libnss3 等) は runner image の preinstall Chrome 用に揃っている前提
+      - name: Install Chrome for testing
+        run: |
+          set -euo pipefail
+          dir="${RUNNER_TEMP}/chrome-for-testing"
+          wrap="${RUNNER_TEMP}/chrome-wrap"
+          mkdir -p "$dir"
+          bun run scripts/install-chrome.ts --out "$dir" --wrapper "$wrap"
+          echo "BUN_CHROME_PATH=${wrap}" >> "$GITHUB_ENV"
+
+      - name: Test (with coverage)
+        run: |
+          set -o pipefail
+          bun run test:coverage 2>&1 | tee coverage-unit.log
+
+      # frontend テスト (project-list.frontend.test.ts) は dist/ を子プロセスで起動するため
+      # 先に build。 test:frontend は path-ignore の補集合で frontend.test.ts だけ走らせる
       - name: Build
         run: bun run build
+
+      - name: Test (frontend)
+        run: bun run test:frontend
+
+      - name: Coverage summary (unit)
+        if: always()
+        run: |
+          if [ -f coverage-unit.log ]; then
+            {
+              echo "### Unit test coverage"
+              echo ""
+              echo '```'
+              cat coverage-unit.log
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload coverage (unit)
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage-unit-${{ github.run_id }}-${{ github.run_attempt }}
+          path: coverage/lcov.info
+          retention-days: 14
+          if-no-files-found: warn
 
   e2e-authentik:
     name: e2e (authentik)
@@ -117,13 +167,16 @@ jobs:
           pg_pass=$(openssl rand -hex 16)
           bootstrap_pwd=$(openssl rand -hex 16)
           bootstrap_token=$(openssl rand -hex 32)
+          proxy_secret=$(openssl rand -hex 32)
           echo "::add-mask::$pg_pass"
           echo "::add-mask::$bootstrap_pwd"
           echo "::add-mask::$bootstrap_token"
+          echo "::add-mask::$proxy_secret"
           {
             echo "PG_PASS=$pg_pass"
             echo "AUTHENTIK_BOOTSTRAP_PASSWORD=$bootstrap_pwd"
             echo "AUTHENTIK_BOOTSTRAP_TOKEN=$bootstrap_token"
+            echo "AUTH_PROXY_SECRET=$proxy_secret"
           } >> "$GITHUB_ENV"
 
       # testcontainers経由ではなく直接compose upすることでテスト失敗後もログ採取可能にする
@@ -136,6 +189,7 @@ jobs:
           AUTHENTIK_BOOTSTRAP_EMAIL=${AUTHENTIK_BOOTSTRAP_EMAIL}
           AUTHENTIK_BOOTSTRAP_PASSWORD=${AUTHENTIK_BOOTSTRAP_PASSWORD}
           AUTHENTIK_BOOTSTRAP_TOKEN=${AUTHENTIK_BOOTSTRAP_TOKEN}
+          AUTH_PROXY_SECRET=${AUTH_PROXY_SECRET}
           CADDY_PORT_HTTP=8080
           AUTHENTIK_PORT_HTTP=9000
           AUTHENTIK_PORT_HTTPS=9443
@@ -172,11 +226,42 @@ jobs:
             sleep 5
           done
 
-      - name: Run authentik e2e
+      - name: Run authentik e2e (with coverage)
         env:
           AUTHENTIK_E2E_CADDY_URL: http://localhost:8080
           AUTHENTIK_E2E_AUTHENTIK_URL: http://localhost:9000
-        run: bun run e2e:authentik
+          RUN_AUTHENTIK_E2E: "1"
+        run: |
+          set -o pipefail
+          # bunの--coverageは bun test専用 (bun run scriptは非対応)。
+          # e2eテストプロセス内で実行されるhelper code (e2e/authentik/scripts/*)
+          # の coverage が出る。container内のmusic-analyzer本体は別プロセスなので
+          # 計測対象外。
+          # --coverage-dir はbunfig.tomlのcoverageDir(=coverage)に上書きされるため
+          # 既定の coverage/lcov.info を生成→artifact 名で unit と区別する
+          bun test --coverage e2e/authentik/flow.test.ts 2>&1 | tee coverage-e2e.log
+
+      - name: Coverage summary (e2e)
+        if: always()
+        run: |
+          if [ -f coverage-e2e.log ]; then
+            {
+              echo "### E2E test coverage"
+              echo ""
+              echo '```'
+              cat coverage-e2e.log
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload coverage (e2e)
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage-e2e-${{ github.run_id }}-${{ github.run_attempt }}
+          path: coverage/lcov.info
+          retention-days: 14
+          if-no-files-found: warn
 
       # 全ログをartifact化し、UI用にtail-200を各serviceについて表示
       - name: Collect compose logs and state

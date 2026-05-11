@@ -7,7 +7,116 @@ datasource db {
   provider = "sqlite"
 }
 
-model Message {
-  id      Int    @id @default(autoincrement())
-  content String
+model User {
+  id           String    @id @default(cuid())
+  authentikSub String    @unique
+  username     String?
+  email        String?
+  name         String?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+  projects     Project[]
+}
+
+model Project {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id])
+  name      String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  videos    Video[]
+  audios    Audio[]
+
+  @@index([userId])
+}
+
+model Video {
+  id        String  @id @default(cuid())
+  projectId String
+  project   Project @relation(fields: [projectId], references: [id])
+  order     Int
+  name      String
+
+  videoKey String
+  audioKey String?
+
+  durationSec  Float
+  width        Int
+  height       Int
+  fps          Float
+  videoBitrate Int?
+  audioBitrate Int?
+  sizeBytes    BigInt
+
+  srcStartSec  Float @default(0)
+  srcEndSec    Float
+  projStartSec Float
+  projEndSec   Float
+
+  createdAt  DateTime    @default(now())
+  updatedAt  DateTime    @updatedAt
+  thumbnails Thumbnail[]
+
+  @@unique([projectId, order])
+  @@index([projectId])
+}
+
+model Audio {
+  id        String  @id @default(cuid())
+  projectId String
+  project   Project @relation(fields: [projectId], references: [id])
+  order     Int
+  name      String
+
+  audioKey       String // 標準化AAC m4a (常に存在、ブラウザ再生可)
+  rawKey         String? // browser再生可能と判断した入力のみ raw を保存
+  rawContentType String?
+
+  durationSec Float
+  sampleRate  Int?
+  channels    Int?
+  bitrate     Int?
+  sizeBytes   BigInt
+
+  srcStartSec  Float @default(0)
+  srcEndSec    Float
+  projStartSec Float
+  projEndSec   Float
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([projectId, order])
+  @@index([projectId])
+}
+
+model Thumbnail {
+  id      String @id @default(cuid())
+  videoId String
+  video   Video  @relation(fields: [videoId], references: [id])
+  atSec   Float
+  key     String
+  width   Int
+  height  Int
+
+  @@unique([videoId, atSec])
+  @@index([videoId])
+}
+
+// DBのrow deleteと同じトランザクションで挿入する S3 prefix の墓標。
+// 同期best-effort cleanupが失敗してもsweeperが拾うので
+// (DB, S3) は eventually consistent になる
+model DeletionMark {
+  id          String   @id @default(cuid())
+  prefix      String
+  attempts    Int      @default(0)
+  lastError   String?
+  // 次に sweeper が拾える時刻。挿入時は upload grace 分先 (orphan 防止用墓標を
+  // upload 完了より前に置くため、sweeper が in-progress な S3 を消さないよう grace を取る)
+  nextRetryAt DateTime @default(now())
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([nextRetryAt])
 }

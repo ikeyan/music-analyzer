@@ -36,6 +36,10 @@
 			trusted_proxies private_ranges
 		}
 
-		reverse_proxy http://music-analyzer:5173
+		# AUTH_PROXY_SECRET を上流に付与。値はcompose env由来。
+		# music-analyzerはこのheaderが一致する時だけrequestを受理する
+		reverse_proxy http://music-analyzer:5173 {
+			header_up X-Auth-Proxy-Secret {env.AUTH_PROXY_SECRET}
+		}
 	}
 }
