@@ -160,6 +160,30 @@ describe("ProjectDetail (frontend)", () => {
     })`);
   }, 90_000);
 
+  it("非メディアファイルを upload すると HTTP status と branch 別エラー文言が画面に出る", async () => {
+    const id = await createProject("error-test");
+    await goto(`/projects/${id}`);
+    await waitHydrated('input[type=file][accept="audio/*"]');
+    // 適当な非メディア bytes をぶつけて ffprobe failure 経路を踏ませる
+    await webview().evaluate(`(() => {
+      const bytes = new TextEncoder().encode("not a media file");
+      const file = new File([bytes], "garbage.bin", { type: "application/octet-stream" });
+      const input = document.querySelector('input[type=file][accept="audio/*"]');
+      const dt = new DataTransfer();
+      dt.items.add(file);
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "files").set;
+      setter.call(input, dt.files);
+      input.dispatchEvent(new Event("change", { bubbles: true }));
+    })()`);
+    await waitFor(webview(), 'p[role="alert"]', 30_000);
+    const errText = await webview().evaluate<string>(
+      `document.querySelector('p[role="alert"]').textContent ?? ""`,
+    );
+    // status + branch を識別できる文言が両方含まれる
+    expect(errText).toContain("HTTP 400");
+    expect(errText).toContain("could not parse uploaded file");
+  }, 60_000);
+
   it("削除ボタンで track が消える", async () => {
     const id = await createProject("delete-test");
     await goto(`/projects/${id}`);

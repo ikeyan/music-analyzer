@@ -113,7 +113,7 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
       const url = apiClient.projects[":id"].videos.$url({ param: { id: data.id } });
       const result = await uploadFileTo(url.toString(), file);
       if ("error" in result) {
-        setError(result.error);
+        setError(`動画 upload 失敗 (HTTP ${result.status}): ${result.error}`);
         return;
       }
       await refresh();
@@ -128,7 +128,7 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
       const url = apiClient.projects[":id"].audios.$url({ param: { id: data.id } });
       const result = await uploadFileTo(url.toString(), file);
       if ("error" in result) {
-        setError(result.error);
+        setError(`音声 upload 失敗 (HTTP ${result.status}): ${result.error}`);
         return;
       }
       await refresh();
@@ -240,7 +240,22 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
         />
       </section>
 
-      {error && <p style={{ color: "crimson" }}>{error}</p>}
+      {error && (
+        <p
+          role="alert"
+          style={{
+            color: "crimson",
+            background: "#fff5f5",
+            border: "1px solid crimson",
+            padding: "0.5rem 0.75rem",
+            borderRadius: 4,
+            margin: "0.5rem 0",
+            whiteSpace: "pre-wrap",
+          }}
+        >
+          {error}
+        </p>
+      )}
 
       <section
         style={{ display: "flex", alignItems: "center", gap: "0.75rem", margin: "0.75rem 0" }}
@@ -338,14 +353,17 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
   );
 }
 
-async function uploadFileTo(url: string, file: File): Promise<{ ok: true } | { error: string }> {
+async function uploadFileTo(
+  url: string,
+  file: File,
+): Promise<{ ok: true } | { error: string; status: number }> {
   const fd = new FormData();
   fd.append("file", file);
   fd.append("name", file.name);
   const res = await fetch(url, { method: "POST", body: fd });
   if (res.ok) return { ok: true };
   const body = (await res.json().catch(() => ({}))) as { error?: string };
-  return { error: body.error ?? `アップロード失敗 (HTTP ${res.status})` };
+  return { error: body.error ?? "(no error message in response body)", status: res.status };
 }
 
 function trackKey(t: Track): string {

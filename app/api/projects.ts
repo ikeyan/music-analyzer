@@ -278,7 +278,10 @@ export const projects = new Hono<AuthContext>()
     // Content-Length で fast-fail。client は嘘をつけるので parse 後の file.size でも再チェックする
     const declared = Number(c.req.header("content-length") ?? "");
     if (Number.isFinite(declared) && declared > MAX_UPLOAD_BYTES + MULTIPART_OVERHEAD_SLACK) {
-      return c.json({ error: `file too large (max ${MAX_UPLOAD_BYTES} bytes)` }, 413);
+      return c.json(
+        { error: `file too large (max ${MAX_UPLOAD_BYTES} bytes, declared content-length)` },
+        413,
+      );
     }
 
     let form;
@@ -292,7 +295,10 @@ export const projects = new Hono<AuthContext>()
       return c.json({ error: "file required" }, 400);
     }
     if (file.size > MAX_UPLOAD_BYTES) {
-      return c.json({ error: `file too large (max ${MAX_UPLOAD_BYTES} bytes)` }, 413);
+      return c.json(
+        { error: `file too large (max ${MAX_UPLOAD_BYTES} bytes, parsed file.size)` },
+        413,
+      );
     }
     const nameField = form.get("name");
     const name = (typeof nameField === "string" ? nameField.trim() : "") || file.name || "video";
@@ -324,7 +330,7 @@ export const projects = new Hono<AuthContext>()
           probe.durationSec > MAX_DURATION_SEC
         ) {
           return {
-            error: `duration must be > 0 and <= ${MAX_DURATION_SEC}s`,
+            error: `duration must be > 0 and <= ${MAX_DURATION_SEC}s (input probe)`,
             status: 400 as const,
           };
         }
@@ -357,7 +363,7 @@ export const projects = new Hono<AuthContext>()
         // pre-probe で過小報告された壊れた入力に備えて再判定
         if (finalProbe.durationSec > MAX_DURATION_SEC) {
           return {
-            error: `duration must be > 0 and <= ${MAX_DURATION_SEC}s`,
+            error: `duration must be > 0 and <= ${MAX_DURATION_SEC}s (transcoded probe)`,
             status: 400 as const,
           };
         }
@@ -500,7 +506,10 @@ export const projects = new Hono<AuthContext>()
 
     const declared = Number(c.req.header("content-length") ?? "");
     if (Number.isFinite(declared) && declared > MAX_UPLOAD_BYTES + MULTIPART_OVERHEAD_SLACK) {
-      return c.json({ error: `file too large (max ${MAX_UPLOAD_BYTES} bytes)` }, 413);
+      return c.json(
+        { error: `file too large (max ${MAX_UPLOAD_BYTES} bytes, declared content-length)` },
+        413,
+      );
     }
 
     let form;
@@ -514,7 +523,10 @@ export const projects = new Hono<AuthContext>()
       return c.json({ error: "file required" }, 400);
     }
     if (file.size > MAX_UPLOAD_BYTES) {
-      return c.json({ error: `file too large (max ${MAX_UPLOAD_BYTES} bytes)` }, 413);
+      return c.json(
+        { error: `file too large (max ${MAX_UPLOAD_BYTES} bytes, parsed file.size)` },
+        413,
+      );
     }
     const nameField = form.get("name");
     const name = (typeof nameField === "string" ? nameField.trim() : "") || file.name || "audio";
@@ -545,7 +557,7 @@ export const projects = new Hono<AuthContext>()
           probe.durationSec > MAX_DURATION_SEC
         ) {
           return {
-            error: `duration must be > 0 and <= ${MAX_DURATION_SEC}s`,
+            error: `duration must be > 0 and <= ${MAX_DURATION_SEC}s (input probe)`,
             status: 400 as const,
           };
         }
@@ -565,7 +577,7 @@ export const projects = new Hono<AuthContext>()
         }
         if (finalProbe.durationSec > MAX_DURATION_SEC) {
           return {
-            error: `duration must be > 0 and <= ${MAX_DURATION_SEC}s`,
+            error: `duration must be > 0 and <= ${MAX_DURATION_SEC}s (transcoded probe)`,
             status: 400 as const,
           };
         }
