@@ -160,11 +160,12 @@ describe("ProjectDetail (frontend)", () => {
     })`);
   }, 90_000);
 
-  it("非メディアファイルを upload すると HTTP status と branch 別エラー文言が画面に出る", async () => {
+  it("非メディアファイルを upload すると task list に失敗とエラー文言が出る", async () => {
     const id = await createProject("error-test");
     await goto(`/projects/${id}`);
     await waitHydrated('input[type=file][accept="audio/*"]');
-    // 適当な非メディア bytes をぶつけて ffprobe failure 経路を踏ませる
+    // 適当な非メディア bytes をぶつけて ffprobe failure 経路を踏ませる。
+    // /complete は通り、task が失敗するので task list に "失敗" として出る
     await webview().evaluate(`(() => {
       const bytes = new TextEncoder().encode("not a media file");
       const file = new File([bytes], "garbage.bin", { type: "application/octet-stream" });
@@ -175,14 +176,37 @@ describe("ProjectDetail (frontend)", () => {
       setter.call(input, dt.files);
       input.dispatchEvent(new Event("change", { bubbles: true }));
     })()`);
-    await waitFor(webview(), 'p[role="alert"]', 30_000);
-    const errText = await webview().evaluate<string>(
-      `document.querySelector('p[role="alert"]').textContent ?? ""`,
+    await waitFor(webview(), '[role="alert"]', 30_000);
+    const taskText = await webview().evaluate<string>(
+      `(document.querySelector('section[aria-label="処理中のタスク"]')?.textContent ?? "")`,
     );
-    // status + branch を識別できる文言が両方含まれる
-    expect(errText).toContain("HTTP 400");
-    expect(errText).toContain("could not parse uploaded file");
+    expect(taskText).toContain("garbage.bin");
+    expect(taskText).toContain("失敗");
+    expect(taskText).toContain("could not parse uploaded file");
   }, 60_000);
+
+  it("upload 中にリロードしても task list に処理中タスクが残る", async () => {
+    const id = await createProject("reload-task");
+    await goto(`/projects/${id}`);
+    await waitHydrated('input[type=file][accept="audio/*"]');
+    await injectFileToInput(getMedia().audioMp3, "audio/*", "reload-tone.mp3", "audio/mpeg");
+    // task が出たらすぐリロード (succeeded で消えてしまう前に)
+    await waitFor(webview(), 'section[aria-label="処理中のタスク"]', 30_000);
+    await goto(`/projects/${id}`);
+    // リロード後も処理中タスクの fileName / kind ラベルが表示される or 既に audio に
+    // 昇格して timeline に出ている (どちらでも UX 上 OK)
+    const result = await webview().evaluate<{ task: string; hasAudio: boolean }>(`(() => {
+      const taskSection = document.querySelector('section[aria-label="処理中のタスク"]');
+      return {
+        task: taskSection?.textContent ?? "",
+        hasAudio: document.querySelector("audio source") !== null,
+      };
+    })()`);
+    if (!result.hasAudio) {
+      expect(result.task).toContain("reload-tone.mp3");
+    }
+    await waitFor(webview(), "audio source", 30_000);
+  }, 90_000);
 
   it("削除ボタンで track が消える", async () => {
     const id = await createProject("delete-test");

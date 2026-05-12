@@ -27,6 +27,8 @@ model Project {
   updatedAt DateTime @updatedAt
   videos    Video[]
   audios    Audio[]
+  uploads   Upload[]
+  tasks     Task[]
 
   @@index([userId])
 }
@@ -102,6 +104,69 @@ model Thumbnail {
 
   @@unique([videoId, atSec])
   @@index([videoId])
+}
+
+// 分割アップロードのセッション。expiresAt (createdAt + 1h) を過ぎても
+// completed にならなければ DeletionMark の grace でチャンクごと回収される
+model Upload {
+  id            String        @id @default(cuid())
+  projectId     String
+  project       Project       @relation(fields: [projectId], references: [id])
+  kind          String // "video" | "audio"
+  fileName      String
+  contentType   String?
+  totalBytes    BigInt
+  chunkSize     Int
+  totalChunks   Int
+  receivedBytes BigInt        @default(0)
+  status        String        @default("pending") // "pending" | "completed" | "aborted"
+  expiresAt     DateTime
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+  chunks        UploadChunk[]
+  tasks         Task[]
+
+  @@index([projectId])
+  @@index([expiresAt])
+}
+
+// 受け取った各チャンクの存在を記録する。
+// s3Key は PUT ごとに unique にして、retry は別 key を書いてから DB tx で promote する。
+// こうすると /complete の validate と背景 task の merge が常に同じ S3 object を見るので
+// (DB row.s3Key = S3 object)、PUT vs /complete の race で内容が食い違わない
+model UploadChunk {
+  id        String   @id @default(cuid())
+  uploadId  String
+  upload    Upload   @relation(fields: [uploadId], references: [id])
+  index     Int
+  s3Key     String
+  sizeBytes BigInt
+  createdAt DateTime @default(now())
+
+  @@unique([uploadId, index])
+  @@index([uploadId])
+}
+
+// プロジェクトに属する非同期タスクの汎用エンティティ。
+// 現状は media validation (ffmpeg probe + transcode) でのみ使う
+model Task {
+  id         String    @id @default(cuid())
+  projectId  String
+  project    Project   @relation(fields: [projectId], references: [id])
+  type       String // "video_validation" | "audio_validation"
+  status     String    @default("pending") // "pending" | "running" | "succeeded" | "failed"
+  error      String?
+  uploadId   String?
+  upload     Upload?   @relation(fields: [uploadId], references: [id])
+  videoId    String?
+  audioId    String?
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+  startedAt  DateTime?
+  finishedAt DateTime?
+
+  @@index([projectId])
+  @@index([status])
 }
 
 // DBのrow deleteと同じトランザクションで挿入する S3 prefix の墓標。

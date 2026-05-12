@@ -12,9 +12,36 @@ export const audioRawKey = (projectId: string, audioId: string, ext: string) =>
   `${projectKey(projectId)}/audios/${audioId}/raw.${ext.replace(/^\./, "")}`;
 export const audioTranscodedKey = (projectId: string, audioId: string) =>
   `${projectKey(projectId)}/audios/${audioId}/transcoded.m4a`;
+export const uploadPrefix = (projectId: string, uploadId: string) =>
+  `${projectKey(projectId)}/uploads/${uploadId}/`;
+// retry は別 key を書いて DB tx で promote するため writeId で unique 化
+export const uploadChunkKey = (
+  projectId: string,
+  uploadId: string,
+  index: number,
+  writeId: string,
+) => `${uploadPrefix(projectId, uploadId)}chunks/${String(index).padStart(7, "0")}-${writeId}`;
 
 export async function uploadFile(key: string, path: string, contentType: string): Promise<void> {
   await getS3().write(key, Bun.file(path), { type: contentType });
+}
+
+// Bun.serve 経由の Request では S3Client.write の戻り値 size が常に 0 を返すバグの
+// workaround で Content-Length から size を取る (CL なしのみ HEAD フォールバック)
+export async function uploadRawRequest(
+  key: string,
+  request: Request,
+  contentType: string,
+): Promise<number> {
+  const s3 = getS3();
+  await s3.write(key, request, { type: contentType });
+  const declared = request.headers.get("content-length");
+  if (declared !== null) {
+    const n = Number(declared);
+    if (Number.isFinite(n) && n >= 0) return n;
+  }
+  const stat = await s3.file(key).stat();
+  return stat.size;
 }
 
 export async function deletePrefix(prefix: string): Promise<void> {

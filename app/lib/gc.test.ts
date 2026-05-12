@@ -1,12 +1,15 @@
 import { describe, expect, it, mock } from "bun:test";
+import { useDbFixture } from "../test-fixtures/db";
 import {
   BASE_RETRY_DELAY_MS,
+  cleanupAbandonedUploads,
   nextRetryDelayMs,
   runSweepOnce,
   startDeletionSweeper,
   stopDeletionSweeper,
   type SweeperDeps,
 } from "./gc";
+import { prisma } from "./prisma";
 
 describe("nextRetryDelayMs", () => {
   it("returns base delay range for attempts=0", () => {
@@ -191,5 +194,93 @@ describe("startDeletionSweeper / stopDeletionSweeper", () => {
 
   it("stop without prior start is a no-op", () => {
     expect(() => stopDeletionSweeper()).not.toThrow();
+  });
+});
+
+describe("cleanupAbandonedUploads", () => {
+  useDbFixture();
+
+  async function makeProject(): Promise<string> {
+    const user = await prisma.user.create({
+      data: { authentikSub: `cleanup-test-${Math.random()}` },
+    });
+    const project = await prisma.project.create({ data: { userId: user.id, name: "p" } });
+    return project.id;
+  }
+
+  it("expired pending と aborted な Upload を chunks ごと削除する", async () => {
+    const pid = await makeProject();
+    const past = new Date(Date.now() - 1000);
+    const future = new Date(Date.now() + 60_000);
+    const expired = await prisma.upload.create({
+      data: {
+        projectId: pid,
+        kind: "audio",
+        fileName: "x",
+        totalBytes: 1n,
+        chunkSize: 1024,
+        totalChunks: 1,
+        expiresAt: past,
+      },
+    });
+    await prisma.uploadChunk.create({
+      data: { uploadId: expired.id, index: 0, sizeBytes: 1n, s3Key: "x" },
+    });
+    const aborted = await prisma.upload.create({
+      data: {
+        projectId: pid,
+        kind: "audio",
+        fileName: "y",
+        totalBytes: 1n,
+        chunkSize: 1024,
+        totalChunks: 1,
+        expiresAt: future,
+        status: "aborted",
+      },
+    });
+    const stillPending = await prisma.upload.create({
+      data: {
+        projectId: pid,
+        kind: "audio",
+        fileName: "z",
+        totalBytes: 1n,
+        chunkSize: 1024,
+        totalChunks: 1,
+        expiresAt: future,
+      },
+    });
+
+    await cleanupAbandonedUploads();
+
+    expect(await prisma.upload.findUnique({ where: { id: expired.id } })).toBeNull();
+    expect(await prisma.uploadChunk.count({ where: { uploadId: expired.id } })).toBe(0);
+    expect(await prisma.upload.findUnique({ where: { id: aborted.id } })).toBeNull();
+    expect(await prisma.upload.findUnique({ where: { id: stillPending.id } })).not.toBeNull();
+  });
+});
+
+describe("startDeletionSweeper ready gating", () => {
+  useDbFixture();
+
+  it("recurring sweeps wait until the ready promise settles", async () => {
+    // due な mark を入れておく。gate が効いていればこの mark は sweep されない
+    await prisma.deletionMark.create({
+      data: { prefix: "gate-test/", nextRetryAt: new Date(Date.now() - 1000) },
+    });
+    const { promise: ready, resolve: resolveReady } = Promise.withResolvers<void>();
+    // intervalMs=20 で 150ms 走らせれば gate が無ければ 5+ 回 sweep が走る
+    startDeletionSweeper(20, ready);
+    try {
+      await Bun.sleep(150);
+      const stillPending = await prisma.deletionMark.findFirst({
+        where: { prefix: "gate-test/" },
+      });
+      // sweep が走っていれば attempts が増えるか mark が消える (S3 未設定で
+      // deletePrefix が例外 → attempts++)。gate が効いていれば attempts=0 のまま
+      expect(stillPending?.attempts).toBe(0);
+    } finally {
+      resolveReady();
+      stopDeletionSweeper();
+    }
   });
 });

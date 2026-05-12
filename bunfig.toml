@@ -1,3 +1,7 @@
+[install]
+linker = "isolated"
+globalStore = true
+
 [test]
 # 全 test 開始前に temp SQLite を作って prisma schema を push する。
 # 以降 lib/prisma.ts は process.env.DATABASE_URL を読んで test DB を見る

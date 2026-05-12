@@ -1,6 +1,21 @@
 // API レスポンス用の DTO。Prisma 行をこれに射影してから c.json で返すと、
 // bigint が JSON に乗らず Hono RPC の型推論も全フィールドにつく
-import type { Audio, Project, Thumbnail, Video } from "../generated/prisma/client";
+import type { Audio, Project, Task, Thumbnail, Upload, Video } from "../generated/prisma/client";
+
+const UPLOAD_KINDS = ["video", "audio"] as const;
+const UPLOAD_STATUSES = ["pending", "completed", "aborted"] as const;
+const TASK_TYPES = ["video_validation", "audio_validation"] as const;
+const TASK_STATUSES = ["pending", "running", "succeeded", "failed"] as const;
+
+function assertIn<T extends string>(
+  v: string,
+  values: readonly T[],
+  label: string,
+): asserts v is T {
+  if (!values.some((x) => x === v)) {
+    throw new Error(`unexpected ${label}: ${JSON.stringify(v)}`);
+  }
+}
 
 export type ApiThumbnail = {
   id: string;
@@ -69,11 +84,47 @@ export type ApiProject = {
 export type ApiProjectDetail = ApiProject & {
   videos: ApiVideo[];
   audios: ApiAudio[];
+  // pending / running / failed の task。succeeded は Video/Audio に昇格済みなので含めない
+  tasks: ApiTask[];
 };
 
 export type ApiProjectSummary = ApiProject & {
   videoCount: number;
   audioCount: number;
+};
+
+export type ApiUpload = {
+  id: string;
+  projectId: string;
+  kind: "video" | "audio";
+  fileName: string;
+  contentType: string | null;
+  totalBytes: number;
+  chunkSize: number;
+  totalChunks: number;
+  receivedBytes: number;
+  status: "pending" | "completed" | "aborted";
+  expiresAt: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type ApiTask = {
+  id: string;
+  projectId: string;
+  type: "video_validation" | "audio_validation";
+  status: "pending" | "running" | "succeeded" | "failed";
+  error: string | null;
+  uploadId: string | null;
+  // 何のファイルを処理中か UI で表示するため upload を inline する。
+  // upload は Task ライフタイムを超えて消えうるので nullable
+  upload: { fileName: string; kind: "video" | "audio" } | null;
+  videoId: string | null;
+  audioId: string | null;
+  createdAt: string;
+  updatedAt: string;
+  startedAt: string | null;
+  finishedAt: string | null;
 };
 
 export function toApiThumbnail(projectId: string, videoId: string, t: Thumbnail): ApiThumbnail {
@@ -152,12 +203,14 @@ export function toApiProjectDetail(
   p: Project & {
     videos: (Video & { thumbnails: Thumbnail[] })[];
     audios: Audio[];
+    tasks: (Task & { upload: { fileName: string; kind: string } | null })[];
   },
 ): ApiProjectDetail {
   return {
     ...toApiProject(p),
     videos: p.videos.map(toApiVideo),
     audios: p.audios.map(toApiAudio),
+    tasks: p.tasks.map(toApiTask),
   };
 }
 
@@ -168,5 +221,52 @@ export function toApiProjectSummary(
     ...toApiProject(p),
     videoCount: p._count.videos,
     audioCount: p._count.audios,
+  };
+}
+
+export function toApiUpload(u: Upload): ApiUpload {
+  assertIn(u.kind, UPLOAD_KINDS, "Upload.kind");
+  assertIn(u.status, UPLOAD_STATUSES, "Upload.status");
+  return {
+    id: u.id,
+    projectId: u.projectId,
+    kind: u.kind,
+    fileName: u.fileName,
+    contentType: u.contentType,
+    totalBytes: Number(u.totalBytes),
+    chunkSize: u.chunkSize,
+    totalChunks: u.totalChunks,
+    receivedBytes: Number(u.receivedBytes),
+    status: u.status,
+    expiresAt: u.expiresAt.toISOString(),
+    createdAt: u.createdAt.toISOString(),
+    updatedAt: u.updatedAt.toISOString(),
+  };
+}
+
+export function toApiTask(
+  t: Task & { upload?: { fileName: string; kind: string } | null },
+): ApiTask {
+  assertIn(t.type, TASK_TYPES, "Task.type");
+  assertIn(t.status, TASK_STATUSES, "Task.status");
+  let upload: ApiTask["upload"] = null;
+  if (t.upload) {
+    assertIn(t.upload.kind, UPLOAD_KINDS, "Task.upload.kind");
+    upload = { fileName: t.upload.fileName, kind: t.upload.kind };
+  }
+  return {
+    id: t.id,
+    projectId: t.projectId,
+    type: t.type,
+    status: t.status,
+    error: t.error,
+    uploadId: t.uploadId,
+    upload,
+    videoId: t.videoId,
+    audioId: t.audioId,
+    createdAt: t.createdAt.toISOString(),
+    updatedAt: t.updatedAt.toISOString(),
+    startedAt: t.startedAt?.toISOString() ?? null,
+    finishedAt: t.finishedAt?.toISOString() ?? null,
   };
 }

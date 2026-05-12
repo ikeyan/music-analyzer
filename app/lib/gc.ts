@@ -85,13 +85,51 @@ export async function sweepPendingDeletions(): Promise<void> {
   }
 }
 
-// 起動時に1度走らせて前runで残った墓標を回収し、以後 intervalMs ごとに再試行。
-// 既に走っているなら no-op
-export function startDeletionSweeper(intervalMs = 60_000): void {
+// 期限切れ pending と aborted な Upload を DB から消す。
+// completed は task が responsible なので除外。pending+expired と aborted は task を
+// 持たない (task は /complete でしか作られない) ので Upload→Task FK 違反は起きない
+export async function cleanupAbandonedUploads(now: () => Date = () => new Date()): Promise<void> {
+  const targets = await prisma.upload.findMany({
+    where: {
+      OR: [{ status: "pending", expiresAt: { lte: now() } }, { status: "aborted" }],
+    },
+    select: { id: true },
+    take: BATCH_SIZE,
+  });
+  for (const u of targets) {
+    try {
+      await prisma.$transaction([
+        prisma.uploadChunk.deleteMany({ where: { uploadId: u.id } }),
+        prisma.upload.delete({ where: { id: u.id } }),
+      ]);
+    } catch {
+      /* 次の tick で retry */
+    }
+  }
+}
+
+let sweeperReady: Promise<unknown> | null = null;
+
+async function runGatedSweep(): Promise<void> {
+  if (sweeperReady) {
+    try {
+      await sweeperReady;
+    } catch {
+      // recovery が pending task の mark を引き直せていない可能性があるので sweep skip
+      return;
+    }
+  }
+  await sweepPendingDeletions();
+  await cleanupAbandonedUploads();
+}
+
+// 既に走っていれば no-op。`ready` が渡れば全 sweep (初回 + 各 tick) がそれを待つ
+export function startDeletionSweeper(intervalMs = 60_000, ready?: Promise<unknown>): void {
   if (sweeperHandle) return;
-  void sweepPendingDeletions().catch(() => {});
+  sweeperReady = ready ?? null;
+  void runGatedSweep().catch(() => {});
   sweeperHandle = setInterval(() => {
-    void sweepPendingDeletions().catch(() => {});
+    void runGatedSweep().catch(() => {});
   }, intervalMs);
 }
 
@@ -100,4 +138,5 @@ export function stopDeletionSweeper(): void {
     clearInterval(sweeperHandle);
     sweeperHandle = null;
   }
+  sweeperReady = null;
 }
