@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { parseRange } from "./storage";
+import { parseRange } from "./range";
 
 describe("parseRange", () => {
   const TOTAL = 1000;

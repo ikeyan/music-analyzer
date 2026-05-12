@@ -20,6 +20,24 @@ export function nextRetryDelayMs(attempts: number, rand: () => number = Math.ran
   return exp * (0.5 + rand() * 0.5);
 }
 
+// graceMs 経過後にだけ sweep されるよう DeletionMark を立てる。
+// 失敗時 (Upload pending の expiresAt 切れなど) は sweeper が deletePrefix で回収する
+export async function markPrefixForDeletion(prefix: string, graceMs: number): Promise<void> {
+  await prisma.deletionMark.create({
+    data: { prefix, nextRetryAt: new Date(Date.now() + graceMs) },
+  });
+}
+
+// commit 後の eager cleanup。失敗時は sweeper の retry に任せる
+export async function eagerCleanupAndUnmark(prefix: string): Promise<void> {
+  try {
+    await deletePrefix(prefix);
+    await prisma.deletionMark.deleteMany({ where: { prefix } });
+  } catch {
+    /* sweeperに任せる */
+  }
+}
+
 // テストから fake の prisma / deletePrefix / now / rand を差し込めるよう、
 // 純粋にループ処理だけを行う形で切り出した内部実装
 type SweeperPrismaMark = { id: string; prefix: string; attempts: number };

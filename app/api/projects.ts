@@ -4,15 +4,18 @@ import { HTTPException } from "hono/http-exception";
 import * as v from "valibot";
 import { type AuthContext, requireUser } from "../lib/auth";
 import { MAX_UPLOAD_BYTES } from "../lib/ffmpeg";
+import { eagerCleanupAndUnmark, markPrefixForDeletion } from "../lib/gc";
 import { prisma } from "../lib/prisma";
+import { withSlotRetry } from "../lib/prisma-retry";
 import { getS3 } from "../lib/s3";
 import {
-  projectKey,
+  audioPrefix,
+  projectPrefix,
   streamS3,
+  uploadChunkKey,
   uploadPrefix,
   uploadRawRequest,
-  uploadChunkKey,
-  deletePrefix,
+  videoPrefix,
 } from "../lib/storage";
 import { TASK_GRACE_MS, enqueueTask } from "../lib/task-runner";
 import {
@@ -75,19 +78,22 @@ async function findProjectOr404(userId: string, projectId: string) {
   return p;
 }
 
-async function markPrefixForDeletion(prefix: string, graceMs: number): Promise<void> {
-  await prisma.deletionMark.create({
-    data: { prefix, nextRetryAt: new Date(Date.now() + graceMs) },
+// GET /:id, PATCH /:id/track-order, SSR route で共通する Project detail loader。
+// 戻り値の include shape は toApiProjectDetail への射影と合わせる。
+// succeeded task は Video/Audio として timeline に出るので除外
+export async function findProjectDetail(userId: string, projectId: string) {
+  return await prisma.project.findFirst({
+    where: { id: projectId, userId },
+    include: {
+      videos: { orderBy: { order: "asc" }, include: { thumbnails: { orderBy: { atSec: "asc" } } } },
+      audios: { orderBy: { order: "asc" } },
+      tasks: {
+        where: { status: { in: ["pending", "running", "failed"] } },
+        orderBy: { createdAt: "desc" },
+        include: { upload: { select: { fileName: true, kind: true } } },
+      },
+    },
   });
-}
-
-async function eagerCleanupAndUnmark(prefix: string): Promise<void> {
-  try {
-    await deletePrefix(prefix);
-    await prisma.deletionMark.deleteMany({ where: { prefix } });
-  } catch {
-    /* sweeperに任せる */
-  }
 }
 
 export const projects = new Hono<AuthContext>()
@@ -109,22 +115,7 @@ export const projects = new Hono<AuthContext>()
   })
   .get("/:id", vValidator("param", idParamSchema), async (c) => {
     const user = c.var.user;
-    const project = await prisma.project.findFirst({
-      where: { id: c.req.valid("param").id, userId: user.id },
-      include: {
-        videos: {
-          orderBy: { order: "asc" },
-          include: { thumbnails: { orderBy: { atSec: "asc" } } },
-        },
-        audios: { orderBy: { order: "asc" } },
-        // succeeded は Video/Audio として timeline に出るので除外
-        tasks: {
-          where: { status: { in: ["pending", "running", "failed"] } },
-          orderBy: { createdAt: "desc" },
-          include: { upload: { select: { fileName: true, kind: true } } },
-        },
-      },
-    });
+    const project = await findProjectDetail(user.id, c.req.valid("param").id);
     if (!project) return c.json({ error: "project not found" }, 404);
     return c.json({ project: toApiProjectDetail(project) satisfies ApiProjectDetail });
   })
@@ -132,7 +123,7 @@ export const projects = new Hono<AuthContext>()
     const user = c.var.user;
     const project = await findProjectOr404(user.id, c.req.valid("param").id);
     if (!project) return c.json({ error: "project not found" }, 404);
-    const prefix = `${projectKey(project.id)}/`;
+    const prefix = projectPrefix(project.id);
     await prisma.$transaction(async (tx) => {
       await tx.deletionMark.create({ data: { prefix } });
       await tx.task.deleteMany({ where: { projectId: project.id } });
@@ -210,21 +201,7 @@ export const projects = new Hono<AuthContext>()
         }),
       );
 
-      const updated = await prisma.project.findFirst({
-        where: { id: project.id, userId: user.id },
-        include: {
-          videos: {
-            orderBy: { order: "asc" },
-            include: { thumbnails: { orderBy: { atSec: "asc" } } },
-          },
-          audios: { orderBy: { order: "asc" } },
-          tasks: {
-            where: { status: { in: ["pending", "running", "failed"] } },
-            orderBy: { createdAt: "desc" },
-            include: { upload: { select: { fileName: true, kind: true } } },
-          },
-        },
-      });
+      const updated = await findProjectDetail(user.id, project.id);
       if (!updated) return c.json({ error: "project not found" }, 404);
       return c.json({ project: toApiProjectDetail(updated) satisfies ApiProjectDetail });
     },
@@ -557,7 +534,7 @@ export const projects = new Hono<AuthContext>()
       where: { id: videoId, projectId: project.id },
     });
     if (!video) return c.json({ error: "video not found" }, 404);
-    const prefix = `${projectKey(project.id)}/videos/${video.id}/`;
+    const prefix = videoPrefix(project.id, video.id);
     await prisma.$transaction(async (tx) => {
       await tx.deletionMark.create({ data: { prefix } });
       await tx.thumbnail.deleteMany({ where: { videoId: video.id } });
@@ -616,7 +593,7 @@ export const projects = new Hono<AuthContext>()
       where: { id: audioId, projectId: project.id },
     });
     if (!audio) return c.json({ error: "audio not found" }, 404);
-    const prefix = `${projectKey(project.id)}/audios/${audio.id}/`;
+    const prefix = audioPrefix(project.id, audio.id);
     await prisma.$transaction(async (tx) => {
       await tx.deletionMark.create({ data: { prefix } });
       await tx.audio.delete({ where: { id: audio.id } });
@@ -648,19 +625,5 @@ export const projects = new Hono<AuthContext>()
     if (!audio || !audio.rawKey) return c.notFound();
     return await streamS3(c, audio.rawKey, audio.rawContentType ?? "application/octet-stream");
   });
-
-// P2002 (unique) / P2034 (write conflict) の保険リトライ
-async function withSlotRetry<T>(fn: () => Promise<T>): Promise<T> {
-  const MAX_ATTEMPTS = 5;
-  for (let i = 0; i < MAX_ATTEMPTS; i++) {
-    try {
-      return await fn();
-    } catch (err) {
-      const code = (err as { code?: string } | null)?.code;
-      if ((code !== "P2002" && code !== "P2034") || i === MAX_ATTEMPTS - 1) throw err;
-    }
-  }
-  throw new Error("unreachable");
-}
 
 export type ProjectsAppType = typeof projects;

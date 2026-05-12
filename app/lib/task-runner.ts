@@ -1,8 +1,5 @@
 import { extname, join } from "node:path";
 import type { Upload } from "../generated/prisma/client";
-
-// /complete 後の task 走行中 sweep を防ぐ grace (1h transcode + 余裕)
-export const TASK_GRACE_MS = 4 * 60 * 60 * 1000;
 import {
   MAX_DURATION_SEC,
   extractAudio,
@@ -12,21 +9,26 @@ import {
   transcodeAudio,
   transcodeVideo,
 } from "./ffmpeg";
+import { eagerCleanupAndUnmark, markPrefixForDeletion } from "./gc";
 import { prisma } from "./prisma";
+import { withSlotRetry } from "./prisma-retry";
 import { awaitAllOrAggregate } from "./promise";
 import { getS3 } from "./s3";
 import {
+  audioPrefix,
   audioRawKey,
   audioTranscodedKey,
-  deletePrefix,
-  projectKey,
   uploadFile,
   uploadPrefix,
   videoAudioKey,
+  videoPrefix,
   videoSourceKey,
   videoThumbKey,
 } from "./storage";
 import { tempDir } from "./temp-dir";
+
+// /complete 後の task 走行中 sweep を防ぐ grace (1h transcode + 余裕)
+export const TASK_GRACE_MS = 4 * 60 * 60 * 1000;
 
 type TxClient = Parameters<Parameters<typeof prisma.$transaction>[0]>[0];
 
@@ -64,29 +66,9 @@ async function allocSlot(
   };
 }
 
-async function withSlotRetry<T>(fn: () => Promise<T>): Promise<T> {
-  const MAX_ATTEMPTS = 5;
-  for (let i = 0; i < MAX_ATTEMPTS; i++) {
-    try {
-      return await fn();
-    } catch (err) {
-      const code = (err as { code?: string } | null)?.code;
-      if ((code !== "P2002" && code !== "P2034") || i === MAX_ATTEMPTS - 1) throw err;
-    }
-  }
-  throw new Error("unreachable");
-}
-
 async function projectExists(projectId: string): Promise<boolean> {
   const p = await prisma.project.findUnique({ where: { id: projectId }, select: { id: true } });
   return p !== null;
-}
-
-// Video/Audio.create と同 tx で unmark、未到達なら sweeper が回収
-async function markMediaPrefixForCleanup(prefix: string): Promise<void> {
-  await prisma.deletionMark.create({
-    data: { prefix, nextRetryAt: new Date(Date.now() + TASK_GRACE_MS) },
-  });
 }
 
 // DB の s3Key を index 順に読む (/complete が validate したのと同じ object)
@@ -189,12 +171,12 @@ async function runVideoTask(taskId: string, upload: Upload): Promise<TaskResult>
   const videoId = crypto.randomUUID();
   const vKey = videoSourceKey(upload.projectId, videoId);
   const aKey = hasAudio ? videoAudioKey(upload.projectId, videoId) : null;
-  const videoPrefix = `${projectKey(upload.projectId)}/videos/${videoId}/`;
+  const vPrefix = videoPrefix(upload.projectId, videoId);
   if (!(await projectExists(upload.projectId))) {
     return { kind: "failure", error: "project deleted before media upload" };
   }
   // Video.create commit で unmark、未到達なら sweeper 回収
-  await markMediaPrefixForCleanup(videoPrefix);
+  await markPrefixForDeletion(vPrefix, TASK_GRACE_MS);
   await awaitAllOrAggregate([
     uploadFile(vKey, videoOut, "video/mp4"),
     ...(aKey ? [uploadFile(aKey, audioOut, "audio/mp4")] : []),
@@ -236,7 +218,7 @@ async function runVideoTask(taskId: string, upload: Upload): Promise<TaskResult>
           },
         },
       });
-      await tx.deletionMark.deleteMany({ where: { prefix: videoPrefix } });
+      await tx.deletionMark.deleteMany({ where: { prefix: vPrefix } });
       // task→succeeded は Video.create と同 tx 必須 (中間状態で recovery が failed に倒す)
       await tx.task.update({
         where: { id: taskId },
@@ -298,11 +280,11 @@ async function runAudioTask(taskId: string, upload: Upload): Promise<TaskResult>
   const keepRaw = isBrowserPlayableAudio(probe.audioStream.codec, probe.formatName);
   const transcodedKey = audioTranscodedKey(upload.projectId, audioId);
   const rawKey = keepRaw ? audioRawKey(upload.projectId, audioId, ext) : null;
-  const audioPrefix = `${projectKey(upload.projectId)}/audios/${audioId}/`;
+  const aPrefix = audioPrefix(upload.projectId, audioId);
   if (!(await projectExists(upload.projectId))) {
     return { kind: "failure", error: "project deleted before media upload" };
   }
-  await markMediaPrefixForCleanup(audioPrefix);
+  await markPrefixForDeletion(aPrefix, TASK_GRACE_MS);
   await awaitAllOrAggregate([
     uploadFile(transcodedKey, transcodedPath, "audio/mp4"),
     ...(rawKey ? [uploadFile(rawKey, inputPath, contentType)] : []),
@@ -332,7 +314,7 @@ async function runAudioTask(taskId: string, upload: Upload): Promise<TaskResult>
           projEndSec: projStart + duration,
         },
       });
-      await tx.deletionMark.deleteMany({ where: { prefix: audioPrefix } });
+      await tx.deletionMark.deleteMany({ where: { prefix: aPrefix } });
       // task→succeeded は Audio.create と同 tx 必須 (中間状態で recovery が failed に倒す)
       await tx.task.update({
         where: { id: taskId },
@@ -390,13 +372,7 @@ async function executeTask(taskId: string): Promise<void> {
   }
 
   // Upload 行は task list の fileName 表示で使うので残す
-  const prefix = uploadPrefix(task.upload.projectId, task.upload.id);
-  try {
-    await deletePrefix(prefix);
-    await prisma.deletionMark.deleteMany({ where: { prefix } });
-  } catch {
-    /* sweeperに任せる */
-  }
+  await eagerCleanupAndUnmark(uploadPrefix(task.upload.projectId, task.upload.id));
 }
 
 // dev HMR / test 横断で重複起動しないよう inflight set を global に置く

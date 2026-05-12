@@ -1,24 +1,14 @@
 import { createRoute } from "honox/factory";
+import { findProjectDetail } from "../../api/projects";
 import { toApiProjectDetail } from "../../api/types";
-import { requireUser } from "../../lib/auth";
-import { prisma } from "../../lib/prisma";
 import ProjectDetail from "../../islands/project-detail";
+import { requireUser } from "../../lib/auth";
 
 export default createRoute(requireUser, async (c) => {
   const user = c.var.user;
   const id = c.req.param("id");
-  const project = await prisma.project.findFirst({
-    where: { id, userId: user.id },
-    include: {
-      videos: { orderBy: { order: "asc" }, include: { thumbnails: { orderBy: { atSec: "asc" } } } },
-      audios: { orderBy: { order: "asc" } },
-      tasks: {
-        where: { status: { in: ["pending", "running", "failed"] } },
-        orderBy: { createdAt: "desc" },
-        include: { upload: { select: { fileName: true, kind: true } } },
-      },
-    },
-  });
+  if (!id) return c.notFound();
+  const project = await findProjectDetail(user.id, id);
   if (!project) return c.notFound();
 
   return c.render(

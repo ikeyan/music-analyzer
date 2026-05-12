@@ -1,8 +1,10 @@
-import { describe, expect, it, mock } from "bun:test";
+import { describe, expect, it, mock, spyOn } from "bun:test";
 import { useDbFixture } from "../test-fixtures/db";
 import {
   BASE_RETRY_DELAY_MS,
   cleanupAbandonedUploads,
+  eagerCleanupAndUnmark,
+  markPrefixForDeletion,
   nextRetryDelayMs,
   runSweepOnce,
   startDeletionSweeper,
@@ -10,6 +12,7 @@ import {
   type SweeperDeps,
 } from "./gc";
 import { prisma } from "./prisma";
+import * as storageModule from "./storage";
 
 describe("nextRetryDelayMs", () => {
   it("returns base delay range for attempts=0", () => {
@@ -194,6 +197,74 @@ describe("startDeletionSweeper / stopDeletionSweeper", () => {
 
   it("stop without prior start is a no-op", () => {
     expect(() => stopDeletionSweeper()).not.toThrow();
+  });
+});
+
+describe("markPrefixForDeletion", () => {
+  useDbFixture();
+
+  it("creates a DeletionMark with nextRetryAt = now + graceMs", async () => {
+    const prefix = "mark-test/";
+    const before = Date.now();
+    await markPrefixForDeletion(prefix, 60_000);
+    const mark = await prisma.deletionMark.findFirst({ where: { prefix } });
+    expect(mark).not.toBeNull();
+    const delta = mark!.nextRetryAt.getTime() - before;
+    expect(delta).toBeGreaterThanOrEqual(60_000 - 500);
+    expect(delta).toBeLessThanOrEqual(60_000 + 500);
+    expect(mark!.attempts).toBe(0);
+  });
+
+  it("creates a new row per call so the same prefix can be marked twice", async () => {
+    const prefix = "mark-dup/";
+    await markPrefixForDeletion(prefix, 1000);
+    await markPrefixForDeletion(prefix, 1000);
+    const count = await prisma.deletionMark.count({ where: { prefix } });
+    expect(count).toBe(2);
+  });
+});
+
+describe("eagerCleanupAndUnmark", () => {
+  useDbFixture();
+
+  it("deletes the S3 prefix then removes the matching DeletionMark rows", async () => {
+    const prefix = "eager/p1/";
+    await prisma.deletionMark.create({ data: { prefix } });
+    const calls: string[] = [];
+    const spy = spyOn(storageModule, "deletePrefix").mockImplementation(async (p: string) => {
+      calls.push(p);
+    });
+    try {
+      await eagerCleanupAndUnmark(prefix);
+    } finally {
+      spy.mockRestore();
+    }
+    expect(calls).toEqual([prefix]);
+    expect(await prisma.deletionMark.count({ where: { prefix } })).toBe(0);
+  });
+
+  it("swallows deletePrefix errors and leaves the mark for the sweeper", async () => {
+    const prefix = "eager/p2/";
+    await prisma.deletionMark.create({ data: { prefix } });
+    const spy = spyOn(storageModule, "deletePrefix").mockImplementation(async () => {
+      throw new Error("S3 down");
+    });
+    try {
+      await expect(eagerCleanupAndUnmark(prefix)).resolves.toBeUndefined();
+    } finally {
+      spy.mockRestore();
+    }
+    // delete 失敗時は mark を残して sweeper の retry に委ねる
+    expect(await prisma.deletionMark.count({ where: { prefix } })).toBe(1);
+  });
+
+  it("is safe to call when no DeletionMark exists for the prefix", async () => {
+    const spy = spyOn(storageModule, "deletePrefix").mockImplementation(async () => {});
+    try {
+      await expect(eagerCleanupAndUnmark("no-mark/")).resolves.toBeUndefined();
+    } finally {
+      spy.mockRestore();
+    }
   });
 });
 

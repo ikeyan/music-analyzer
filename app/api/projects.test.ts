@@ -14,7 +14,7 @@ import { useDbFixture } from "../test-fixtures/db";
 import { useMediaFixture } from "../test-fixtures/media";
 import { useS3Fixture } from "../test-fixtures/s3";
 import { type AppType, api } from "./index";
-import { UPLOAD_EXPIRY_MS } from "./projects";
+import { UPLOAD_EXPIRY_MS, findProjectDetail } from "./projects";
 import type { ApiTask, ApiUpload } from "./types";
 
 useDbFixture();
@@ -624,5 +624,134 @@ describe("chunked upload + media validation task", () => {
       1024,
     );
     expectError(result, 400);
+  });
+});
+
+describe("findProjectDetail", () => {
+  async function makeProject(userSub: string, name: string): Promise<string> {
+    const user = await prisma.user.create({ data: { authentikSub: userSub } });
+    const project = await prisma.project.create({ data: { userId: user.id, name } });
+    return project.id;
+  }
+
+  it("returns the project with empty videos/audios/tasks arrays when none exist", async () => {
+    const pid = await makeProject("detail-empty", "empty");
+    const owner = await prisma.user.findFirstOrThrow({ where: { authentikSub: "detail-empty" } });
+    const result = await findProjectDetail(owner.id, pid);
+    expect(result).not.toBeNull();
+    expect(result!.id).toBe(pid);
+    expect(result!.videos).toEqual([]);
+    expect(result!.audios).toEqual([]);
+    expect(result!.tasks).toEqual([]);
+  });
+
+  it("returns null when the project belongs to another user", async () => {
+    const pidA = await makeProject("detail-owner-a", "a");
+    const userB = await prisma.user.create({ data: { authentikSub: "detail-owner-b" } });
+    expect(await findProjectDetail(userB.id, pidA)).toBeNull();
+  });
+
+  it("returns null for missing project id", async () => {
+    const user = await prisma.user.create({ data: { authentikSub: "detail-missing" } });
+    expect(await findProjectDetail(user.id, "no-such-project")).toBeNull();
+  });
+
+  it("orders videos and audios by `order` ascending and thumbnails by atSec", async () => {
+    const pid = await makeProject("detail-order", "ordered");
+    await prisma.video.createMany({
+      data: [
+        {
+          id: "v1",
+          projectId: pid,
+          order: 1,
+          name: "v1",
+          videoKey: "k1",
+          durationSec: 1,
+          width: 1,
+          height: 1,
+          fps: 1,
+          sizeBytes: 1n,
+          srcStartSec: 0,
+          srcEndSec: 1,
+          projStartSec: 0,
+          projEndSec: 1,
+        },
+        {
+          id: "v0",
+          projectId: pid,
+          order: 0,
+          name: "v0",
+          videoKey: "k0",
+          durationSec: 1,
+          width: 1,
+          height: 1,
+          fps: 1,
+          sizeBytes: 1n,
+          srcStartSec: 0,
+          srcEndSec: 1,
+          projStartSec: 1,
+          projEndSec: 2,
+        },
+      ],
+    });
+    await prisma.thumbnail.createMany({
+      data: [
+        { id: "t1", videoId: "v0", atSec: 10, key: "tk1", width: 10, height: 10 },
+        { id: "t0", videoId: "v0", atSec: 0, key: "tk0", width: 10, height: 10 },
+      ],
+    });
+    await prisma.audio.createMany({
+      data: [
+        {
+          id: "a1",
+          projectId: pid,
+          order: 1,
+          name: "a1",
+          audioKey: "ak1",
+          durationSec: 1,
+          sizeBytes: 1n,
+          srcStartSec: 0,
+          srcEndSec: 1,
+          projStartSec: 2,
+          projEndSec: 3,
+        },
+        {
+          id: "a0",
+          projectId: pid,
+          order: 0,
+          name: "a0",
+          audioKey: "ak0",
+          durationSec: 1,
+          sizeBytes: 1n,
+          srcStartSec: 0,
+          srcEndSec: 1,
+          projStartSec: 3,
+          projEndSec: 4,
+        },
+      ],
+    });
+    const owner = await prisma.user.findFirstOrThrow({ where: { authentikSub: "detail-order" } });
+    const result = await findProjectDetail(owner.id, pid);
+    expect(result!.videos.map((v) => v.id)).toEqual(["v0", "v1"]);
+    expect(result!.audios.map((a) => a.id)).toEqual(["a0", "a1"]);
+    expect(result!.videos[0]!.thumbnails.map((t) => t.id)).toEqual(["t0", "t1"]);
+  });
+
+  it("excludes succeeded tasks (they have already become Video/Audio rows)", async () => {
+    const pid = await makeProject("detail-task-filter", "tasks");
+    await prisma.task.createMany({
+      data: [
+        { id: "tp", projectId: pid, type: "audio_validation", status: "pending" },
+        { id: "tr", projectId: pid, type: "audio_validation", status: "running" },
+        { id: "tf", projectId: pid, type: "audio_validation", status: "failed" },
+        { id: "ts", projectId: pid, type: "audio_validation", status: "succeeded" },
+      ],
+    });
+    const owner = await prisma.user.findFirstOrThrow({
+      where: { authentikSub: "detail-task-filter" },
+    });
+    const result = await findProjectDetail(owner.id, pid);
+    const ids = result!.tasks.map((t) => t.id).toSorted();
+    expect(ids).toEqual(["tf", "tp", "tr"]);
   });
 });
