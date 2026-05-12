@@ -5,7 +5,6 @@ import * as v from "valibot";
 import { type AuthContext, requireUser } from "../lib/auth";
 import { MAX_UPLOAD_BYTES } from "../lib/ffmpeg";
 import { prisma } from "../lib/prisma";
-import { getS3 } from "../lib/s3";
 import {
   projectKey,
   streamS3,
@@ -342,10 +341,9 @@ export const projects = new Hono<AuthContext>()
           };
         }
         if (size > upload.chunkSize) {
-          // CL を信じて write 前検証を通したあとには起きない想定。防衛策
-          await getS3()
-            .delete(key)
-            .catch(() => {});
+          // CL を信じて write 前検証を通したあとには起きない想定。防衛策。
+          // canonical key を消すと既に validate 済みの chunk を破壊しうるので消さず、
+          // upload prefix の DeletionMark + sweeper / task cleanup に任せる
           return {
             kind: "error",
             status: 413,
@@ -391,9 +389,10 @@ export const projects = new Hono<AuthContext>()
           return { stale: false as const };
         });
         if (txResult.stale) {
-          await getS3()
-            .delete(key)
-            .catch(() => {});
+          // canonical key を消さない: 再送 PUT (同 bytes) が /complete と race して
+          // 後着した場合に validate 済みの chunk を消してしまうため。
+          // 余計な late write は upload prefix の DeletionMark + sweeper か
+          // task 完了時の deletePrefix で回収される
           return { kind: "error", status: 409, error: `upload is ${txResult.status}` };
         }
         return { kind: "ok" };
