@@ -2,6 +2,7 @@ import { describe, expect, it, mock } from "bun:test";
 import { useDbFixture } from "../test-fixtures/db";
 import {
   BASE_RETRY_DELAY_MS,
+  cleanupAbandonedUploads,
   nextRetryDelayMs,
   runSweepOnce,
   startDeletionSweeper,
@@ -193,6 +194,68 @@ describe("startDeletionSweeper / stopDeletionSweeper", () => {
 
   it("stop without prior start is a no-op", () => {
     expect(() => stopDeletionSweeper()).not.toThrow();
+  });
+});
+
+describe("cleanupAbandonedUploads", () => {
+  useDbFixture();
+
+  async function makeProject(): Promise<string> {
+    const user = await prisma.user.create({
+      data: { authentikSub: `cleanup-test-${Math.random()}` },
+    });
+    const project = await prisma.project.create({ data: { userId: user.id, name: "p" } });
+    return project.id;
+  }
+
+  it("expired pending と aborted な Upload を chunks ごと削除する", async () => {
+    const pid = await makeProject();
+    const past = new Date(Date.now() - 1000);
+    const future = new Date(Date.now() + 60_000);
+    const expired = await prisma.upload.create({
+      data: {
+        projectId: pid,
+        kind: "audio",
+        fileName: "x",
+        totalBytes: 1n,
+        chunkSize: 1024,
+        totalChunks: 1,
+        expiresAt: past,
+      },
+    });
+    await prisma.uploadChunk.create({
+      data: { uploadId: expired.id, index: 0, sizeBytes: 1n, s3Key: "x" },
+    });
+    const aborted = await prisma.upload.create({
+      data: {
+        projectId: pid,
+        kind: "audio",
+        fileName: "y",
+        totalBytes: 1n,
+        chunkSize: 1024,
+        totalChunks: 1,
+        expiresAt: future,
+        status: "aborted",
+      },
+    });
+    const stillPending = await prisma.upload.create({
+      data: {
+        projectId: pid,
+        kind: "audio",
+        fileName: "z",
+        totalBytes: 1n,
+        chunkSize: 1024,
+        totalChunks: 1,
+        expiresAt: future,
+      },
+    });
+
+    await cleanupAbandonedUploads();
+
+    expect(await prisma.upload.findUnique({ where: { id: expired.id } })).toBeNull();
+    expect(await prisma.uploadChunk.count({ where: { uploadId: expired.id } })).toBe(0);
+    expect(await prisma.upload.findUnique({ where: { id: aborted.id } })).toBeNull();
+    expect(await prisma.upload.findUnique({ where: { id: stillPending.id } })).not.toBeNull();
   });
 });
 

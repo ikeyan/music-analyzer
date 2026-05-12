@@ -85,18 +85,41 @@ export async function sweepPendingDeletions(): Promise<void> {
   }
 }
 
+// 期限切れ pending と aborted な Upload を DB から消す。
+// completed は task が responsible なので除外。pending+expired と aborted は task を
+// 持たない (task は /complete でしか作られない) ので Upload→Task FK 違反は起きない
+export async function cleanupAbandonedUploads(now: () => Date = () => new Date()): Promise<void> {
+  const targets = await prisma.upload.findMany({
+    where: {
+      OR: [{ status: "pending", expiresAt: { lte: now() } }, { status: "aborted" }],
+    },
+    select: { id: true },
+    take: BATCH_SIZE,
+  });
+  for (const u of targets) {
+    try {
+      await prisma.$transaction([
+        prisma.uploadChunk.deleteMany({ where: { uploadId: u.id } }),
+        prisma.upload.delete({ where: { id: u.id } }),
+      ]);
+    } catch {
+      /* 次の tick で retry */
+    }
+  }
+}
+
 let sweeperReady: Promise<unknown> | null = null;
 
 async function runGatedSweep(): Promise<void> {
   if (sweeperReady) {
-    // recovery 失敗してもこの後の sweep は走らせる
     try {
       await sweeperReady;
     } catch {
-      /* swallow */
+      /* recovery 失敗でも sweep は走らせる */
     }
   }
   await sweepPendingDeletions();
+  await cleanupAbandonedUploads();
 }
 
 // 既に走っていれば no-op。`ready` が渡れば全 sweep (初回 + 各 tick) がそれを待つ
