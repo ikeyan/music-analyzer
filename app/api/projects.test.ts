@@ -613,6 +613,52 @@ describe("chunked upload + media validation task", () => {
     await waitForInflightTasks();
   }, 120_000);
 
+  it("Audio.create と task succeeded は同一 tx で commit される (中間状態が観測不可)", async () => {
+    process.env.NODE_ENV = "development";
+    const app = appWithProjects();
+    const pid = await createProject(app, "task-atomic");
+    const bytes = new Uint8Array(await Bun.file(getMedia().audioMp3).arrayBuffer());
+    const { task } = await uploadChunked(
+      app,
+      pid,
+      "audio",
+      "tone.mp3",
+      bytes,
+      bytes.byteLength,
+      "audio/mpeg",
+    );
+    await pollTaskUntil(app, pid, task.id, (t) => t.status === "succeeded", 60_000);
+    await waitForInflightTasks();
+    const finished = await prisma.task.findUniqueOrThrow({ where: { id: task.id } });
+    expect(finished.status).toBe("succeeded");
+    expect(finished.audioId).not.toBeNull();
+    // audioId が指す Audio 行が存在する (= same-tx で書かれた前提)
+    const audio = await prisma.audio.findUnique({ where: { id: finished.audioId! } });
+    expect(audio).not.toBeNull();
+  }, 120_000);
+
+  it("recoverTasksOnStartup は succeeded task に手を出さない", async () => {
+    process.env.NODE_ENV = "development";
+    const app = appWithProjects();
+    const pid = await createProject(app, "task-recover-skip-succeeded");
+    const bytes = new Uint8Array(await Bun.file(getMedia().audioMp3).arrayBuffer());
+    const { task } = await uploadChunked(
+      app,
+      pid,
+      "audio",
+      "tone.mp3",
+      bytes,
+      bytes.byteLength,
+      "audio/mpeg",
+    );
+    await pollTaskUntil(app, pid, task.id, (t) => t.status === "succeeded", 60_000);
+    await waitForInflightTasks();
+    // 再起動相当: recovery を呼んでも succeeded は触らない
+    await recoverTasksOnStartup();
+    const after = await prisma.task.findUniqueOrThrow({ where: { id: task.id } });
+    expect(after.status).toBe("succeeded");
+  }, 120_000);
+
   it("aborted/missing への late chunk PUT は S3 に orphan を残さない", async () => {
     process.env.NODE_ENV = "development";
     const app = appWithProjects();

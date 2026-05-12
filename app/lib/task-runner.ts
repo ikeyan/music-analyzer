@@ -129,7 +129,7 @@ type TaskResult =
   | { kind: "success"; videoId?: string; audioId?: string }
   | { kind: "failure"; error: string };
 
-async function runVideoTask(upload: Upload): Promise<TaskResult> {
+async function runVideoTask(taskId: string, upload: Upload): Promise<TaskResult> {
   await using td = await tempDir("video-task");
   const tmp = td.path;
   const ext = extname(upload.fileName) || ".bin";
@@ -243,13 +243,20 @@ async function runVideoTask(upload: Upload): Promise<TaskResult> {
       });
       // row が確定した時点で mark を消す。途中 throw 時は mark が残り sweeper が拾う
       await tx.deletionMark.deleteMany({ where: { prefix: videoPrefix } });
+      // Video commit と同じ tx で task を succeeded に flip。
+      // ここを別 tx にすると Video 作成後・task update 前に process が死ぬと
+      // 「track はあるのに task は running → recovery で failed」状態になる
+      await tx.task.update({
+        where: { id: taskId },
+        data: { status: "succeeded", finishedAt: new Date(), videoId: v.id },
+      });
       return v;
     }),
   );
   return { kind: "success", videoId: created.id };
 }
 
-async function runAudioTask(upload: Upload): Promise<TaskResult> {
+async function runAudioTask(taskId: string, upload: Upload): Promise<TaskResult> {
   await using td = await tempDir("audio-task");
   const tmp = td.path;
   const ext = (extname(upload.fileName) || ".bin").slice(1).toLowerCase();
@@ -332,6 +339,12 @@ async function runAudioTask(upload: Upload): Promise<TaskResult> {
         },
       });
       await tx.deletionMark.deleteMany({ where: { prefix: audioPrefix } });
+      // Audio commit と同じ tx で task を succeeded に flip (recovery の running→failed
+      // 誤分類を防ぐ)
+      await tx.task.update({
+        where: { id: taskId },
+        data: { status: "succeeded", finishedAt: new Date(), audioId: a.id },
+      });
       return a;
     }),
   );
@@ -362,8 +375,8 @@ async function executeTask(taskId: string): Promise<void> {
   try {
     result =
       task.type === "video_validation"
-        ? await runVideoTask(task.upload)
-        : await runAudioTask(task.upload);
+        ? await runVideoTask(task.id, task.upload)
+        : await runAudioTask(task.id, task.upload);
   } catch (err) {
     result = {
       kind: "failure",
@@ -371,17 +384,8 @@ async function executeTask(taskId: string): Promise<void> {
     };
   }
 
-  if (result.kind === "success") {
-    await prisma.task.update({
-      where: { id: task.id },
-      data: {
-        status: "succeeded",
-        finishedAt: new Date(),
-        videoId: result.videoId ?? null,
-        audioId: result.audioId ?? null,
-      },
-    });
-  } else {
+  // success の場合は run* 内で task も同じ tx で flip 済み。failure のみここで update
+  if (result.kind === "failure") {
     await prisma.task.update({
       where: { id: task.id },
       data: { status: "failed", error: result.error, finishedAt: new Date() },
