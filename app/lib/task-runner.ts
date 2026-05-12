@@ -439,15 +439,23 @@ export async function waitForInflightTasks(): Promise<void> {
   while (inflight.size > 0) await Bun.sleep(20);
 }
 
-// running 残骸を failed に倒し、pending を再 enqueue。
+// running 残骸を failed に倒し (関連 chunk 行も同時に削除)、pending を再 enqueue。
 // 再 enqueue 前に mark を引き直して sweeper との race を避ける
 export async function recoverTasksOnStartup(): Promise<void> {
-  const orphaned = await prisma.task.updateMany({
+  const orphaned = await prisma.task.findMany({
     where: { status: "running" },
-    data: { status: "failed", error: "process restarted during task", finishedAt: new Date() },
+    select: { id: true, uploadId: true },
   });
-  if (orphaned.count > 0) {
-    console.error(`task-runner: marked ${orphaned.count} orphaned tasks as failed`);
+  if (orphaned.length > 0) {
+    const orphanedUploadIds = orphaned.flatMap((t) => (t.uploadId ? [t.uploadId] : []));
+    await prisma.$transaction([
+      prisma.task.updateMany({
+        where: { id: { in: orphaned.map((t) => t.id) } },
+        data: { status: "failed", error: "process restarted during task", finishedAt: new Date() },
+      }),
+      prisma.uploadChunk.deleteMany({ where: { uploadId: { in: orphanedUploadIds } } }),
+    ]);
+    console.error(`task-runner: marked ${orphaned.length} orphaned tasks as failed`);
   }
   const pending = await prisma.task.findMany({
     where: { status: "pending" },
