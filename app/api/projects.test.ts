@@ -29,19 +29,16 @@ function makeClient(): ChunkedUploadClient {
   const app = new Hono().route("/api", api);
   // app.request は body から CL を自動付与しない (本番 fetch は付ける) ので
   // テスト経路でだけ補う
-  const customFetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+  const customFetch: typeof app.request = async (input, init) => {
     const headers = new Headers(init?.headers);
     const body = init?.body;
     if (body != null && !headers.has("content-length")) {
       const size = bodyByteLength(body);
       if (size !== undefined) headers.set("content-length", String(size));
     }
-    return await app.request(input as Parameters<typeof app.request>[0], { ...init, headers });
+    return await app.request(input, { ...init, headers });
   };
-  return hc<AppType>("http://test/api", {
-    fetch: customFetch as unknown as typeof fetch,
-    headers: DEV_HEADERS,
-  });
+  return hc<AppType>("http://test/api", { fetch: customFetch, headers: DEV_HEADERS });
 }
 
 function bodyByteLength(body: BodyInit): number | undefined {
