@@ -1,13 +1,13 @@
 import { type CSSProperties, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ApiAudio, ApiProjectDetail, ApiTask, ApiThumbnail, ApiVideo } from "../api/types";
 import { apiClient } from "../lib/api-client";
+import { chunkedUpload } from "../lib/chunked-upload";
 
 export type Thumb = ApiThumbnail;
 export type VideoItem = ApiVideo;
 export type AudioItem = ApiAudio;
 export type ProjectDetailData = ApiProjectDetail;
 
-const UPLOAD_CHUNK_SIZE = 8 * 1024 * 1024;
 // active task がある間 1s 間隔で refresh (succeeded 後の Video/Audio 反映も兼ねる)
 const TASK_POLL_INTERVAL_MS = 1000;
 
@@ -115,7 +115,14 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
     setBusy(kind);
     setError(null);
     try {
-      const result = await chunkedUpload(data.id, kind, file);
+      const result = await chunkedUpload(
+        apiClient,
+        data.id,
+        kind,
+        file,
+        file.name,
+        file.type || undefined,
+      );
       if ("error" in result) {
         const label = kind === "video" ? "動画" : "音声";
         setError(`${label} upload 失敗 (HTTP ${result.status}): ${result.error}`);
@@ -357,53 +364,6 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
       </div>
     </div>
   );
-}
-
-// 完了監視は ProjectDetail 全体の polling effect が代行するのでここでは task を返すだけ
-async function chunkedUpload(
-  projectId: string,
-  kind: "video" | "audio",
-  file: File,
-): Promise<{ ok: true; task: ApiTask } | { error: string; status: number }> {
-  const createUrl = apiClient.projects[":id"].uploads.$url({ param: { id: projectId } });
-  const create = await fetch(createUrl.toString(), {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      kind,
-      fileName: file.name,
-      contentType: file.type || undefined,
-      totalBytes: file.size,
-      chunkSize: UPLOAD_CHUNK_SIZE,
-    }),
-  });
-  if (!create.ok) return await readError(create);
-  const { upload } = (await create.json()) as {
-    upload: { id: string; chunkSize: number; totalChunks: number };
-  };
-
-  for (let i = 0; i < upload.totalChunks; i++) {
-    const start = i * upload.chunkSize;
-    const end = Math.min(file.size, start + upload.chunkSize);
-    const chunkUrl = `/api/projects/${encodeURIComponent(projectId)}/uploads/${encodeURIComponent(upload.id)}/chunks/${i}`;
-    const res = await fetch(chunkUrl, {
-      method: "PUT",
-      headers: { "content-type": file.type || "application/octet-stream" },
-      body: file.slice(start, end),
-    });
-    if (!res.ok) return await readError(res);
-  }
-
-  const completeUrl = `/api/projects/${encodeURIComponent(projectId)}/uploads/${encodeURIComponent(upload.id)}/complete`;
-  const complete = await fetch(completeUrl, { method: "POST" });
-  if (!complete.ok) return await readError(complete);
-  const { task } = (await complete.json()) as { task: ApiTask };
-  return { ok: true, task };
-}
-
-async function readError(res: Response): Promise<{ error: string; status: number }> {
-  const body = (await res.json().catch(() => ({}))) as { error?: string };
-  return { error: body.error ?? "(no error message in response body)", status: res.status };
 }
 
 function trackKey(t: Track): string {
