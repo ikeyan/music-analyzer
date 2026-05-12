@@ -609,6 +609,42 @@ describe("chunked upload + media validation task", () => {
     await waitForInflightTasks();
   }, 120_000);
 
+  it("aborted/missing への late chunk PUT は S3 に orphan を残さない", async () => {
+    process.env.NODE_ENV = "development";
+    const app = appWithProjects();
+    const pid = await createProject(app, "chunk-abort-orphan");
+    const create = await app.request(`/api/projects/${pid}/uploads`, {
+      method: "POST",
+      headers: { ...DEV_HEADERS, "content-type": "application/json" },
+      body: JSON.stringify({
+        kind: "audio",
+        fileName: "x.bin",
+        totalBytes: 4,
+        chunkSize: 64 * 1024,
+      }),
+    });
+    const upload = ((await create.json()) as { upload: ApiUpload }).upload;
+    // 先に DELETE して status=aborted + mark 削除済みにする
+    const del = await app.request(`/api/projects/${pid}/uploads/${upload.id}`, {
+      method: "DELETE",
+      headers: DEV_HEADERS,
+    });
+    expect(del.status).toBe(204);
+    // 遅延 PUT (DELETE 後の late write を模擬)
+    const put = await app.request(`/api/projects/${pid}/uploads/${upload.id}/chunks/0`, {
+      method: "PUT",
+      headers: {
+        ...DEV_HEADERS,
+        "content-type": "application/octet-stream",
+        "content-length": "4",
+      },
+      body: new Uint8Array([1, 2, 3, 4]),
+    });
+    expect(put.status).toBe(409);
+    // S3 に late write の orphan が残っていないこと
+    expect(await getS3().exists(uploadChunkKey(pid, upload.id, 0))).toBe(false);
+  });
+
   it("aborted upload への chunk PUT も 409", async () => {
     process.env.NODE_ENV = "development";
     const app = appWithProjects();
