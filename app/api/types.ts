@@ -1,6 +1,6 @@
 // API レスポンス用の DTO。Prisma 行をこれに射影してから c.json で返すと、
 // bigint が JSON に乗らず Hono RPC の型推論も全フィールドにつく
-import type { Audio, Project, Thumbnail, Video } from "../generated/prisma/client";
+import type { Audio, Project, Task, Thumbnail, Upload, Video } from "../generated/prisma/client";
 
 export type ApiThumbnail = {
   id: string;
@@ -74,6 +74,37 @@ export type ApiProjectDetail = ApiProject & {
 export type ApiProjectSummary = ApiProject & {
   videoCount: number;
   audioCount: number;
+};
+
+export type ApiUpload = {
+  id: string;
+  projectId: string;
+  kind: "video" | "audio";
+  fileName: string;
+  contentType: string | null;
+  totalBytes: number;
+  chunkSize: number;
+  totalChunks: number;
+  receivedBytes: number;
+  status: "pending" | "completed" | "aborted";
+  expiresAt: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type ApiTask = {
+  id: string;
+  projectId: string;
+  type: "video_validation" | "audio_validation";
+  status: "pending" | "running" | "succeeded" | "failed";
+  error: string | null;
+  uploadId: string | null;
+  videoId: string | null;
+  audioId: string | null;
+  createdAt: string;
+  updatedAt: string;
+  startedAt: string | null;
+  finishedAt: string | null;
 };
 
 export function toApiThumbnail(projectId: string, videoId: string, t: Thumbnail): ApiThumbnail {
@@ -168,5 +199,40 @@ export function toApiProjectSummary(
     ...toApiProject(p),
     videoCount: p._count.videos,
     audioCount: p._count.audios,
+  };
+}
+
+export function toApiUpload(u: Upload): ApiUpload {
+  return {
+    id: u.id,
+    projectId: u.projectId,
+    kind: u.kind as "video" | "audio",
+    fileName: u.fileName,
+    contentType: u.contentType,
+    totalBytes: Number(u.totalBytes),
+    chunkSize: u.chunkSize,
+    totalChunks: u.totalChunks,
+    receivedBytes: Number(u.receivedBytes),
+    status: u.status as "pending" | "completed" | "aborted",
+    expiresAt: u.expiresAt.toISOString(),
+    createdAt: u.createdAt.toISOString(),
+    updatedAt: u.updatedAt.toISOString(),
+  };
+}
+
+export function toApiTask(t: Task): ApiTask {
+  return {
+    id: t.id,
+    projectId: t.projectId,
+    type: t.type as "video_validation" | "audio_validation",
+    status: t.status as "pending" | "running" | "succeeded" | "failed",
+    error: t.error,
+    uploadId: t.uploadId,
+    videoId: t.videoId,
+    audioId: t.audioId,
+    createdAt: t.createdAt.toISOString(),
+    updatedAt: t.updatedAt.toISOString(),
+    startedAt: t.startedAt?.toISOString() ?? null,
+    finishedAt: t.finishedAt?.toISOString() ?? null,
   };
 }

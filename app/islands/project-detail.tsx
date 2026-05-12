@@ -1,11 +1,15 @@
 import { type CSSProperties, useEffect, useMemo, useRef, useState } from "react";
-import type { ApiAudio, ApiProjectDetail, ApiThumbnail, ApiVideo } from "../api/types";
+import type { ApiAudio, ApiProjectDetail, ApiTask, ApiThumbnail, ApiVideo } from "../api/types";
 import { apiClient } from "../lib/api-client";
 
 export type Thumb = ApiThumbnail;
 export type VideoItem = ApiVideo;
 export type AudioItem = ApiAudio;
 export type ProjectDetailData = ApiProjectDetail;
+
+const UPLOAD_CHUNK_SIZE = 8 * 1024 * 1024;
+const TASK_POLL_INTERVAL_MS = 500;
+const TASK_POLL_TIMEOUT_MS = 10 * 60 * 1000;
 
 type Track = { kind: "video"; data: VideoItem } | { kind: "audio"; data: AudioItem };
 
@@ -106,29 +110,14 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
     setData(body.project);
   }
 
-  async function uploadVideo(file: File) {
-    setBusy("video");
+  async function uploadMedia(kind: "video" | "audio", file: File) {
+    setBusy(kind);
     setError(null);
     try {
-      const url = apiClient.projects[":id"].videos.$url({ param: { id: data.id } });
-      const result = await uploadFileTo(url.toString(), file);
+      const result = await chunkedUploadAndWait(data.id, kind, file);
       if ("error" in result) {
-        setError(`動画 upload 失敗 (HTTP ${result.status}): ${result.error}`);
-        return;
-      }
-      await refresh();
-    } finally {
-      setBusy(null);
-    }
-  }
-  async function uploadAudio(file: File) {
-    setBusy("audio");
-    setError(null);
-    try {
-      const url = apiClient.projects[":id"].audios.$url({ param: { id: data.id } });
-      const result = await uploadFileTo(url.toString(), file);
-      if ("error" in result) {
-        setError(`音声 upload 失敗 (HTTP ${result.status}): ${result.error}`);
+        const label = kind === "video" ? "動画" : "音声";
+        setError(`${label} upload 失敗 (HTTP ${result.status}): ${result.error}`);
         return;
       }
       await refresh();
@@ -228,14 +217,14 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
           label="動画追加"
           accept="video/*"
           disabled={busy !== null}
-          onPick={uploadVideo}
+          onPick={(f) => uploadMedia("video", f)}
           busy={busy === "video"}
         />
         <UploadField
           label="音声追加"
           accept="audio/*"
           disabled={busy !== null}
-          onPick={uploadAudio}
+          onPick={(f) => uploadMedia("audio", f)}
           busy={busy === "audio"}
         />
       </section>
@@ -353,15 +342,71 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
   );
 }
 
-async function uploadFileTo(
-  url: string,
+// 分割アップロード → complete → task polling を一括で行う。
+// task が失敗したら API status は 200 だが task.error を error として返す
+async function chunkedUploadAndWait(
+  projectId: string,
+  kind: "video" | "audio",
   file: File,
 ): Promise<{ ok: true } | { error: string; status: number }> {
-  const fd = new FormData();
-  fd.append("file", file);
-  fd.append("name", file.name);
-  const res = await fetch(url, { method: "POST", body: fd });
-  if (res.ok) return { ok: true };
+  const createUrl = apiClient.projects[":id"].uploads.$url({ param: { id: projectId } });
+  const create = await fetch(createUrl.toString(), {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      kind,
+      fileName: file.name,
+      contentType: file.type || undefined,
+      totalBytes: file.size,
+      chunkSize: UPLOAD_CHUNK_SIZE,
+    }),
+  });
+  if (!create.ok) return await readError(create);
+  const { upload } = (await create.json()) as {
+    upload: { id: string; chunkSize: number; totalChunks: number };
+  };
+
+  for (let i = 0; i < upload.totalChunks; i++) {
+    const start = i * upload.chunkSize;
+    const end = Math.min(file.size, start + upload.chunkSize);
+    const chunkUrl = `/api/projects/${encodeURIComponent(projectId)}/uploads/${encodeURIComponent(upload.id)}/chunks/${i}`;
+    const res = await fetch(chunkUrl, {
+      method: "PUT",
+      headers: { "content-type": file.type || "application/octet-stream" },
+      body: file.slice(start, end),
+    });
+    if (!res.ok) return await readError(res);
+  }
+
+  const completeUrl = `/api/projects/${encodeURIComponent(projectId)}/uploads/${encodeURIComponent(upload.id)}/complete`;
+  const complete = await fetch(completeUrl, { method: "POST" });
+  if (!complete.ok) return await readError(complete);
+  const { task } = (await complete.json()) as { task: ApiTask };
+
+  const finalTask = await pollTask(projectId, task.id);
+  if (!finalTask) return { error: "task polling timeout", status: 504 };
+  if (finalTask.status === "failed") {
+    return { error: finalTask.error ?? "task failed", status: 400 };
+  }
+  return { ok: true };
+}
+
+async function pollTask(projectId: string, taskId: string): Promise<ApiTask | null> {
+  const deadline = Date.now() + TASK_POLL_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    const res = await apiClient.projects[":id"].tasks[":taskId"].$get({
+      param: { id: projectId, taskId },
+    });
+    if (res.ok) {
+      const body = await res.json();
+      if (body.task.status === "succeeded" || body.task.status === "failed") return body.task;
+    }
+    await new Promise((r) => setTimeout(r, TASK_POLL_INTERVAL_MS));
+  }
+  return null;
+}
+
+async function readError(res: Response): Promise<{ error: string; status: number }> {
   const body = (await res.json().catch(() => ({}))) as { error?: string };
   return { error: body.error ?? "(no error message in response body)", status: res.status };
 }

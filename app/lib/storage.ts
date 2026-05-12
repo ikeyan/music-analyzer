@@ -12,9 +12,27 @@ export const audioRawKey = (projectId: string, audioId: string, ext: string) =>
   `${projectKey(projectId)}/audios/${audioId}/raw.${ext.replace(/^\./, "")}`;
 export const audioTranscodedKey = (projectId: string, audioId: string) =>
   `${projectKey(projectId)}/audios/${audioId}/transcoded.m4a`;
+export const uploadPrefix = (projectId: string, uploadId: string) =>
+  `${projectKey(projectId)}/uploads/${uploadId}/`;
+// 7桁 0-pad で lexicographic = numeric。merge 時に list 順そのまま使える
+export const uploadChunkKey = (projectId: string, uploadId: string, index: number) =>
+  `${uploadPrefix(projectId, uploadId)}chunks/${String(index).padStart(7, "0")}`;
 
 export async function uploadFile(key: string, path: string, contentType: string): Promise<void> {
   await getS3().write(key, Bun.file(path), { type: contentType });
+}
+
+// chunk upload で client から来た body を S3 に書く。
+// Bun S3 client は chunked-encoding な Request からは 0 byte しか取れないので、
+// ArrayBuffer に読み切ってから書く (chunk size は MAX_CHUNK_SIZE で押さえている)
+export async function uploadRawRequest(
+  key: string,
+  request: Request,
+  contentType: string,
+): Promise<number> {
+  const buf = await request.arrayBuffer();
+  await getS3().write(key, buf, { type: contentType });
+  return buf.byteLength;
 }
 
 export async function deletePrefix(prefix: string): Promise<void> {

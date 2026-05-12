@@ -3,6 +3,7 @@ import { showRoutes } from "hono/dev";
 import { api } from "./api";
 import { blobs } from "./api/blobs";
 import { startDeletionSweeper } from "./lib/gc";
+import { recoverTasksOnStartup } from "./lib/task-runner";
 
 // /api/blobs はバケット全体を素通しする dev/scratch 用 endpoint なので
 // development 環境以外では mount しない (production / staging に晒すと
@@ -17,6 +18,7 @@ const app = createApp({
 });
 
 startDeletionSweeper();
+void recoverTasksOnStartup().catch(() => {});
 
 showRoutes(app);
 
