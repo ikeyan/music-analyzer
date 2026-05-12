@@ -120,6 +120,13 @@ export const projects = new Hono<AuthContext>()
           include: { thumbnails: { orderBy: { atSec: "asc" } } },
         },
         audios: { orderBy: { order: "asc" } },
+        // succeeded は Video/Audio として timeline に出るので除外。
+        // pending/running/failed だけ画面に出す (リロード後も処理状況が見える)
+        tasks: {
+          where: { status: { in: ["pending", "running", "failed"] } },
+          orderBy: { createdAt: "desc" },
+          include: { upload: { select: { fileName: true, kind: true } } },
+        },
       },
     });
     if (!project) return c.json({ error: "project not found" }, 404);
@@ -215,6 +222,11 @@ export const projects = new Hono<AuthContext>()
             include: { thumbnails: { orderBy: { atSec: "asc" } } },
           },
           audios: { orderBy: { order: "asc" } },
+          tasks: {
+            where: { status: { in: ["pending", "running", "failed"] } },
+            orderBy: { createdAt: "desc" },
+            include: { upload: { select: { fileName: true, kind: true } } },
+          },
         },
       });
       if (!updated) return c.json({ error: "project not found" }, 404);
@@ -510,6 +522,7 @@ export const projects = new Hono<AuthContext>()
     const tasks = await prisma.task.findMany({
       where: { projectId: project.id },
       orderBy: { createdAt: "desc" },
+      include: { upload: { select: { fileName: true, kind: true } } },
     });
     return c.json({ tasks: tasks.map(toApiTask) satisfies ApiTask[] });
   })
@@ -521,6 +534,7 @@ export const projects = new Hono<AuthContext>()
     if (!project) return c.json({ error: "project not found" }, 404);
     const task = await prisma.task.findFirst({
       where: { id: taskId, projectId: project.id },
+      include: { upload: { select: { fileName: true, kind: true } } },
     });
     if (!task) return c.json({ error: "task not found" }, 404);
     return c.json({ task: toApiTask(task) satisfies ApiTask });

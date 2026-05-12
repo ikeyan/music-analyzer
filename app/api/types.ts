@@ -69,6 +69,8 @@ export type ApiProject = {
 export type ApiProjectDetail = ApiProject & {
   videos: ApiVideo[];
   audios: ApiAudio[];
+  // pending / running / failed の task。succeeded は Video/Audio に昇格済みなので含めない
+  tasks: ApiTask[];
 };
 
 export type ApiProjectSummary = ApiProject & {
@@ -99,6 +101,9 @@ export type ApiTask = {
   status: "pending" | "running" | "succeeded" | "failed";
   error: string | null;
   uploadId: string | null;
+  // 何のファイルを処理中か UI で表示するため upload を inline する。
+  // upload は Task ライフタイムを超えて消えうるので nullable
+  upload: { fileName: string; kind: "video" | "audio" } | null;
   videoId: string | null;
   audioId: string | null;
   createdAt: string;
@@ -183,12 +188,14 @@ export function toApiProjectDetail(
   p: Project & {
     videos: (Video & { thumbnails: Thumbnail[] })[];
     audios: Audio[];
+    tasks: (Task & { upload: { fileName: string; kind: string } | null })[];
   },
 ): ApiProjectDetail {
   return {
     ...toApiProject(p),
     videos: p.videos.map(toApiVideo),
     audios: p.audios.map(toApiAudio),
+    tasks: p.tasks.map(toApiTask),
   };
 }
 
@@ -220,7 +227,9 @@ export function toApiUpload(u: Upload): ApiUpload {
   };
 }
 
-export function toApiTask(t: Task): ApiTask {
+export function toApiTask(
+  t: Task & { upload?: { fileName: string; kind: string } | null },
+): ApiTask {
   return {
     id: t.id,
     projectId: t.projectId,
@@ -228,6 +237,9 @@ export function toApiTask(t: Task): ApiTask {
     status: t.status as "pending" | "running" | "succeeded" | "failed",
     error: t.error,
     uploadId: t.uploadId,
+    upload: t.upload
+      ? { fileName: t.upload.fileName, kind: t.upload.kind as "video" | "audio" }
+      : null,
     videoId: t.videoId,
     audioId: t.audioId,
     createdAt: t.createdAt.toISOString(),

@@ -1,4 +1,4 @@
-import { type CSSProperties, useEffect, useMemo, useRef, useState } from "react";
+import { type CSSProperties, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ApiAudio, ApiProjectDetail, ApiTask, ApiThumbnail, ApiVideo } from "../api/types";
 import { apiClient } from "../lib/api-client";
 
@@ -8,10 +8,10 @@ export type AudioItem = ApiAudio;
 export type ProjectDetailData = ApiProjectDetail;
 
 const UPLOAD_CHUNK_SIZE = 8 * 1024 * 1024;
-const TASK_POLL_INTERVAL_MS = 500;
-// backend の TASK_GRACE_MS と揃える。1h 動画は transcode に数十分かかるので
-// 短い hard deadline で諦めると task は完了するのに UI 側だけ放棄してしまう
-const TASK_POLL_TIMEOUT_MS = 4 * 60 * 60 * 1000;
+// アクティブな task がある間、project detail を 1s 間隔で fetch する。
+// timeline 描画も含めて refresh するので、succeeded task の Video/Audio が timeline に
+// 出現するのも同じパス
+const TASK_POLL_INTERVAL_MS = 1000;
 
 type Track = { kind: "video"; data: VideoItem } | { kind: "audio"; data: AudioItem };
 
@@ -105,28 +105,44 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
     }
   }, [tracks, currentTime, playing]);
 
-  async function refresh() {
-    const res = await apiClient.projects[":id"].$get({ param: { id: data.id } });
+  const projectId = data.id;
+  const refresh = useCallback(async () => {
+    const res = await apiClient.projects[":id"].$get({ param: { id: projectId } });
     if (!res.ok) return;
     const body = await res.json();
     setData(body.project);
-  }
+  }, [projectId]);
 
   async function uploadMedia(kind: "video" | "audio", file: File) {
     setBusy(kind);
     setError(null);
     try {
-      const result = await chunkedUploadAndWait(data.id, kind, file);
+      const result = await chunkedUpload(data.id, kind, file);
       if ("error" in result) {
         const label = kind === "video" ? "動画" : "音声";
         setError(`${label} upload 失敗 (HTTP ${result.status}): ${result.error}`);
         return;
       }
+      // task が登録されたので即座に refresh して task list に出す。
+      // 以降の進捗は useEffect の polling が拾う
       await refresh();
     } finally {
       setBusy(null);
     }
   }
+
+  // 進行中の task がある間だけ polling。boolean に縮約して effect の再 mount を抑える
+  const hasActiveTasks = useMemo(
+    () => data.tasks.some((t) => t.status === "pending" || t.status === "running"),
+    [data.tasks],
+  );
+  useEffect(() => {
+    if (!hasActiveTasks) return;
+    const timer = setInterval(() => {
+      void refresh();
+    }, TASK_POLL_INTERVAL_MS);
+    return () => clearInterval(timer);
+  }, [hasActiveTasks, refresh]);
 
   // user-gesture 内で play().then(pause) して全 track を unlock。範囲外は mute で音漏れを防ぐ。
   // 範囲外要素は unlocking フラグで syncMediaElement の同期 pause から除外する
@@ -248,6 +264,8 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
         </p>
       )}
 
+      {data.tasks.length > 0 && <TaskList tasks={data.tasks} />}
+
       <section
         style={{ display: "flex", alignItems: "center", gap: "0.75rem", margin: "0.75rem 0" }}
       >
@@ -344,13 +362,13 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
   );
 }
 
-// 分割アップロード → complete → task polling を一括で行う。
-// task が失敗したら API status は 200 だが task.error を error として返す
-async function chunkedUploadAndWait(
+// 分割アップロード → complete までを行い、登録された task を返す (polling はしない)。
+// 完了監視は ProjectDetail 全体の polling effect が代行する
+async function chunkedUpload(
   projectId: string,
   kind: "video" | "audio",
   file: File,
-): Promise<{ ok: true } | { error: string; status: number }> {
+): Promise<{ ok: true; task: ApiTask } | { error: string; status: number }> {
   const createUrl = apiClient.projects[":id"].uploads.$url({ param: { id: projectId } });
   const create = await fetch(createUrl.toString(), {
     method: "POST",
@@ -384,28 +402,7 @@ async function chunkedUploadAndWait(
   const complete = await fetch(completeUrl, { method: "POST" });
   if (!complete.ok) return await readError(complete);
   const { task } = (await complete.json()) as { task: ApiTask };
-
-  const finalTask = await pollTask(projectId, task.id);
-  if (!finalTask) return { error: "task polling timeout", status: 504 };
-  if (finalTask.status === "failed") {
-    return { error: finalTask.error ?? "task failed", status: 400 };
-  }
-  return { ok: true };
-}
-
-async function pollTask(projectId: string, taskId: string): Promise<ApiTask | null> {
-  const deadline = Date.now() + TASK_POLL_TIMEOUT_MS;
-  while (Date.now() < deadline) {
-    const res = await apiClient.projects[":id"].tasks[":taskId"].$get({
-      param: { id: projectId, taskId },
-    });
-    if (res.ok) {
-      const body = await res.json();
-      if (body.task.status === "succeeded" || body.task.status === "failed") return body.task;
-    }
-    await new Promise((r) => setTimeout(r, TASK_POLL_INTERVAL_MS));
-  }
-  return null;
+  return { ok: true, task };
 }
 
 async function readError(res: Response): Promise<{ error: string; status: number }> {
@@ -750,6 +747,104 @@ function ThumbnailStrip({
         );
       })}
     </div>
+  );
+}
+
+function TaskList({ tasks }: { tasks: ApiTask[] }) {
+  return (
+    <section
+      aria-label="処理中のタスク"
+      style={{
+        border: "1px solid #ddd",
+        borderRadius: 6,
+        background: "#f6f8fa",
+        padding: "0.5rem 0.75rem",
+        margin: "0.5rem 0",
+      }}
+    >
+      <h2 style={{ fontSize: "0.95rem", margin: "0 0 0.4rem 0" }}>処理中のタスク</h2>
+      <ul style={{ margin: 0, padding: 0, listStyle: "none", display: "grid", gap: "0.35rem" }}>
+        {tasks.map((t) => (
+          <TaskRow key={t.id} task={t} />
+        ))}
+      </ul>
+    </section>
+  );
+}
+
+function TaskRow({ task }: { task: ApiTask }) {
+  const kindLabel =
+    task.upload?.kind === "video" ? "動画" : task.upload?.kind === "audio" ? "音声" : "ファイル";
+  const statusLabel = (() => {
+    switch (task.status) {
+      case "pending":
+        return "待機中";
+      case "running":
+        return "処理中…";
+      case "failed":
+        return "失敗";
+      case "succeeded":
+        return "完了";
+    }
+  })();
+  const statusColor = (() => {
+    switch (task.status) {
+      case "running":
+        return "#1f6feb";
+      case "pending":
+        return "#6e7781";
+      case "failed":
+        return "crimson";
+      case "succeeded":
+        return "#1a7f37";
+    }
+  })();
+  const fileName = task.upload?.fileName ?? "(削除済み upload)";
+  return (
+    <li
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: "0.5rem",
+        fontSize: "0.85rem",
+        flexWrap: "wrap",
+      }}
+    >
+      <span
+        style={{
+          display: "inline-block",
+          minWidth: "2.5rem",
+          padding: "0 0.4rem",
+          background: task.upload?.kind === "video" ? "#3b82f6" : "#10b981",
+          color: "white",
+          borderRadius: 3,
+          fontSize: "0.75rem",
+          textAlign: "center",
+        }}
+      >
+        {kindLabel}
+      </span>
+      <span style={{ fontFamily: "monospace", overflow: "hidden", textOverflow: "ellipsis" }}>
+        {fileName}
+      </span>
+      <span style={{ color: statusColor, fontWeight: 600 }}>{statusLabel}</span>
+      {task.error && (
+        <span
+          role="alert"
+          style={{
+            color: "crimson",
+            flexBasis: "100%",
+            background: "#fff5f5",
+            padding: "0.25rem 0.4rem",
+            borderRadius: 3,
+            whiteSpace: "pre-wrap",
+            wordBreak: "break-word",
+          }}
+        >
+          {task.error}
+        </span>
+      )}
+    </li>
   );
 }
 
