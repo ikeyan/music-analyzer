@@ -21,7 +21,6 @@ import {
   audioTranscodedKey,
   deletePrefix,
   projectKey,
-  uploadChunkKey,
   uploadFile,
   uploadPrefix,
   videoAudioKey,
@@ -93,14 +92,24 @@ async function markMediaPrefixForCleanup(prefix: string): Promise<void> {
   });
 }
 
-// chunks/* を index 順で S3 ストリームから直接 destPath に連結する
+// UploadChunk.s3Key を index 順に S3 ストリームから destPath に連結する。
+// DB に記録された s3Key を直接読むので、/complete の validate と同じ object を merge する
 async function mergeChunks(upload: Upload, destPath: string): Promise<void> {
+  const chunks = await prisma.uploadChunk.findMany({
+    where: { uploadId: upload.id },
+    orderBy: { index: "asc" },
+    select: { index: true, s3Key: true },
+  });
+  if (chunks.length !== upload.totalChunks) {
+    throw new Error(
+      `mergeChunks: chunk count ${chunks.length} != totalChunks ${upload.totalChunks}`,
+    );
+  }
   const s3 = getS3();
   const writer = Bun.file(destPath).writer();
   try {
-    for (let i = 0; i < upload.totalChunks; i++) {
-      const key = uploadChunkKey(upload.projectId, upload.id, i);
-      const reader = s3.file(key).stream().getReader();
+    for (const chunk of chunks) {
+      const reader = s3.file(chunk.s3Key).stream().getReader();
       try {
         while (true) {
           const { done, value } = await reader.read();

@@ -2,7 +2,7 @@ import { describe, expect, it } from "bun:test";
 import { Hono } from "hono";
 import { prisma } from "../lib/prisma";
 import { getS3 } from "../lib/s3";
-import { projectKey, uploadChunkKey, uploadPrefix } from "../lib/storage";
+import { projectKey, uploadPrefix } from "../lib/storage";
 import { TASK_GRACE_MS, recoverTasksOnStartup, waitForInflightTasks } from "../lib/task-runner";
 import { useDbFixture } from "../test-fixtures/db";
 import { useMediaFixture } from "../test-fixtures/media";
@@ -259,13 +259,17 @@ describe("chunked upload + media validation task", () => {
       },
       body: new Uint8Array([1, 2, 3, 4]),
     });
-    expect(await getS3().exists(uploadChunkKey(pid, upload.id, 0))).toBe(true);
+    const chunk0 = await prisma.uploadChunk.findUnique({
+      where: { uploadId_index: { uploadId: upload.id, index: 0 } },
+    });
+    expect(chunk0).not.toBeNull();
+    expect(await getS3().exists(chunk0!.s3Key)).toBe(true);
     const del = await app.request(`/api/projects/${pid}/uploads/${upload.id}`, {
       method: "DELETE",
       headers: DEV_HEADERS,
     });
     expect(del.status).toBe(204);
-    expect(await getS3().exists(uploadChunkKey(pid, upload.id, 0))).toBe(false);
+    expect(await getS3().exists(chunk0!.s3Key)).toBe(false);
   });
 
   it("waitForInflightTasks は task 完了後に解決する", async () => {
@@ -455,9 +459,10 @@ describe("chunked upload + media validation task", () => {
       body: new Uint8Array([1, 2, 3, 4]),
     });
     expect(ok.status).toBe(200);
-    const stored = await getS3()
-      .file(uploadChunkKey(pid, upload.id, 0))
-      .arrayBuffer();
+    const chunk0 = await prisma.uploadChunk.findUniqueOrThrow({
+      where: { uploadId_index: { uploadId: upload.id, index: 0 } },
+    });
+    const stored = await getS3().file(chunk0.s3Key).arrayBuffer();
     expect(stored.byteLength).toBe(4);
     // chunkSize 超過 body を投げて 413 (chunkSize=1024 に対し 2048 byte)
     const big = new Uint8Array(2048);
@@ -471,15 +476,13 @@ describe("chunked upload + media validation task", () => {
       body: big,
     });
     expect(oversize.status).toBe(413);
-    // 既存 S3 chunk が破壊されていないこと
-    const stillStored = await getS3()
-      .file(uploadChunkKey(pid, upload.id, 0))
-      .arrayBuffer();
+    // 既存 S3 chunk が破壊されていないこと (canonical key 上書きしない設計)
+    const stillStored = await getS3().file(chunk0.s3Key).arrayBuffer();
     expect(stillStored.byteLength).toBe(4);
     expect(new Uint8Array(stillStored)).toEqual(new Uint8Array([1, 2, 3, 4]));
   });
 
-  it("同一 chunk index への並列 PUT は直列化され S3 と DB が一致する", async () => {
+  it("同一 chunk index への並列 PUT で DB と S3 が一致 (最後の winner に統一)", async () => {
     process.env.NODE_ENV = "development";
     const app = appWithProjects();
     const pid = await createProject(app, "chunk-serialize");
@@ -494,9 +497,8 @@ describe("chunked upload + media validation task", () => {
       }),
     });
     const upload = ((await create.json()) as { upload: ApiUpload }).upload;
-    // 2 つの異なる body を同 index に並列に投げる
-    const bodyA = new Uint8Array(8).fill(0xaa); // 8 bytes
-    const bodyB = new Uint8Array(4).fill(0xbb); // 4 bytes
+    const bodyA = new Uint8Array(8).fill(0xaa);
+    const bodyB = new Uint8Array(4).fill(0xbb);
     const url = `/api/projects/${pid}/uploads/${upload.id}/chunks/0`;
     const [resA, resB] = await Promise.all([
       app.request(url, {
@@ -519,14 +521,16 @@ describe("chunked upload + media validation task", () => {
       }),
     ]);
     expect([resA.status, resB.status].every((s) => s === 200)).toBe(true);
-    // 直列化後の最終状態: S3 と DB の sizeBytes が一致する
-    const dbChunk = await prisma.uploadChunk.findUnique({
+    // DB の s3Key と sizeBytes が S3 object と一致する。古い writeId の object は消えている
+    const dbChunk = await prisma.uploadChunk.findUniqueOrThrow({
       where: { uploadId_index: { uploadId: upload.id, index: 0 } },
     });
-    const stored = await getS3()
-      .file(uploadChunkKey(pid, upload.id, 0))
-      .arrayBuffer();
-    expect(Number(dbChunk!.sizeBytes)).toBe(stored.byteLength);
+    const stored = await getS3().file(dbChunk.s3Key).arrayBuffer();
+    expect(Number(dbChunk.sizeBytes)).toBe(stored.byteLength);
+    // upload prefix 配下の chunks/* には DB が指す 1 個だけ残っている
+    const list = await getS3().list({ prefix: uploadPrefix(pid, upload.id) });
+    const keys = (list.contents ?? []).map((o) => o.key).filter((k): k is string => !!k);
+    expect(keys).toEqual([dbChunk.s3Key]);
   });
 
   it("task 成功時 media prefix の DeletionMark が消える (途中失敗時は残る)", async () => {
@@ -641,8 +645,9 @@ describe("chunked upload + media validation task", () => {
       body: new Uint8Array([1, 2, 3, 4]),
     });
     expect(put.status).toBe(409);
-    // S3 に late write の orphan が残っていないこと
-    expect(await getS3().exists(uploadChunkKey(pid, upload.id, 0))).toBe(false);
+    // S3 に late write の orphan が残っていないこと (prefix 配下空)
+    const list = await getS3().list({ prefix: uploadPrefix(pid, upload.id) });
+    expect(list.contents ?? []).toHaveLength(0);
   });
 
   it("aborted upload への chunk PUT も 409", async () => {

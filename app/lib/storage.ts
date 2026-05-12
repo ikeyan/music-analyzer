@@ -14,9 +14,15 @@ export const audioTranscodedKey = (projectId: string, audioId: string) =>
   `${projectKey(projectId)}/audios/${audioId}/transcoded.m4a`;
 export const uploadPrefix = (projectId: string, uploadId: string) =>
   `${projectKey(projectId)}/uploads/${uploadId}/`;
-// 7桁 0-pad で lexicographic = numeric。merge 時に list 順そのまま使える
-export const uploadChunkKey = (projectId: string, uploadId: string, index: number) =>
-  `${uploadPrefix(projectId, uploadId)}chunks/${String(index).padStart(7, "0")}`;
+// PUT ごとに unique にするため writeId を付ける。retry は別 key を書いて DB tx で
+// promote する設計なので、同じ canonical key を上書きせず /complete の validate と
+// task の merge が常に同じ object を指す
+export const uploadChunkKey = (
+  projectId: string,
+  uploadId: string,
+  index: number,
+  writeId: string,
+) => `${uploadPrefix(projectId, uploadId)}chunks/${String(index).padStart(7, "0")}-${writeId}`;
 
 export async function uploadFile(key: string, path: string, contentType: string): Promise<void> {
   await getS3().write(key, Bun.file(path), { type: contentType });

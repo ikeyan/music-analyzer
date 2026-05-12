@@ -78,24 +78,6 @@ async function findProjectOr404(userId: string, projectId: string) {
   return p;
 }
 
-// 同一 (uploadId, index) への並列 PUT を直列化する in-memory mutex。
-// 直列化しないと S3 への到着順と DB への到着順がずれて、DB の sizeBytes が
-// 実際の S3 オブジェクトと食い違う恐れがある。single-process 前提
-const chunkLocks = new Map<string, Promise<unknown>>();
-async function withChunkLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
-  const prev = chunkLocks.get(key);
-  const mine = (async () => {
-    if (prev) await prev.catch(() => {});
-    return await fn();
-  })();
-  chunkLocks.set(key, mine);
-  try {
-    return await mine;
-  } finally {
-    if (chunkLocks.get(key) === mine) chunkLocks.delete(key);
-  }
-}
-
 async function markPrefixForDeletion(prefix: string, graceMs: number): Promise<void> {
   await prisma.deletionMark.create({
     data: { prefix, nextRetryAt: new Date(Date.now() + graceMs) },
@@ -318,94 +300,77 @@ export const projects = new Hono<AuthContext>()
         return c.json({ error: `chunk too large (max ${MAX_SINGLE_CHUNK_BYTES} bytes)` }, 413);
       }
       const contentType = c.req.header("content-type") ?? "application/octet-stream";
-      const key = uploadChunkKey(project.id, upload.id, index);
-
-      // 同 (uploadId, index) への並列 PUT を直列化。直列化しないと S3 への到着順と
-      // DB の sizeBytes が食い違って /complete validate を通った後の merge で
-      // 壊れた byte set を読む恐れがある
-      type ChunkPutOutcome =
-        | { kind: "ok" }
-        | {
-            kind: "error";
-            status: 409 | 413 | 500;
-            error: string;
-          };
-      const outcome: ChunkPutOutcome = await withChunkLock(`${upload.id}:${index}`, async () => {
-        let size: number;
-        try {
-          size = await uploadRawRequest(key, c.req.raw, contentType);
-        } catch (err) {
-          return {
-            kind: "error",
-            status: 500,
-            error: `chunk upload failed: ${err instanceof Error ? err.message : String(err)}`,
-          };
-        }
-        if (size > upload.chunkSize) {
-          // CL を信じて write 前検証を通したあとには起きない想定。防衛策。
-          // canonical key を消すと既に validate 済みの chunk を破壊しうるので消さず、
-          // upload prefix の DeletionMark + sweeper / task cleanup に任せる
-          return {
-            kind: "error",
-            status: 413,
-            error: `chunk exceeds declared chunkSize ${upload.chunkSize}`,
-          };
-        }
-        // S3 write 完了から DB 反映までの間に /complete が status を flip しうるので、
-        // tx 内で status=pending を再確認してから書く。flipped していたら S3 にだけ
-        // 残った遅延書き込みは best-effort で消す
-        const txResult = await prisma.$transaction(async (tx) => {
-          const fresh = await tx.upload.findUnique({
-            where: { id: upload.id },
-            select: { status: true, expiresAt: true },
-          });
-          if (!fresh || fresh.status !== "pending") {
-            return { stale: true as const, status: fresh?.status ?? "missing" };
-          }
-          if (fresh.expiresAt.getTime() <= Date.now()) {
-            return { stale: true as const, status: "expired" as const };
-          }
-          const existing = await tx.uploadChunk.findUnique({
-            where: { uploadId_index: { uploadId: upload.id, index } },
-          });
-          if (existing) {
-            const delta = BigInt(size) - existing.sizeBytes;
-            await tx.uploadChunk.update({
-              where: { uploadId_index: { uploadId: upload.id, index } },
-              data: { sizeBytes: BigInt(size) },
-            });
-            await tx.upload.update({
-              where: { id: upload.id },
-              data: { receivedBytes: { increment: delta } },
-            });
-          } else {
-            await tx.uploadChunk.create({
-              data: { uploadId: upload.id, index, sizeBytes: BigInt(size) },
-            });
-            await tx.upload.update({
-              where: { id: upload.id },
-              data: { receivedBytes: { increment: BigInt(size) } },
-            });
-          }
-          return { stale: false as const };
+      // PUT ごとに固有 s3Key を発番し、DB tx で promote する。
+      // canonical key を上書きしないので /complete と race しても、validate と merge は
+      // 常に同じ s3Key (= 同じ S3 object) を見る
+      const writeId = crypto.randomUUID();
+      const newS3Key = uploadChunkKey(project.id, upload.id, index, writeId);
+      let size: number;
+      try {
+        size = await uploadRawRequest(newS3Key, c.req.raw, contentType);
+      } catch (err) {
+        return c.json(
+          { error: `chunk upload failed: ${err instanceof Error ? err.message : String(err)}` },
+          500,
+        );
+      }
+      if (size > upload.chunkSize) {
+        // CL pre-check を抜けたあとに起きる前提はない。防衛策
+        await getS3()
+          .delete(newS3Key)
+          .catch(() => {});
+        return c.json({ error: `chunk exceeds declared chunkSize ${upload.chunkSize}` }, 413);
+      }
+      // tx 内で status=pending を再確認し、existing.s3Key を捕まえてから自分の s3Key へ promote。
+      // stale なら自分の write を消す (DB は触らないので validate 済みの先行 s3Key は無事)
+      const promoteResult = await prisma.$transaction(async (tx) => {
+        const fresh = await tx.upload.findUnique({
+          where: { id: upload.id },
+          select: { status: true, expiresAt: true },
         });
-        if (txResult.stale) {
-          // status=completed では task の merge が canonical key を必要とするので
-          // late write を消さない (再送 PUT が validate 済み chunk を壊さないため)。
-          // それ以外 (aborted/missing/expired) は task が走らない & DELETE 経路は
-          // mark まで消すので、自分の late write を best-effort で回収しないと
-          // 永久 orphan になる
-          if (txResult.status !== "completed") {
-            await getS3()
-              .delete(key)
-              .catch(() => {});
-          }
-          return { kind: "error", status: 409, error: `upload is ${txResult.status}` };
+        if (!fresh || fresh.status !== "pending") {
+          return { stale: true as const, status: fresh?.status ?? "missing", oldS3Key: null };
         }
-        return { kind: "ok" };
+        if (fresh.expiresAt.getTime() <= Date.now()) {
+          return { stale: true as const, status: "expired" as const, oldS3Key: null };
+        }
+        const existing = await tx.uploadChunk.findUnique({
+          where: { uploadId_index: { uploadId: upload.id, index } },
+        });
+        if (existing) {
+          const delta = BigInt(size) - existing.sizeBytes;
+          await tx.uploadChunk.update({
+            where: { uploadId_index: { uploadId: upload.id, index } },
+            data: { sizeBytes: BigInt(size), s3Key: newS3Key },
+          });
+          await tx.upload.update({
+            where: { id: upload.id },
+            data: { receivedBytes: { increment: delta } },
+          });
+          return { stale: false as const, oldS3Key: existing.s3Key };
+        }
+        await tx.uploadChunk.create({
+          data: { uploadId: upload.id, index, sizeBytes: BigInt(size), s3Key: newS3Key },
+        });
+        await tx.upload.update({
+          where: { id: upload.id },
+          data: { receivedBytes: { increment: BigInt(size) } },
+        });
+        return { stale: false as const, oldS3Key: null };
       });
-
-      if (outcome.kind === "error") return c.json({ error: outcome.error }, outcome.status);
+      if (promoteResult.stale) {
+        // 自分が write した s3Key は誰も参照していないので best-effort で消す
+        await getS3()
+          .delete(newS3Key)
+          .catch(() => {});
+        return c.json({ error: `upload is ${promoteResult.status}` }, 409);
+      }
+      if (promoteResult.oldS3Key && promoteResult.oldS3Key !== newS3Key) {
+        // DB は new s3Key を指すようになった。古い s3Key は誰も参照しないので消す
+        await getS3()
+          .delete(promoteResult.oldS3Key)
+          .catch(() => {});
+      }
       const updated = await prisma.upload.findUniqueOrThrow({ where: { id: upload.id } });
       return c.json({ upload: toApiUpload(updated) satisfies ApiUpload });
     },

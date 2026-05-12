@@ -130,13 +130,16 @@ model Upload {
   @@index([expiresAt])
 }
 
-// 受け取った各チャンクの存在を記録する。complete 時に 0..totalChunks-1 が
-// 揃っているかをこの行集合で検証する
+// 受け取った各チャンクの存在を記録する。
+// s3Key は PUT ごとに unique にして、retry は別 key を書いてから DB tx で promote する。
+// こうすると /complete の validate と背景 task の merge が常に同じ S3 object を見るので
+// (DB row.s3Key = S3 object)、PUT vs /complete の race で内容が食い違わない
 model UploadChunk {
   id        String   @id @default(cuid())
   uploadId  String
   upload    Upload   @relation(fields: [uploadId], references: [id])
   index     Int
+  s3Key     String
   sizeBytes BigInt
   createdAt DateTime @default(now())
 
