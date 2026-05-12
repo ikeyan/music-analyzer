@@ -380,7 +380,6 @@ export const projects = new Hono<AuthContext>()
     const project = await findProjectOr404(user.id, id);
     if (!project) return c.json({ error: "project not found" }, 404);
 
-    // 並行 /complete を updateMany で原子クレーム (count==0 が race 敗北)
     type CompleteOutcome =
       | { kind: "claimed"; task: ApiTask }
       | { kind: "race_lost"; task: ApiTask }
@@ -389,76 +388,105 @@ export const projects = new Hono<AuthContext>()
           status: 400 | 404 | 409 | 410 | 500;
           error: string;
         };
-    const outcome: CompleteOutcome = await prisma.$transaction(async (tx) => {
-      const upload = await tx.upload.findFirst({
-        where: { id: uploadId, projectId: project.id },
-        include: { chunks: { select: { index: true, sizeBytes: true } } },
-      });
-      if (!upload) {
-        return { kind: "error", status: 404, error: "upload not found" };
+
+    // chunks の read + validate を claim より後ろに置く。
+    // PUT promotion tx と /complete の race を塞ぐため、claim 先行 →
+    // validate 失敗時は throw で tx abort して claim を巻き戻す
+    class CompleteValidationFailure extends Error {
+      constructor(public outcome: Extract<CompleteOutcome, { kind: "error" }>) {
+        super(outcome.error);
       }
-      if (upload.status === "completed") {
-        const existing = await tx.task.findFirst({
-          where: { uploadId: upload.id },
-          orderBy: { createdAt: "desc" },
+    }
+    let outcome: CompleteOutcome;
+    try {
+      outcome = await prisma.$transaction(async (tx) => {
+        const upload = await tx.upload.findFirst({
+          where: { id: uploadId, projectId: project.id },
         });
-        if (existing) return { kind: "race_lost", task: toApiTask(existing) };
-        return { kind: "error", status: 500, error: "completed upload has no task" };
-      }
-      if (upload.status !== "pending") {
-        return { kind: "error", status: 409, error: `upload is ${upload.status}` };
-      }
-      if (upload.expiresAt.getTime() <= Date.now()) {
-        return { kind: "error", status: 410, error: "upload expired" };
-      }
-      if (upload.chunks.length !== upload.totalChunks) {
-        return {
-          kind: "error",
-          status: 400,
-          error: `missing chunks: received ${upload.chunks.length}/${upload.totalChunks}`,
-        };
-      }
-      const seen = new Set(upload.chunks.map((chunk) => chunk.index));
-      for (let i = 0; i < upload.totalChunks; i++) {
-        if (!seen.has(i)) {
-          return { kind: "error", status: 400, error: `missing chunk ${i}` };
+        if (!upload) {
+          return { kind: "error", status: 404, error: "upload not found" };
         }
-      }
-      const sum = upload.chunks.reduce((acc, chunk) => acc + chunk.sizeBytes, 0n);
-      if (sum !== upload.totalBytes) {
-        return {
-          kind: "error",
-          status: 400,
-          error: `byte total mismatch: received ${sum}, declared ${upload.totalBytes}`,
-        };
-      }
-      const claimed = await tx.upload.updateMany({
-        where: { id: upload.id, status: "pending" },
-        data: { status: "completed" },
-      });
-      if (claimed.count === 0) {
-        const existing = await tx.task.findFirst({
-          where: { uploadId: upload.id },
-          orderBy: { createdAt: "desc" },
+        if (upload.status === "completed") {
+          const existing = await tx.task.findFirst({
+            where: { uploadId: upload.id },
+            orderBy: { createdAt: "desc" },
+            include: { upload: { select: { fileName: true, kind: true } } },
+          });
+          if (existing) return { kind: "race_lost", task: toApiTask(existing) };
+          return { kind: "error", status: 500, error: "completed upload has no task" };
+        }
+        if (upload.status !== "pending") {
+          return { kind: "error", status: 409, error: `upload is ${upload.status}` };
+        }
+        if (upload.expiresAt.getTime() <= Date.now()) {
+          return { kind: "error", status: 410, error: "upload expired" };
+        }
+        const claimed = await tx.upload.updateMany({
+          where: { id: upload.id, status: "pending" },
+          data: { status: "completed" },
         });
-        if (existing) return { kind: "race_lost", task: toApiTask(existing) };
-        return { kind: "error", status: 500, error: "race lost but no task found" };
+        if (claimed.count === 0) {
+          const existing = await tx.task.findFirst({
+            where: { uploadId: upload.id },
+            orderBy: { createdAt: "desc" },
+            include: { upload: { select: { fileName: true, kind: true } } },
+          });
+          if (existing) return { kind: "race_lost", task: toApiTask(existing) };
+          return { kind: "error", status: 500, error: "race lost but no task found" };
+        }
+        // claim 後に chunks 確定状態を read。PUT promotion はこの時点で stale 扱い
+        const chunks = await tx.uploadChunk.findMany({
+          where: { uploadId: upload.id },
+          select: { index: true, sizeBytes: true },
+        });
+        if (chunks.length !== upload.totalChunks) {
+          throw new CompleteValidationFailure({
+            kind: "error",
+            status: 400,
+            error: `missing chunks: received ${chunks.length}/${upload.totalChunks}`,
+          });
+        }
+        const seen = new Set(chunks.map((chunk) => chunk.index));
+        for (let i = 0; i < upload.totalChunks; i++) {
+          if (!seen.has(i)) {
+            throw new CompleteValidationFailure({
+              kind: "error",
+              status: 400,
+              error: `missing chunk ${i}`,
+            });
+          }
+        }
+        const sum = chunks.reduce((acc, chunk) => acc + chunk.sizeBytes, 0n);
+        if (sum !== upload.totalBytes) {
+          throw new CompleteValidationFailure({
+            kind: "error",
+            status: 400,
+            error: `byte total mismatch: received ${sum}, declared ${upload.totalBytes}`,
+          });
+        }
+        const task = await tx.task.create({
+          data: {
+            projectId: project.id,
+            type: upload.kind === "video" ? "video_validation" : "audio_validation",
+            uploadId: upload.id,
+            status: "pending",
+          },
+          include: { upload: { select: { fileName: true, kind: true } } },
+        });
+        // task 走行中の sweep を防ぐ。完了時 executeTask が mark ごと回収
+        await tx.deletionMark.updateMany({
+          where: { prefix: uploadPrefix(project.id, upload.id) },
+          data: { nextRetryAt: new Date(Date.now() + TASK_GRACE_MS) },
+        });
+        return { kind: "claimed", task: toApiTask(task) };
+      });
+    } catch (err) {
+      if (err instanceof CompleteValidationFailure) {
+        outcome = err.outcome;
+      } else {
+        throw err;
       }
-      const task = await tx.task.create({
-        data: {
-          projectId: project.id,
-          type: upload.kind === "video" ? "video_validation" : "audio_validation",
-          uploadId: upload.id,
-          status: "pending",
-        },
-      });
-      // task 走行中の sweep を防ぐ。完了時 executeTask が mark ごと回収
-      await tx.deletionMark.updateMany({
-        where: { prefix: uploadPrefix(project.id, upload.id) },
-        data: { nextRetryAt: new Date(Date.now() + TASK_GRACE_MS) },
-      });
-      return { kind: "claimed", task: toApiTask(task) };
-    });
+    }
 
     if (outcome.kind === "error") return c.json({ error: outcome.error }, outcome.status);
     if (outcome.kind === "claimed") enqueueTask(outcome.task.id);

@@ -189,6 +189,32 @@ describe("chunked upload + media validation task", () => {
     expect(finished.error ?? "").toContain("could not parse uploaded file");
   }, 90_000);
 
+  it("validate 失敗時は claim を rollback して status=pending に戻す", async () => {
+    process.env.NODE_ENV = "development";
+    const app = appWithProjects();
+    const pid = await createProject(app, "complete-validate-rollback");
+    // chunks を欠かせて validate 失敗にする
+    const create = await app.request(`/api/projects/${pid}/uploads`, {
+      method: "POST",
+      headers: { ...DEV_HEADERS, "content-type": "application/json" },
+      body: JSON.stringify({
+        kind: "audio",
+        fileName: "x.bin",
+        totalBytes: 4,
+        chunkSize: 1024,
+      }),
+    });
+    const upload = ((await create.json()) as { upload: ApiUpload }).upload;
+    const complete = await app.request(`/api/projects/${pid}/uploads/${upload.id}/complete`, {
+      method: "POST",
+      headers: DEV_HEADERS,
+    });
+    expect(complete.status).toBe(400);
+    // claim が巻き戻り status=pending のまま (次の /complete をやり直せる)
+    const reloaded = await prisma.upload.findUniqueOrThrow({ where: { id: upload.id } });
+    expect(reloaded.status).toBe("pending");
+  });
+
   it("complete 前に全 chunk が揃っていなければ 400", async () => {
     process.env.NODE_ENV = "development";
     const app = appWithProjects();
