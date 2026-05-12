@@ -31,13 +31,10 @@ import {
 // upload 完了前に死んだチャンクは 1h grace の DeletionMark + sweeper で回収する
 export const UPLOAD_EXPIRY_MS = 60 * 60 * 1000;
 
-// chunk size の許容範囲。client が指定する。multipart の S3 minimum (5MiB) と
-// 単一 request にメモリ展開しても安全な上限を考慮した範囲
 const DEFAULT_CHUNK_SIZE = 8 * 1024 * 1024;
-// 極小チャンクの DoS だけ防ぐ。実用的な下限は client が DEFAULT を使うことを期待する
+// 極小チャンク DoS 防止
 const MIN_CHUNK_SIZE = 1024;
 const MAX_CHUNK_SIZE = 64 * 1024 * 1024;
-// 全 chunk 受信前の Content-Length 単発 fast-fail 用
 const MAX_SINGLE_CHUNK_BYTES = MAX_CHUNK_SIZE;
 
 const idParamSchema = v.object({ id: v.string() });
@@ -120,8 +117,7 @@ export const projects = new Hono<AuthContext>()
           include: { thumbnails: { orderBy: { atSec: "asc" } } },
         },
         audios: { orderBy: { order: "asc" } },
-        // succeeded は Video/Audio として timeline に出るので除外。
-        // pending/running/failed だけ画面に出す (リロード後も処理状況が見える)
+        // succeeded は Video/Audio として timeline に出るので除外
         tasks: {
           where: { status: { in: ["pending", "running", "failed"] } },
           orderBy: { createdAt: "desc" },
@@ -234,8 +230,6 @@ export const projects = new Hono<AuthContext>()
     },
   )
 
-  // 分割アップロード開始: Upload 行 + 1h grace の DeletionMark を作る。
-  // 以降の PUT /chunks/:index と POST /complete はこの uploadId を握って進める
   .post(
     "/:id/uploads",
     vValidator("param", idParamSchema),
@@ -272,7 +266,6 @@ export const projects = new Hono<AuthContext>()
     },
   )
 
-  // 単一 chunk を S3 に書き込み、UploadChunk 行を upsert する。再送 idempotent
   .put(
     "/:id/uploads/:uploadId/chunks/:index",
     vValidator("param", uploadChunkParamSchema),
@@ -295,8 +288,7 @@ export const projects = new Hono<AuthContext>()
       if (!Number.isInteger(index) || index < 0 || index >= upload.totalChunks) {
         return c.json({ error: `chunk index out of range [0, ${upload.totalChunks})` }, 400);
       }
-      // 既存 S3 オブジェクトを上書き破壊しないよう、Content-Length を必須にして
-      // chunkSize 違反は write 前に reject する (CL なし=真の chunked は 411)
+      // CL 必須。違反は write 前に reject して既存 S3 を破壊しない
       const declaredRaw = c.req.header("content-length");
       if (declaredRaw == null) {
         return c.json({ error: "content-length header required" }, 411);
@@ -312,9 +304,7 @@ export const projects = new Hono<AuthContext>()
         return c.json({ error: `chunk too large (max ${MAX_SINGLE_CHUNK_BYTES} bytes)` }, 413);
       }
       const contentType = c.req.header("content-type") ?? "application/octet-stream";
-      // PUT ごとに固有 s3Key を発番し、DB tx で promote する。
-      // canonical key を上書きしないので /complete と race しても、validate と merge は
-      // 常に同じ s3Key (= 同じ S3 object) を見る
+      // PUT ごとに固有 s3Key (= DB row が指す 1 object)、tx で promote
       const writeId = crypto.randomUUID();
       const newS3Key = uploadChunkKey(project.id, upload.id, index, writeId);
       let size: number;
@@ -327,14 +317,12 @@ export const projects = new Hono<AuthContext>()
         );
       }
       if (size > upload.chunkSize) {
-        // CL pre-check を抜けたあとに起きる前提はない。防衛策
+        // CL pre-check の防衛策
         await getS3()
           .delete(newS3Key)
           .catch(() => {});
         return c.json({ error: `chunk exceeds declared chunkSize ${upload.chunkSize}` }, 413);
       }
-      // tx 内で status=pending を再確認し、existing.s3Key を捕まえてから自分の s3Key へ promote。
-      // stale なら自分の write を消す (DB は触らないので validate 済みの先行 s3Key は無事)
       const promoteResult = await prisma.$transaction(async (tx) => {
         const fresh = await tx.upload.findUnique({
           where: { id: upload.id },
@@ -371,14 +359,12 @@ export const projects = new Hono<AuthContext>()
         return { stale: false as const, oldS3Key: null };
       });
       if (promoteResult.stale) {
-        // 自分が write した s3Key は誰も参照していないので best-effort で消す
         await getS3()
           .delete(newS3Key)
           .catch(() => {});
         return c.json({ error: `upload is ${promoteResult.status}` }, 409);
       }
       if (promoteResult.oldS3Key && promoteResult.oldS3Key !== newS3Key) {
-        // DB は new s3Key を指すようになった。古い s3Key は誰も参照しないので消す
         await getS3()
           .delete(promoteResult.oldS3Key)
           .catch(() => {});
@@ -388,16 +374,13 @@ export const projects = new Hono<AuthContext>()
     },
   )
 
-  // 全 chunk 揃った前提で finalize。Task を pending で作成し background runner を起動。
-  // ffmpeg は非同期で走り、完了は GET /tasks/:taskId の polling で取る
   .post("/:id/uploads/:uploadId/complete", vValidator("param", uploadIdParamSchema), async (c) => {
     const user = c.var.user;
     const { id, uploadId } = c.req.valid("param");
     const project = await findProjectOr404(user.id, id);
     if (!project) return c.json({ error: "project not found" }, 404);
 
-    // 並行 /complete を直列化するため、validate と claim を 1 つの transaction に置く。
-    // updateMany({where: status:"pending"}) で claim を原子化し、count==0 なら race 敗北
+    // 並行 /complete を updateMany で原子クレーム (count==0 が race 敗北)
     type CompleteOutcome =
       | { kind: "claimed"; task: ApiTask }
       | { kind: "race_lost"; task: ApiTask }
@@ -449,7 +432,6 @@ export const projects = new Hono<AuthContext>()
           error: `byte total mismatch: received ${sum}, declared ${upload.totalBytes}`,
         };
       }
-      // atomic claim: 同時 /complete のもう一方は count=0 で抜ける
       const claimed = await tx.upload.updateMany({
         where: { id: upload.id, status: "pending" },
         data: { status: "completed" },
@@ -470,8 +452,7 @@ export const projects = new Hono<AuthContext>()
           status: "pending",
         },
       });
-      // task 走行中に sweeper に chunks を消されないよう mark の grace を伸ばす。
-      // task 完了時に executeTask が prefix と一緒に mark を消す
+      // task 走行中の sweep を防ぐ。完了時 executeTask が mark ごと回収
       await tx.deletionMark.updateMany({
         where: { prefix: uploadPrefix(project.id, upload.id) },
         data: { nextRetryAt: new Date(Date.now() + TASK_GRACE_MS) },
@@ -491,8 +472,7 @@ export const projects = new Hono<AuthContext>()
     const project = await findProjectOr404(user.id, id);
     if (!project) return c.json({ error: "project not found" }, 404);
     const prefix = uploadPrefix(project.id, uploadId);
-    // tx 内で status=pending を再確認して flip すれば、aborted への遷移が
-    // /complete とすれ違うのを防げる
+    // tx 内で status=pending を再確認して /complete と直列化
     const aborted = await prisma.$transaction(async (tx) => {
       const upload = await tx.upload.findFirst({
         where: { id: uploadId, projectId: project.id },
@@ -641,7 +621,7 @@ export const projects = new Hono<AuthContext>()
     return await streamS3(c, audio.rawKey, audio.rawContentType ?? "application/octet-stream");
   });
 
-// (projectId, order) unique衝突 (P2002) と SQLite write conflict (P2034) 用の保険リトライ
+// P2002 (unique) / P2034 (write conflict) の保険リトライ
 async function withSlotRetry<T>(fn: () => Promise<T>): Promise<T> {
   const MAX_ATTEMPTS = 5;
   for (let i = 0; i < MAX_ATTEMPTS; i++) {

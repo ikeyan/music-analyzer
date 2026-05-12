@@ -8,9 +8,7 @@ export type AudioItem = ApiAudio;
 export type ProjectDetailData = ApiProjectDetail;
 
 const UPLOAD_CHUNK_SIZE = 8 * 1024 * 1024;
-// アクティブな task がある間、project detail を 1s 間隔で fetch する。
-// timeline 描画も含めて refresh するので、succeeded task の Video/Audio が timeline に
-// 出現するのも同じパス
+// active task がある間 1s 間隔で refresh (succeeded 後の Video/Audio 反映も兼ねる)
 const TASK_POLL_INTERVAL_MS = 1000;
 
 type Track = { kind: "video"; data: VideoItem } | { kind: "audio"; data: AudioItem };
@@ -123,7 +121,6 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
         setError(`${label} upload 失敗 (HTTP ${result.status}): ${result.error}`);
         return;
       }
-      // task が登録されたので即座に refresh して task list に出す。
       // 以降の進捗は useEffect の polling が拾う
       await refresh();
     } finally {
@@ -131,7 +128,7 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
     }
   }
 
-  // 進行中の task がある間だけ polling。boolean に縮約して effect の再 mount を抑える
+  // boolean に縮約して effect の再 mount を抑える
   const hasActiveTasks = useMemo(
     () => data.tasks.some((t) => t.status === "pending" || t.status === "running"),
     [data.tasks],
@@ -362,8 +359,7 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
   );
 }
 
-// 分割アップロード → complete までを行い、登録された task を返す (polling はしない)。
-// 完了監視は ProjectDetail 全体の polling effect が代行する
+// 完了監視は ProjectDetail 全体の polling effect が代行するのでここでは task を返すだけ
 async function chunkedUpload(
   projectId: string,
   kind: "video" | "audio",

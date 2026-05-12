@@ -14,9 +14,7 @@ export const audioTranscodedKey = (projectId: string, audioId: string) =>
   `${projectKey(projectId)}/audios/${audioId}/transcoded.m4a`;
 export const uploadPrefix = (projectId: string, uploadId: string) =>
   `${projectKey(projectId)}/uploads/${uploadId}/`;
-// PUT ごとに unique にするため writeId を付ける。retry は別 key を書いて DB tx で
-// promote する設計なので、同じ canonical key を上書きせず /complete の validate と
-// task の merge が常に同じ object を指す
+// retry は別 key を書いて DB tx で promote するため writeId で unique 化
 export const uploadChunkKey = (
   projectId: string,
   uploadId: string,
@@ -28,10 +26,8 @@ export async function uploadFile(key: string, path: string, contentType: string)
   await getS3().write(key, Bun.file(path), { type: contentType });
 }
 
-// chunk upload で client から来た raw Request body を S3 に流す。
-// Bun.serve 経由の Request を S3Client.write に渡すと書き込みは成功するが
-// write の戻り値 size が常に 0 になる (戻り値バグ) ので Content-Length から取る。
-// CL なし (真の chunked encoding) のみ HEAD でフォールバック
+// Bun.serve 経由の Request では S3Client.write の戻り値 size が常に 0 を返すバグの
+// workaround で Content-Length から size を取る (CL なしのみ HEAD フォールバック)
 export async function uploadRawRequest(
   key: string,
   request: Request,

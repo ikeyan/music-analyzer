@@ -1,8 +1,7 @@
 import { extname, join } from "node:path";
 import type { Upload } from "../generated/prisma/client";
 
-// /complete 後に task が走り終わるまで sweeper に回収されないよう mark を伸ばす grace。
-// MAX_DURATION_SEC (1h) の transcode + upload に余裕を持たせた値
+// /complete 後の task 走行中 sweep を防ぐ grace (1h transcode + 余裕)
 export const TASK_GRACE_MS = 4 * 60 * 60 * 1000;
 import {
   MAX_DURATION_SEC,
@@ -83,17 +82,14 @@ async function projectExists(projectId: string): Promise<boolean> {
   return p !== null;
 }
 
-// media prefix を sweeper の回収対象にしておき、Video/Audio.create と同じ tx で
-// unmark する。並列 S3 upload の一部失敗・FK race・mid-upload crash すべてで
-// orphan を残さない。grace は task の最大走行時間を見込んだ TASK_GRACE_MS を流用
+// Video/Audio.create と同 tx で unmark、未到達なら sweeper が回収
 async function markMediaPrefixForCleanup(prefix: string): Promise<void> {
   await prisma.deletionMark.create({
     data: { prefix, nextRetryAt: new Date(Date.now() + TASK_GRACE_MS) },
   });
 }
 
-// UploadChunk.s3Key を index 順に S3 ストリームから destPath に連結する。
-// DB に記録された s3Key を直接読むので、/complete の validate と同じ object を merge する
+// DB の s3Key を index 順に読む (/complete が validate したのと同じ object)
 async function mergeChunks(upload: Upload, destPath: string): Promise<void> {
   const chunks = await prisma.uploadChunk.findMany({
     where: { uploadId: upload.id },
@@ -197,8 +193,7 @@ async function runVideoTask(taskId: string, upload: Upload): Promise<TaskResult>
   if (!(await projectExists(upload.projectId))) {
     return { kind: "failure", error: "project deleted before media upload" };
   }
-  // S3 upload + Video.create のどこで落ちても orphan を残さないよう先に mark を打つ。
-  // 全部成功して row が確定したら mark を消す
+  // Video.create commit で unmark、未到達なら sweeper 回収
   await markMediaPrefixForCleanup(videoPrefix);
   await awaitAllOrAggregate([
     uploadFile(vKey, videoOut, "video/mp4"),
@@ -241,11 +236,8 @@ async function runVideoTask(taskId: string, upload: Upload): Promise<TaskResult>
           },
         },
       });
-      // row が確定した時点で mark を消す。途中 throw 時は mark が残り sweeper が拾う
       await tx.deletionMark.deleteMany({ where: { prefix: videoPrefix } });
-      // Video commit と同じ tx で task を succeeded に flip。
-      // ここを別 tx にすると Video 作成後・task update 前に process が死ぬと
-      // 「track はあるのに task は running → recovery で failed」状態になる
+      // task→succeeded は Video.create と同 tx 必須 (中間状態で recovery が failed に倒す)
       await tx.task.update({
         where: { id: taskId },
         data: { status: "succeeded", finishedAt: new Date(), videoId: v.id },
@@ -339,8 +331,7 @@ async function runAudioTask(taskId: string, upload: Upload): Promise<TaskResult>
         },
       });
       await tx.deletionMark.deleteMany({ where: { prefix: audioPrefix } });
-      // Audio commit と同じ tx で task を succeeded に flip (recovery の running→failed
-      // 誤分類を防ぐ)
+      // task→succeeded は Audio.create と同 tx 必須 (中間状態で recovery が failed に倒す)
       await tx.task.update({
         where: { id: taskId },
         data: { status: "succeeded", finishedAt: new Date(), audioId: a.id },
@@ -351,7 +342,6 @@ async function runAudioTask(taskId: string, upload: Upload): Promise<TaskResult>
   return { kind: "success", audioId: created.id };
 }
 
-// task を 1件実行する。task 完了時に upload prefix の DeletionMark を即時 cleanup
 async function executeTask(taskId: string): Promise<void> {
   const claimed = await prisma.task.updateMany({
     where: { id: taskId, status: "pending" },
@@ -384,7 +374,7 @@ async function executeTask(taskId: string): Promise<void> {
     };
   }
 
-  // success の場合は run* 内で task も同じ tx で flip 済み。failure のみここで update
+  // success は run* 内で同 tx flip 済み
   if (result.kind === "failure") {
     await prisma.task.update({
       where: { id: task.id },
@@ -392,9 +382,7 @@ async function executeTask(taskId: string): Promise<void> {
     });
   }
 
-  // upload chunks はもう不要 (Video/Audio へ昇格済み or 失敗)。
-  // S3 と UploadChunk 行を両方消す (Upload 行は task list の fileName 表示で使うので残す)。
-  // S3 cleanup が失敗しても DeletionMark + sweeper が後で回収する
+  // Upload 行は task list の fileName 表示で使うので残す
   const prefix = uploadPrefix(task.upload.projectId, task.upload.id);
   try {
     await deletePrefix(prefix);
@@ -402,12 +390,10 @@ async function executeTask(taskId: string): Promise<void> {
   } catch {
     /* sweeperに任せる */
   }
-  await prisma.uploadChunk.deleteMany({ where: { uploadId: task.upload.id } }).catch(() => {
-    /* 残っても害は小さい (Upload 削除時に cascade されるか手動 cleanup) */
-  });
+  await prisma.uploadChunk.deleteMany({ where: { uploadId: task.upload.id } }).catch(() => {});
 }
 
-// 起動からの inflight task 集合。dev HMR / test 横断で重複起動しないよう global に持つ
+// dev HMR / test 横断で重複起動しないよう inflight set を global に置く
 declare global {
   // eslint-disable-next-line no-var
   var __musicAnalyzerInflightTasks: Set<string> | undefined;
@@ -416,7 +402,6 @@ const inflight =
   globalThis.__musicAnalyzerInflightTasks ??
   (globalThis.__musicAnalyzerInflightTasks = new Set<string>());
 
-// task を background 実行用に enqueue。await しない (返り値で完了待ちはできない)
 export function enqueueTask(taskId: string): void {
   if (inflight.has(taskId)) return;
   inflight.add(taskId);
@@ -431,15 +416,12 @@ export function enqueueTask(taskId: string): void {
   })();
 }
 
-// テスト用に inflight 完了を待つ
 export async function waitForInflightTasks(): Promise<void> {
   while (inflight.size > 0) await Bun.sleep(20);
 }
 
-// 起動時に「running のまま残った」task は前 process が落ちた事を意味するので
-// failed へ落とす。pending は再 enqueue して実行を継続させる。
-// 4h grace ギリギリの再起動で sweeper が走ると chunks が消える窓があるので
-// 再 enqueue 前に DeletionMark.nextRetryAt を引き直す
+// running 残骸を failed に倒し、pending を再 enqueue。
+// 再 enqueue 前に mark を引き直して sweeper との race を避ける
 export async function recoverTasksOnStartup(): Promise<void> {
   const orphaned = await prisma.task.updateMany({
     where: { status: "running" },

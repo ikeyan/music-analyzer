@@ -99,10 +99,7 @@ async function runGatedSweep(): Promise<void> {
   await sweepPendingDeletions();
 }
 
-// 起動時に1度走らせて前runで残った墓標を回収し、以後 intervalMs ごとに再試行。
-// 既に走っているなら no-op。`ready` を渡すと **全ての** sweep をそれが settle する
-// まで遅らせる (recovery が intervalMs より長引くと recurring tick が pending task の
-// mark を引き直す前に発火しうるので、初回だけでなく interval callback も gate する)
+// 既に走っていれば no-op。`ready` が渡れば全 sweep (初回 + 各 tick) がそれを待つ
 export function startDeletionSweeper(intervalMs = 60_000, ready?: Promise<unknown>): void {
   if (sweeperHandle) return;
   sweeperReady = ready ?? null;
