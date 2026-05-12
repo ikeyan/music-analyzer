@@ -74,6 +74,7 @@ async function putRawChunk(
   projectId: string,
   uploadId: string,
   index: number,
+  // BufferSource = ArrayBufferView<ArrayBuffer> | ArrayBuffer なので <ArrayBuffer> 必須
   body: Uint8Array<ArrayBuffer>,
   contentType = "application/octet-stream",
 ): Promise<Response> {
