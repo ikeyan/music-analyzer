@@ -128,7 +128,11 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
         setError(`${label} upload 失敗 (HTTP ${result.status}): ${result.error}`);
         return;
       }
-      // 以降の進捗は useEffect の polling が拾う
+      // refresh が transient error で失敗しても polling effect が動くよう task を直接 seed
+      setData((d) => ({
+        ...d,
+        tasks: [result.task, ...d.tasks.filter((t) => t.id !== result.task.id)],
+      }));
       await refresh();
     } finally {
       setBusy(null);
