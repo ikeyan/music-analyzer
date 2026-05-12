@@ -85,16 +85,30 @@ export async function sweepPendingDeletions(): Promise<void> {
   }
 }
 
+let sweeperReady: Promise<unknown> | null = null;
+
+async function runGatedSweep(): Promise<void> {
+  if (sweeperReady) {
+    // recovery 失敗してもこの後の sweep は走らせる
+    try {
+      await sweeperReady;
+    } catch {
+      /* swallow */
+    }
+  }
+  await sweepPendingDeletions();
+}
+
 // 起動時に1度走らせて前runで残った墓標を回収し、以後 intervalMs ごとに再試行。
-// 既に走っているなら no-op。`ready` を渡すと初回 sweep をそれが resolve するまで
-// 遅らせる (recoverTasksOnStartup が pending task の mark を引き直す前に
-// 古い nextRetryAt で chunks を消されないようにするため)
+// 既に走っているなら no-op。`ready` を渡すと **全ての** sweep をそれが settle する
+// まで遅らせる (recovery が intervalMs より長引くと recurring tick が pending task の
+// mark を引き直す前に発火しうるので、初回だけでなく interval callback も gate する)
 export function startDeletionSweeper(intervalMs = 60_000, ready?: Promise<unknown>): void {
   if (sweeperHandle) return;
-  const initial = ready ? Promise.resolve(ready) : Promise.resolve();
-  void initial.then(() => sweepPendingDeletions()).catch(() => {});
+  sweeperReady = ready ?? null;
+  void runGatedSweep().catch(() => {});
   sweeperHandle = setInterval(() => {
-    void sweepPendingDeletions().catch(() => {});
+    void runGatedSweep().catch(() => {});
   }, intervalMs);
 }
 
@@ -103,4 +117,5 @@ export function stopDeletionSweeper(): void {
     clearInterval(sweeperHandle);
     sweeperHandle = null;
   }
+  sweeperReady = null;
 }

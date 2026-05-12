@@ -1,4 +1,5 @@
 import { describe, expect, it, mock } from "bun:test";
+import { useDbFixture } from "../test-fixtures/db";
 import {
   BASE_RETRY_DELAY_MS,
   nextRetryDelayMs,
@@ -7,6 +8,7 @@ import {
   stopDeletionSweeper,
   type SweeperDeps,
 } from "./gc";
+import { prisma } from "./prisma";
 
 describe("nextRetryDelayMs", () => {
   it("returns base delay range for attempts=0", () => {
@@ -191,5 +193,34 @@ describe("startDeletionSweeper / stopDeletionSweeper", () => {
 
   it("stop without prior start is a no-op", () => {
     expect(() => stopDeletionSweeper()).not.toThrow();
+  });
+});
+
+describe("startDeletionSweeper ready gating", () => {
+  useDbFixture();
+
+  it("recurring sweeps wait until the ready promise settles", async () => {
+    // due な mark を入れておく。gate が効いていればこの mark は sweep されない
+    await prisma.deletionMark.create({
+      data: { prefix: "gate-test/", nextRetryAt: new Date(Date.now() - 1000) },
+    });
+    let resolveReady: () => void = () => {};
+    const ready = new Promise<void>((r) => {
+      resolveReady = r;
+    });
+    // intervalMs=20 で 150ms 走らせれば gate が無ければ 5+ 回 sweep が走る
+    startDeletionSweeper(20, ready);
+    try {
+      await Bun.sleep(150);
+      const stillPending = await prisma.deletionMark.findFirst({
+        where: { prefix: "gate-test/" },
+      });
+      // sweep が走っていれば attempts が増えるか mark が消える (S3 未設定で
+      // deletePrefix が例外 → attempts++)。gate が効いていれば attempts=0 のまま
+      expect(stillPending?.attempts).toBe(0);
+    } finally {
+      resolveReady();
+      stopDeletionSweeper();
+    }
   });
 });
