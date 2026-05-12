@@ -5,6 +5,7 @@ import * as v from "valibot";
 import { type AuthContext, requireUser } from "../lib/auth";
 import { MAX_UPLOAD_BYTES } from "../lib/ffmpeg";
 import { prisma } from "../lib/prisma";
+import { getS3 } from "../lib/s3";
 import {
   projectKey,
   streamS3,
@@ -299,34 +300,55 @@ export const projects = new Hono<AuthContext>()
       }
       if (size > upload.chunkSize) {
         // chunkSize は client 申告。違反したら S3 に書いた行ごと破棄
+        await getS3()
+          .delete(key)
+          .catch(() => {});
         return c.json({ error: `chunk exceeds declared chunkSize ${upload.chunkSize}` }, 413);
       }
-      // upsert で同 index 再送を idempotent に。サイズの差分で receivedBytes を直す
-      const existing = await prisma.uploadChunk.findUnique({
-        where: { uploadId_index: { uploadId: upload.id, index } },
-      });
-      if (existing) {
-        const delta = BigInt(size) - existing.sizeBytes;
-        await prisma.$transaction([
-          prisma.uploadChunk.update({
+      // S3 write 完了から DB 反映までの間に /complete が status を flip しうるので、
+      // tx 内で status=pending を再確認してから書く。flipped していたら S3 にだけ
+      // 残った遅延書き込みは best-effort で消す (failed の場合 task 完了時の prefix
+      // cleanup or sweeper でも回収される)
+      const txResult = await prisma.$transaction(async (tx) => {
+        const fresh = await tx.upload.findUnique({
+          where: { id: upload.id },
+          select: { status: true, expiresAt: true },
+        });
+        if (!fresh || fresh.status !== "pending") {
+          return { stale: true as const, status: fresh?.status ?? "missing" };
+        }
+        if (fresh.expiresAt.getTime() <= Date.now()) {
+          return { stale: true as const, status: "expired" as const };
+        }
+        const existing = await tx.uploadChunk.findUnique({
+          where: { uploadId_index: { uploadId: upload.id, index } },
+        });
+        if (existing) {
+          const delta = BigInt(size) - existing.sizeBytes;
+          await tx.uploadChunk.update({
             where: { uploadId_index: { uploadId: upload.id, index } },
             data: { sizeBytes: BigInt(size) },
-          }),
-          prisma.upload.update({
+          });
+          await tx.upload.update({
             where: { id: upload.id },
             data: { receivedBytes: { increment: delta } },
-          }),
-        ]);
-      } else {
-        await prisma.$transaction([
-          prisma.uploadChunk.create({
+          });
+        } else {
+          await tx.uploadChunk.create({
             data: { uploadId: upload.id, index, sizeBytes: BigInt(size) },
-          }),
-          prisma.upload.update({
+          });
+          await tx.upload.update({
             where: { id: upload.id },
             data: { receivedBytes: { increment: BigInt(size) } },
-          }),
-        ]);
+          });
+        }
+        return { stale: false as const };
+      });
+      if (txResult.stale) {
+        await getS3()
+          .delete(key)
+          .catch(() => {});
+        return c.json({ error: `upload is ${txResult.status}` }, 409);
       }
       const updated = await prisma.upload.findUniqueOrThrow({ where: { id: upload.id } });
       return c.json({ upload: toApiUpload(updated) satisfies ApiUpload });
@@ -396,21 +418,33 @@ export const projects = new Hono<AuthContext>()
     return c.json({ task: toApiTask(task) satisfies ApiTask }, 201);
   })
 
-  // upload を即時中止して chunks を回収する。未完了 upload の自発キャンセル用
+  // pending な upload の自発キャンセル用。completed 後は task が chunks を必要とするので拒否
   .delete("/:id/uploads/:uploadId", vValidator("param", uploadIdParamSchema), async (c) => {
     const user = c.var.user;
     const { id, uploadId } = c.req.valid("param");
     const project = await findProjectOr404(user.id, id);
     if (!project) return c.json({ error: "project not found" }, 404);
-    const upload = await prisma.upload.findFirst({
-      where: { id: uploadId, projectId: project.id },
+    const prefix = uploadPrefix(project.id, uploadId);
+    // tx 内で status=pending を再確認して flip すれば、aborted への遷移が
+    // /complete とすれ違うのを防げる
+    const aborted = await prisma.$transaction(async (tx) => {
+      const upload = await tx.upload.findFirst({
+        where: { id: uploadId, projectId: project.id },
+        select: { status: true },
+      });
+      if (!upload) return { ok: false as const, status: 404 as const, error: "upload not found" };
+      if (upload.status !== "pending") {
+        return {
+          ok: false as const,
+          status: 409 as const,
+          error: `cannot abort: upload is ${upload.status}`,
+        };
+      }
+      await tx.uploadChunk.deleteMany({ where: { uploadId } });
+      await tx.upload.update({ where: { id: uploadId }, data: { status: "aborted" } });
+      return { ok: true as const };
     });
-    if (!upload) return c.json({ error: "upload not found" }, 404);
-    const prefix = uploadPrefix(project.id, upload.id);
-    await prisma.$transaction(async (tx) => {
-      await tx.uploadChunk.deleteMany({ where: { uploadId: upload.id } });
-      await tx.upload.update({ where: { id: upload.id }, data: { status: "aborted" } });
-    });
+    if (!aborted.ok) return c.json({ error: aborted.error }, aborted.status);
     await eagerCleanupAndUnmark(prefix);
     return c.body(null, 204);
   })

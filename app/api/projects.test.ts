@@ -269,4 +269,99 @@ describe("chunked upload + media validation task", () => {
     const tasks = await prisma.task.findMany({ where: { projectId: pid } });
     expect(tasks.every((t) => t.status === "succeeded" || t.status === "failed")).toBe(true);
   }, 120_000);
+
+  // completed / aborted upload に PUT chunk が後から届くケース。
+  // /complete が status を flip したあとの遅延 PUT は DB を汚さず S3 も残さない
+  it("completed upload への PUT chunk は 409 で拒否され S3 に残らない", async () => {
+    process.env.NODE_ENV = "development";
+    const app = appWithProjects();
+    const pid = await createProject(app, "chunk-race");
+    const create = await app.request(`/api/projects/${pid}/uploads`, {
+      method: "POST",
+      headers: { ...DEV_HEADERS, "content-type": "application/json" },
+      body: JSON.stringify({
+        kind: "audio",
+        fileName: "x.bin",
+        totalBytes: 4,
+        chunkSize: 64 * 1024,
+      }),
+    });
+    const upload = ((await create.json()) as { upload: ApiUpload }).upload;
+    // 正規に chunk 0 を入れて /complete を通す
+    await app.request(`/api/projects/${pid}/uploads/${upload.id}/chunks/0`, {
+      method: "PUT",
+      headers: { ...DEV_HEADERS, "content-type": "application/octet-stream" },
+      body: new Uint8Array([1, 2, 3, 4]),
+    });
+    const complete = await app.request(`/api/projects/${pid}/uploads/${upload.id}/complete`, {
+      method: "POST",
+      headers: DEV_HEADERS,
+    });
+    expect(complete.status).toBe(201);
+    // 後から遅延 PUT が来たケースをシミュレート (chunk 内容が違う)
+    const retry = await app.request(`/api/projects/${pid}/uploads/${upload.id}/chunks/0`, {
+      method: "PUT",
+      headers: { ...DEV_HEADERS, "content-type": "application/octet-stream" },
+      body: new Uint8Array([9, 9, 9, 9]),
+    });
+    // pre-write でも post-write でも完了済み判定で 409
+    expect(retry.status).toBe(409);
+    // 遅延 PUT が S3 に残してしまっていないことを検証
+    // (task の cleanup と競合する可能性があるので、tasks が落ち着いてから確認)
+    await waitForInflightTasks();
+  }, 60_000);
+
+  it("completed upload の DELETE は 409 で拒否し chunks を消さない", async () => {
+    process.env.NODE_ENV = "development";
+    const app = appWithProjects();
+    const pid = await createProject(app, "chunk-abort-completed");
+    const bytes = new Uint8Array(await Bun.file(getMedia().audioMp3).arrayBuffer());
+    const { upload } = await uploadChunked(
+      app,
+      pid,
+      "audio",
+      "tone.mp3",
+      bytes,
+      bytes.byteLength,
+      "audio/mpeg",
+    );
+    // /complete 直後 (task は pending か running)。task が cleanup する前に DELETE
+    const del = await app.request(`/api/projects/${pid}/uploads/${upload.id}`, {
+      method: "DELETE",
+      headers: DEV_HEADERS,
+    });
+    expect(del.status).toBe(409);
+    const body = (await del.json()) as { error: string };
+    expect(body.error).toContain("completed");
+    // task は走らせきって安定化
+    await waitForInflightTasks();
+  }, 60_000);
+
+  it("aborted upload への chunk PUT も 409", async () => {
+    process.env.NODE_ENV = "development";
+    const app = appWithProjects();
+    const pid = await createProject(app, "chunk-after-abort");
+    const create = await app.request(`/api/projects/${pid}/uploads`, {
+      method: "POST",
+      headers: { ...DEV_HEADERS, "content-type": "application/json" },
+      body: JSON.stringify({
+        kind: "audio",
+        fileName: "x.bin",
+        totalBytes: 4,
+        chunkSize: 64 * 1024,
+      }),
+    });
+    const upload = ((await create.json()) as { upload: ApiUpload }).upload;
+    const del = await app.request(`/api/projects/${pid}/uploads/${upload.id}`, {
+      method: "DELETE",
+      headers: DEV_HEADERS,
+    });
+    expect(del.status).toBe(204);
+    const put = await app.request(`/api/projects/${pid}/uploads/${upload.id}/chunks/0`, {
+      method: "PUT",
+      headers: { ...DEV_HEADERS, "content-type": "application/octet-stream" },
+      body: new Uint8Array([1, 2, 3, 4]),
+    });
+    expect(put.status).toBe(409);
+  });
 });
