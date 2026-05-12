@@ -16,6 +16,7 @@ import {
   audioRawKey,
   audioTranscodedKey,
   deletePrefix,
+  projectKey,
   uploadChunkKey,
   uploadFile,
   uploadPrefix,
@@ -72,6 +73,25 @@ async function withSlotRetry<T>(fn: () => Promise<T>): Promise<T> {
     }
   }
   throw new Error("unreachable");
+}
+
+async function projectExists(projectId: string): Promise<boolean> {
+  const p = await prisma.project.findUnique({ where: { id: projectId }, select: { id: true } });
+  return p !== null;
+}
+
+// Video/Audio.create が project FK 違反 (P2003) で落ちる = transcode 結果 upload 中に
+// project が消えた状況。S3 にだけ残った orphan を best-effort で回収する
+async function cleanupOrphanedMedia(prefix: string): Promise<void> {
+  try {
+    await deletePrefix(prefix);
+  } catch {
+    /* sweeper 経路はないので best-effort のみ。残ったら手動 cleanup */
+  }
+}
+
+function isForeignKeyError(err: unknown): boolean {
+  return (err as { code?: string } | null)?.code === "P2003";
 }
 
 // chunks/* を index 順で S3 ストリームから直接 destPath に連結する
@@ -165,6 +185,12 @@ async function runVideoTask(upload: Upload): Promise<TaskResult> {
   const videoId = crypto.randomUUID();
   const vKey = videoSourceKey(upload.projectId, videoId);
   const aKey = hasAudio ? videoAudioKey(upload.projectId, videoId) : null;
+  const videoPrefix = `${projectKey(upload.projectId)}/videos/${videoId}/`;
+  // S3 upload 直前に project の生存確認。これと最終 create の間に project が
+  // 消されたら create が P2003 で落ちるので catch で S3 だけ拾い直す
+  if (!(await projectExists(upload.projectId))) {
+    return { kind: "failure", error: "project deleted before media upload" };
+  }
   await awaitAllOrAggregate([
     uploadFile(vKey, videoOut, "video/mp4"),
     ...(aKey ? [uploadFile(aKey, audioOut, "audio/mp4")] : []),
@@ -174,41 +200,50 @@ async function runVideoTask(upload: Upload): Promise<TaskResult> {
   ]);
 
   const duration = finalProbe.durationSec;
-  const created = await withSlotRetry(() =>
-    prisma.$transaction(async (tx) => {
-      const { order, projStart } = await allocSlot(tx, upload.projectId);
-      const v = await tx.video.create({
-        data: {
-          id: videoId,
-          projectId: upload.projectId,
-          order,
-          name: upload.fileName || "video",
-          videoKey: vKey,
-          audioKey: aKey,
-          durationSec: duration,
-          width: vs.width,
-          height: vs.height,
-          fps: vs.fps,
-          videoBitrate: vs.bitrate,
-          audioBitrate: finalProbe.audioStream?.bitrate ?? null,
-          sizeBytes: BigInt(finalProbe.sizeBytes),
-          srcStartSec: 0,
-          srcEndSec: duration,
-          projStartSec: projStart,
-          projEndSec: projStart + duration,
-          thumbnails: {
-            create: thumbs.map((t) => ({
-              atSec: t.atSec,
-              key: videoThumbKey(upload.projectId, videoId, t.atSec),
-              width: t.width,
-              height: t.height,
-            })),
+  let created;
+  try {
+    created = await withSlotRetry(() =>
+      prisma.$transaction(async (tx) => {
+        const { order, projStart } = await allocSlot(tx, upload.projectId);
+        const v = await tx.video.create({
+          data: {
+            id: videoId,
+            projectId: upload.projectId,
+            order,
+            name: upload.fileName || "video",
+            videoKey: vKey,
+            audioKey: aKey,
+            durationSec: duration,
+            width: vs.width,
+            height: vs.height,
+            fps: vs.fps,
+            videoBitrate: vs.bitrate,
+            audioBitrate: finalProbe.audioStream?.bitrate ?? null,
+            sizeBytes: BigInt(finalProbe.sizeBytes),
+            srcStartSec: 0,
+            srcEndSec: duration,
+            projStartSec: projStart,
+            projEndSec: projStart + duration,
+            thumbnails: {
+              create: thumbs.map((t) => ({
+                atSec: t.atSec,
+                key: videoThumbKey(upload.projectId, videoId, t.atSec),
+                width: t.width,
+                height: t.height,
+              })),
+            },
           },
-        },
-      });
-      return v;
-    }),
-  );
+        });
+        return v;
+      }),
+    );
+  } catch (err) {
+    if (isForeignKeyError(err)) {
+      await cleanupOrphanedMedia(videoPrefix);
+      return { kind: "failure", error: "project deleted during media upload" };
+    }
+    throw err;
+  }
   return { kind: "success", videoId: created.id };
 }
 
@@ -260,39 +295,51 @@ async function runAudioTask(upload: Upload): Promise<TaskResult> {
   const keepRaw = isBrowserPlayableAudio(probe.audioStream.codec, probe.formatName);
   const transcodedKey = audioTranscodedKey(upload.projectId, audioId);
   const rawKey = keepRaw ? audioRawKey(upload.projectId, audioId, ext) : null;
-
+  const audioPrefix = `${projectKey(upload.projectId)}/audios/${audioId}/`;
+  if (!(await projectExists(upload.projectId))) {
+    return { kind: "failure", error: "project deleted before media upload" };
+  }
   await awaitAllOrAggregate([
     uploadFile(transcodedKey, transcodedPath, "audio/mp4"),
     ...(rawKey ? [uploadFile(rawKey, inputPath, contentType)] : []),
   ]);
 
   const duration = finalProbe.durationSec;
-  const created = await withSlotRetry(() =>
-    prisma.$transaction(async (tx) => {
-      const { order, projStart } = await allocSlot(tx, upload.projectId);
-      const a = await tx.audio.create({
-        data: {
-          id: audioId,
-          projectId: upload.projectId,
-          order,
-          name: upload.fileName || "audio",
-          audioKey: transcodedKey,
-          rawKey,
-          rawContentType: keepRaw ? contentType : null,
-          durationSec: duration,
-          sampleRate: finalProbe.audioStream?.sampleRate || null,
-          channels: finalProbe.audioStream?.channels || null,
-          bitrate: finalProbe.audioStream?.bitrate ?? null,
-          sizeBytes: BigInt(finalProbe.sizeBytes),
-          srcStartSec: 0,
-          srcEndSec: duration,
-          projStartSec: projStart,
-          projEndSec: projStart + duration,
-        },
-      });
-      return a;
-    }),
-  );
+  let created;
+  try {
+    created = await withSlotRetry(() =>
+      prisma.$transaction(async (tx) => {
+        const { order, projStart } = await allocSlot(tx, upload.projectId);
+        const a = await tx.audio.create({
+          data: {
+            id: audioId,
+            projectId: upload.projectId,
+            order,
+            name: upload.fileName || "audio",
+            audioKey: transcodedKey,
+            rawKey,
+            rawContentType: keepRaw ? contentType : null,
+            durationSec: duration,
+            sampleRate: finalProbe.audioStream?.sampleRate || null,
+            channels: finalProbe.audioStream?.channels || null,
+            bitrate: finalProbe.audioStream?.bitrate ?? null,
+            sizeBytes: BigInt(finalProbe.sizeBytes),
+            srcStartSec: 0,
+            srcEndSec: duration,
+            projStartSec: projStart,
+            projEndSec: projStart + duration,
+          },
+        });
+        return a;
+      }),
+    );
+  } catch (err) {
+    if (isForeignKeyError(err)) {
+      await cleanupOrphanedMedia(audioPrefix);
+      return { kind: "failure", error: "project deleted during media upload" };
+    }
+    throw err;
+  }
   return { kind: "success", audioId: created.id };
 }
 

@@ -30,6 +30,9 @@ import {
 
 // upload 完了前に死んだチャンクは 1h grace の DeletionMark + sweeper で回収する
 export const UPLOAD_EXPIRY_MS = 60 * 60 * 1000;
+// /complete 後に task が走り終わるまで sweeper に回収されないよう mark を伸ばす。
+// MAX_DURATION_SEC (1h) の transcode + upload に余裕を持たせた grace
+export const TASK_GRACE_MS = 4 * 60 * 60 * 1000;
 
 // chunk size の許容範囲。client が指定する。multipart の S3 minimum (5MiB) と
 // 単一 request にメモリ展開しても安全な上限を考慮した範囲
@@ -283,8 +286,20 @@ export const projects = new Hono<AuthContext>()
       if (!Number.isInteger(index) || index < 0 || index >= upload.totalChunks) {
         return c.json({ error: `chunk index out of range [0, ${upload.totalChunks})` }, 400);
       }
-      const declared = Number(c.req.header("content-length") ?? "");
-      if (Number.isFinite(declared) && declared > MAX_SINGLE_CHUNK_BYTES) {
+      // 既存 S3 オブジェクトを上書き破壊しないよう、Content-Length を必須にして
+      // chunkSize 違反は write 前に reject する (CL なし=真の chunked は 411)
+      const declaredRaw = c.req.header("content-length");
+      if (declaredRaw == null) {
+        return c.json({ error: "content-length header required" }, 411);
+      }
+      const declared = Number(declaredRaw);
+      if (!Number.isFinite(declared) || declared < 0 || !Number.isInteger(declared)) {
+        return c.json({ error: "content-length must be a non-negative integer" }, 400);
+      }
+      if (declared > upload.chunkSize) {
+        return c.json({ error: `chunk exceeds declared chunkSize ${upload.chunkSize}` }, 413);
+      }
+      if (declared > MAX_SINGLE_CHUNK_BYTES) {
         return c.json({ error: `chunk too large (max ${MAX_SINGLE_CHUNK_BYTES} bytes)` }, 413);
       }
       const contentType = c.req.header("content-type") ?? "application/octet-stream";
@@ -298,8 +313,9 @@ export const projects = new Hono<AuthContext>()
           500,
         );
       }
+      // クライアントが CL で嘘をついて多く送ってきた防衛策。CL を信じて write 前検証
+      // を通したあとに size > chunkSize にはならない想定だが念のため
       if (size > upload.chunkSize) {
-        // chunkSize は client 申告。違反したら S3 に書いた行ごと破棄
         await getS3()
           .delete(key)
           .catch(() => {});
@@ -362,50 +378,74 @@ export const projects = new Hono<AuthContext>()
     const { id, uploadId } = c.req.valid("param");
     const project = await findProjectOr404(user.id, id);
     if (!project) return c.json({ error: "project not found" }, 404);
-    const upload = await prisma.upload.findFirst({
-      where: { id: uploadId, projectId: project.id },
-      include: { chunks: { select: { index: true, sizeBytes: true } } },
-    });
-    if (!upload) return c.json({ error: "upload not found" }, 404);
-    if (upload.status === "completed") {
-      const task = await prisma.task.findFirst({
-        where: { uploadId: upload.id },
-        orderBy: { createdAt: "desc" },
-      });
-      if (task) return c.json({ task: toApiTask(task) satisfies ApiTask });
-      return c.json({ error: "completed upload has no task" }, 500);
-    }
-    if (upload.status !== "pending") {
-      return c.json({ error: `upload is ${upload.status}` }, 409);
-    }
-    if (upload.expiresAt.getTime() <= Date.now()) {
-      return c.json({ error: "upload expired" }, 410);
-    }
-    if (upload.chunks.length !== upload.totalChunks) {
-      return c.json(
-        {
-          error: `missing chunks: received ${upload.chunks.length}/${upload.totalChunks}`,
-        },
-        400,
-      );
-    }
-    const seen = new Set(upload.chunks.map((chunk) => chunk.index));
-    for (let i = 0; i < upload.totalChunks; i++) {
-      if (!seen.has(i)) {
-        return c.json({ error: `missing chunk ${i}` }, 400);
-      }
-    }
-    const sum = upload.chunks.reduce((acc, chunk) => acc + chunk.sizeBytes, 0n);
-    if (sum !== upload.totalBytes) {
-      return c.json(
-        { error: `byte total mismatch: received ${sum}, declared ${upload.totalBytes}` },
-        400,
-      );
-    }
 
-    const task = await prisma.$transaction(async (tx) => {
-      await tx.upload.update({ where: { id: upload.id }, data: { status: "completed" } });
-      return await tx.task.create({
+    // 並行 /complete を直列化するため、validate と claim を 1 つの transaction に置く。
+    // updateMany({where: status:"pending"}) で claim を原子化し、count==0 なら race 敗北
+    type CompleteOutcome =
+      | { kind: "claimed"; task: ApiTask }
+      | { kind: "race_lost"; task: ApiTask }
+      | {
+          kind: "error";
+          status: 400 | 404 | 409 | 410 | 500;
+          error: string;
+        };
+    const outcome: CompleteOutcome = await prisma.$transaction(async (tx) => {
+      const upload = await tx.upload.findFirst({
+        where: { id: uploadId, projectId: project.id },
+        include: { chunks: { select: { index: true, sizeBytes: true } } },
+      });
+      if (!upload) {
+        return { kind: "error", status: 404, error: "upload not found" };
+      }
+      if (upload.status === "completed") {
+        const existing = await tx.task.findFirst({
+          where: { uploadId: upload.id },
+          orderBy: { createdAt: "desc" },
+        });
+        if (existing) return { kind: "race_lost", task: toApiTask(existing) };
+        return { kind: "error", status: 500, error: "completed upload has no task" };
+      }
+      if (upload.status !== "pending") {
+        return { kind: "error", status: 409, error: `upload is ${upload.status}` };
+      }
+      if (upload.expiresAt.getTime() <= Date.now()) {
+        return { kind: "error", status: 410, error: "upload expired" };
+      }
+      if (upload.chunks.length !== upload.totalChunks) {
+        return {
+          kind: "error",
+          status: 400,
+          error: `missing chunks: received ${upload.chunks.length}/${upload.totalChunks}`,
+        };
+      }
+      const seen = new Set(upload.chunks.map((chunk) => chunk.index));
+      for (let i = 0; i < upload.totalChunks; i++) {
+        if (!seen.has(i)) {
+          return { kind: "error", status: 400, error: `missing chunk ${i}` };
+        }
+      }
+      const sum = upload.chunks.reduce((acc, chunk) => acc + chunk.sizeBytes, 0n);
+      if (sum !== upload.totalBytes) {
+        return {
+          kind: "error",
+          status: 400,
+          error: `byte total mismatch: received ${sum}, declared ${upload.totalBytes}`,
+        };
+      }
+      // atomic claim: 同時 /complete のもう一方は count=0 で抜ける
+      const claimed = await tx.upload.updateMany({
+        where: { id: upload.id, status: "pending" },
+        data: { status: "completed" },
+      });
+      if (claimed.count === 0) {
+        const existing = await tx.task.findFirst({
+          where: { uploadId: upload.id },
+          orderBy: { createdAt: "desc" },
+        });
+        if (existing) return { kind: "race_lost", task: toApiTask(existing) };
+        return { kind: "error", status: 500, error: "race lost but no task found" };
+      }
+      const task = await tx.task.create({
         data: {
           projectId: project.id,
           type: upload.kind === "video" ? "video_validation" : "audio_validation",
@@ -413,9 +453,18 @@ export const projects = new Hono<AuthContext>()
           status: "pending",
         },
       });
+      // task 走行中に sweeper に chunks を消されないよう mark の grace を伸ばす。
+      // task 完了時に executeTask が prefix と一緒に mark を消す
+      await tx.deletionMark.updateMany({
+        where: { prefix: uploadPrefix(project.id, upload.id) },
+        data: { nextRetryAt: new Date(Date.now() + TASK_GRACE_MS) },
+      });
+      return { kind: "claimed", task: toApiTask(task) };
     });
-    enqueueTask(task.id);
-    return c.json({ task: toApiTask(task) satisfies ApiTask }, 201);
+
+    if (outcome.kind === "error") return c.json({ error: outcome.error }, outcome.status);
+    if (outcome.kind === "claimed") enqueueTask(outcome.task.id);
+    return c.json({ task: outcome.task satisfies ApiTask }, outcome.kind === "claimed" ? 201 : 200);
   })
 
   // pending な upload の自発キャンセル用。completed 後は task が chunks を必要とするので拒否

@@ -7,7 +7,7 @@ import { waitForInflightTasks } from "../lib/task-runner";
 import { useDbFixture } from "../test-fixtures/db";
 import { useMediaFixture } from "../test-fixtures/media";
 import { useS3Fixture } from "../test-fixtures/s3";
-import { UPLOAD_EXPIRY_MS, projects } from "./projects";
+import { TASK_GRACE_MS, UPLOAD_EXPIRY_MS, projects } from "./projects";
 import type { ApiProjectDetail, ApiTask, ApiUpload } from "./types";
 
 useDbFixture();
@@ -60,7 +60,12 @@ async function uploadChunked(
     const slice = bytes.slice(start, end);
     const res = await app.request(`/api/projects/${projectId}/uploads/${upload.id}/chunks/${i}`, {
       method: "PUT",
-      headers: { ...DEV_HEADERS, "content-type": contentType },
+      headers: {
+        ...DEV_HEADERS,
+        "content-type": contentType,
+        // app.request は body から CL を自動付与しないので手で乗せる (本番は fetch が送る)
+        "content-length": String(slice.byteLength),
+      },
       body: slice,
     });
     expect(res.status).toBe(200);
@@ -247,7 +252,11 @@ describe("chunked upload + media validation task", () => {
     const upload = ((await create.json()) as { upload: ApiUpload }).upload;
     await app.request(`/api/projects/${pid}/uploads/${upload.id}/chunks/0`, {
       method: "PUT",
-      headers: { ...DEV_HEADERS, "content-type": "application/octet-stream" },
+      headers: {
+        ...DEV_HEADERS,
+        "content-type": "application/octet-stream",
+        "content-length": "4",
+      },
       body: new Uint8Array([1, 2, 3, 4]),
     });
     expect(await getS3().exists(uploadChunkKey(pid, upload.id, 0))).toBe(true);
@@ -290,7 +299,11 @@ describe("chunked upload + media validation task", () => {
     // 正規に chunk 0 を入れて /complete を通す
     await app.request(`/api/projects/${pid}/uploads/${upload.id}/chunks/0`, {
       method: "PUT",
-      headers: { ...DEV_HEADERS, "content-type": "application/octet-stream" },
+      headers: {
+        ...DEV_HEADERS,
+        "content-type": "application/octet-stream",
+        "content-length": "4",
+      },
       body: new Uint8Array([1, 2, 3, 4]),
     });
     const complete = await app.request(`/api/projects/${pid}/uploads/${upload.id}/complete`, {
@@ -301,7 +314,11 @@ describe("chunked upload + media validation task", () => {
     // 後から遅延 PUT が来たケースをシミュレート (chunk 内容が違う)
     const retry = await app.request(`/api/projects/${pid}/uploads/${upload.id}/chunks/0`, {
       method: "PUT",
-      headers: { ...DEV_HEADERS, "content-type": "application/octet-stream" },
+      headers: {
+        ...DEV_HEADERS,
+        "content-type": "application/octet-stream",
+        "content-length": "4",
+      },
       body: new Uint8Array([9, 9, 9, 9]),
     });
     // pre-write でも post-write でも完了済み判定で 409
@@ -337,6 +354,131 @@ describe("chunked upload + media validation task", () => {
     await waitForInflightTasks();
   }, 60_000);
 
+  it("/complete は upload prefix の DeletionMark の nextRetryAt を TASK_GRACE_MS 先に伸ばす", async () => {
+    process.env.NODE_ENV = "development";
+    const app = appWithProjects();
+    const pid = await createProject(app, "chunk-bump-mark");
+    const bytes = new Uint8Array(await Bun.file(getMedia().audioMp3).arrayBuffer());
+    const before = Date.now();
+    const { upload } = await uploadChunked(
+      app,
+      pid,
+      "audio",
+      "tone.mp3",
+      bytes,
+      bytes.byteLength,
+      "audio/mpeg",
+    );
+    const prefix = uploadPrefix(pid, upload.id);
+    const mark = await prisma.deletionMark.findFirst({ where: { prefix } });
+    if (mark) {
+      // /complete が走った瞬間に nextRetryAt が now+TASK_GRACE_MS に書き直されている。
+      // 後段の task cleanup で削除される前を観測するため raw select
+      const delta = mark.nextRetryAt.getTime() - before;
+      expect(delta).toBeGreaterThanOrEqual(TASK_GRACE_MS - 1000);
+    }
+    // 任意: task を走らせきって安定化させる
+    await waitForInflightTasks();
+  }, 120_000);
+
+  it("並行 /complete は片方が race_lost で 200 を返し task は 1 つだけ", async () => {
+    process.env.NODE_ENV = "development";
+    const app = appWithProjects();
+    const pid = await createProject(app, "chunk-race-complete");
+    const bytes = new Uint8Array(await Bun.file(getMedia().audioMp3).arrayBuffer());
+    const create = await app.request(`/api/projects/${pid}/uploads`, {
+      method: "POST",
+      headers: { ...DEV_HEADERS, "content-type": "application/json" },
+      body: JSON.stringify({
+        kind: "audio",
+        fileName: "tone.mp3",
+        totalBytes: bytes.byteLength,
+        chunkSize: bytes.byteLength,
+        contentType: "audio/mpeg",
+      }),
+    });
+    const upload = ((await create.json()) as { upload: ApiUpload }).upload;
+    await app.request(`/api/projects/${pid}/uploads/${upload.id}/chunks/0`, {
+      method: "PUT",
+      headers: {
+        ...DEV_HEADERS,
+        "content-type": "audio/mpeg",
+        "content-length": String(bytes.byteLength),
+      },
+      body: bytes,
+    });
+    // 並列に 2 つ撃つ
+    const [a, b] = await Promise.all([
+      app.request(`/api/projects/${pid}/uploads/${upload.id}/complete`, {
+        method: "POST",
+        headers: DEV_HEADERS,
+      }),
+      app.request(`/api/projects/${pid}/uploads/${upload.id}/complete`, {
+        method: "POST",
+        headers: DEV_HEADERS,
+      }),
+    ]);
+    const statuses = [a.status, b.status].toSorted();
+    expect(statuses).toEqual([200, 201]);
+    const ja = (await a.json()) as { task: ApiTask };
+    const jb = (await b.json()) as { task: ApiTask };
+    expect(ja.task.id).toBe(jb.task.id);
+    await waitForInflightTasks();
+    const tasks = await prisma.task.findMany({ where: { uploadId: upload.id } });
+    expect(tasks).toHaveLength(1);
+  }, 120_000);
+
+  it("chunkSize 超過 body の chunk PUT は write 前に 413 で reject される (既存 S3 を保護)", async () => {
+    process.env.NODE_ENV = "development";
+    const app = appWithProjects();
+    const pid = await createProject(app, "chunk-oversize");
+    const chunkSize = 4;
+    const create = await app.request(`/api/projects/${pid}/uploads`, {
+      method: "POST",
+      headers: { ...DEV_HEADERS, "content-type": "application/json" },
+      body: JSON.stringify({
+        kind: "audio",
+        fileName: "x.bin",
+        totalBytes: chunkSize,
+        chunkSize: 1024, // valibot minimum 1024 を満たす上で、API 上の chunkSize >= 1024 確保
+      }),
+    });
+    const upload = ((await create.json()) as { upload: ApiUpload }).upload;
+    // 正規 chunk を書く
+    const ok = await app.request(`/api/projects/${pid}/uploads/${upload.id}/chunks/0`, {
+      method: "PUT",
+      headers: {
+        ...DEV_HEADERS,
+        "content-type": "application/octet-stream",
+        "content-length": "4",
+      },
+      body: new Uint8Array([1, 2, 3, 4]),
+    });
+    expect(ok.status).toBe(200);
+    const stored = await getS3()
+      .file(uploadChunkKey(pid, upload.id, 0))
+      .arrayBuffer();
+    expect(stored.byteLength).toBe(4);
+    // chunkSize 超過 body を投げて 413 (chunkSize=1024 に対し 2048 byte)
+    const big = new Uint8Array(2048);
+    const oversize = await app.request(`/api/projects/${pid}/uploads/${upload.id}/chunks/0`, {
+      method: "PUT",
+      headers: {
+        ...DEV_HEADERS,
+        "content-type": "application/octet-stream",
+        "content-length": String(big.byteLength),
+      },
+      body: big,
+    });
+    expect(oversize.status).toBe(413);
+    // 既存 S3 chunk が破壊されていないこと
+    const stillStored = await getS3()
+      .file(uploadChunkKey(pid, upload.id, 0))
+      .arrayBuffer();
+    expect(stillStored.byteLength).toBe(4);
+    expect(new Uint8Array(stillStored)).toEqual(new Uint8Array([1, 2, 3, 4]));
+  });
+
   it("aborted upload への chunk PUT も 409", async () => {
     process.env.NODE_ENV = "development";
     const app = appWithProjects();
@@ -359,7 +501,11 @@ describe("chunked upload + media validation task", () => {
     expect(del.status).toBe(204);
     const put = await app.request(`/api/projects/${pid}/uploads/${upload.id}/chunks/0`, {
       method: "PUT",
-      headers: { ...DEV_HEADERS, "content-type": "application/octet-stream" },
+      headers: {
+        ...DEV_HEADERS,
+        "content-type": "application/octet-stream",
+        "content-length": "4",
+      },
       body: new Uint8Array([1, 2, 3, 4]),
     });
     expect(put.status).toBe(409);
