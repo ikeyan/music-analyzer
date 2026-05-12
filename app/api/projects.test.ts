@@ -3,11 +3,11 @@ import { Hono } from "hono";
 import { prisma } from "../lib/prisma";
 import { getS3 } from "../lib/s3";
 import { uploadChunkKey, uploadPrefix } from "../lib/storage";
-import { waitForInflightTasks } from "../lib/task-runner";
+import { TASK_GRACE_MS, recoverTasksOnStartup, waitForInflightTasks } from "../lib/task-runner";
 import { useDbFixture } from "../test-fixtures/db";
 import { useMediaFixture } from "../test-fixtures/media";
 import { useS3Fixture } from "../test-fixtures/s3";
-import { TASK_GRACE_MS, UPLOAD_EXPIRY_MS, projects } from "./projects";
+import { UPLOAD_EXPIRY_MS, projects } from "./projects";
 import type { ApiProjectDetail, ApiTask, ApiUpload } from "./types";
 
 useDbFixture();
@@ -478,6 +478,63 @@ describe("chunked upload + media validation task", () => {
     expect(stillStored.byteLength).toBe(4);
     expect(new Uint8Array(stillStored)).toEqual(new Uint8Array([1, 2, 3, 4]));
   });
+
+  it("recoverTasksOnStartup は pending task の upload prefix の DeletionMark を引き直す", async () => {
+    process.env.NODE_ENV = "development";
+    const app = appWithProjects();
+    const pid = await createProject(app, "recover-mark");
+    // upload + complete で pending task を作る
+    const bytes = new Uint8Array(await Bun.file(getMedia().audioMp3).arrayBuffer());
+    const create = await app.request(`/api/projects/${pid}/uploads`, {
+      method: "POST",
+      headers: { ...DEV_HEADERS, "content-type": "application/json" },
+      body: JSON.stringify({
+        kind: "audio",
+        fileName: "tone.mp3",
+        totalBytes: bytes.byteLength,
+        chunkSize: bytes.byteLength,
+        contentType: "audio/mpeg",
+      }),
+    });
+    const upload = ((await create.json()) as { upload: ApiUpload }).upload;
+    await app.request(`/api/projects/${pid}/uploads/${upload.id}/chunks/0`, {
+      method: "PUT",
+      headers: {
+        ...DEV_HEADERS,
+        "content-type": "audio/mpeg",
+        "content-length": String(bytes.byteLength),
+      },
+      body: bytes,
+    });
+    // task 完了を待たずに先に走っている in-flight task を全部しずめる
+    // (succeeded で cleanup されると DeletionMark が消えてしまうので
+    // /complete から手動で task を pending のまま用意する)
+    const completeTx = await prisma.$transaction(async (tx) => {
+      await tx.upload.update({ where: { id: upload.id }, data: { status: "completed" } });
+      return await tx.task.create({
+        data: { projectId: pid, type: "audio_validation", uploadId: upload.id, status: "pending" },
+      });
+    });
+    // mark を強制的に過去日付に倒す (再起動間際を再現)
+    const prefix = uploadPrefix(pid, upload.id);
+    await prisma.deletionMark.updateMany({
+      where: { prefix },
+      data: { nextRetryAt: new Date(Date.now() - 10_000) },
+    });
+    // recovery → mark が未来へ引き直される
+    const before = Date.now();
+    await recoverTasksOnStartup();
+    const mark = await prisma.deletionMark.findFirst({ where: { prefix } });
+    if (!mark) {
+      // task が走り切って prefix 削除済みなら mark もなくなっている = それも OK
+      await waitForInflightTasks();
+      const tasks = await prisma.task.findMany({ where: { id: completeTx.id } });
+      expect(tasks[0]?.status === "succeeded" || tasks[0]?.status === "failed").toBe(true);
+      return;
+    }
+    expect(mark.nextRetryAt.getTime()).toBeGreaterThanOrEqual(before + TASK_GRACE_MS - 1000);
+    await waitForInflightTasks();
+  }, 120_000);
 
   it("aborted upload への chunk PUT も 409", async () => {
     process.env.NODE_ENV = "development";

@@ -1,5 +1,9 @@
 import { extname, join } from "node:path";
 import type { Upload } from "../generated/prisma/client";
+
+// /complete 後に task が走り終わるまで sweeper に回収されないよう mark を伸ばす grace。
+// MAX_DURATION_SEC (1h) の transcode + upload に余裕を持たせた値
+export const TASK_GRACE_MS = 4 * 60 * 60 * 1000;
 import {
   MAX_DURATION_SEC,
   extractAudio,
@@ -434,19 +438,29 @@ export async function waitForInflightTasks(): Promise<void> {
 }
 
 // 起動時に「running のまま残った」task は前 process が落ちた事を意味するので
-// failed へ落とす。pending は再 enqueue して実行を継続させる
+// failed へ落とす。pending は再 enqueue して実行を継続させる。
+// 4h grace ギリギリの再起動で sweeper が走ると chunks が消える窓があるので
+// 再 enqueue 前に DeletionMark.nextRetryAt を引き直す
 export async function recoverTasksOnStartup(): Promise<void> {
   const orphaned = await prisma.task.updateMany({
     where: { status: "running" },
     data: { status: "failed", error: "process restarted during task", finishedAt: new Date() },
   });
   if (orphaned.count > 0) {
-    // ログのため stderr に1行
     console.error(`task-runner: marked ${orphaned.count} orphaned tasks as failed`);
   }
   const pending = await prisma.task.findMany({
     where: { status: "pending" },
-    select: { id: true },
+    select: { id: true, upload: { select: { id: true, projectId: true } } },
   });
-  for (const t of pending) enqueueTask(t.id);
+  const refreshAt = new Date(Date.now() + TASK_GRACE_MS);
+  for (const t of pending) {
+    if (t.upload) {
+      await prisma.deletionMark.updateMany({
+        where: { prefix: uploadPrefix(t.upload.projectId, t.upload.id) },
+        data: { nextRetryAt: refreshAt },
+      });
+    }
+    enqueueTask(t.id);
+  }
 }

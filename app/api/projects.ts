@@ -14,7 +14,7 @@ import {
   uploadChunkKey,
   deletePrefix,
 } from "../lib/storage";
-import { enqueueTask } from "../lib/task-runner";
+import { TASK_GRACE_MS, enqueueTask } from "../lib/task-runner";
 import {
   type ApiProject,
   type ApiProjectDetail,
@@ -30,9 +30,6 @@ import {
 
 // upload 完了前に死んだチャンクは 1h grace の DeletionMark + sweeper で回収する
 export const UPLOAD_EXPIRY_MS = 60 * 60 * 1000;
-// /complete 後に task が走り終わるまで sweeper に回収されないよう mark を伸ばす。
-// MAX_DURATION_SEC (1h) の transcode + upload に余裕を持たせた grace
-export const TASK_GRACE_MS = 4 * 60 * 60 * 1000;
 
 // chunk size の許容範囲。client が指定する。multipart の S3 minimum (5MiB) と
 // 単一 request にメモリ展開しても安全な上限を考慮した範囲

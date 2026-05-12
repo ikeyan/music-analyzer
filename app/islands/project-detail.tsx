@@ -9,7 +9,9 @@ export type ProjectDetailData = ApiProjectDetail;
 
 const UPLOAD_CHUNK_SIZE = 8 * 1024 * 1024;
 const TASK_POLL_INTERVAL_MS = 500;
-const TASK_POLL_TIMEOUT_MS = 10 * 60 * 1000;
+// backend の TASK_GRACE_MS と揃える。1h 動画は transcode に数十分かかるので
+// 短い hard deadline で諦めると task は完了するのに UI 側だけ放棄してしまう
+const TASK_POLL_TIMEOUT_MS = 4 * 60 * 60 * 1000;
 
 type Track = { kind: "video"; data: VideoItem } | { kind: "audio"; data: AudioItem };
 
