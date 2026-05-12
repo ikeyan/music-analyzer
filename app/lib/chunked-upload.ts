@@ -6,7 +6,9 @@ export const UPLOAD_CHUNK_SIZE = 8 * 1024 * 1024;
 
 export type ChunkedUploadClient = ReturnType<typeof hc<AppType>>;
 
-export type ChunkedUploadResult = { ok: true; task: ApiTask } | { error: string; status: number };
+export type ChunkedUploadResult =
+  | { ok: true; task: ApiTask }
+  | { ok: false; error: string; status: number };
 
 export async function chunkedUpload(
   client: ChunkedUploadClient,
@@ -48,7 +50,11 @@ export async function chunkedUpload(
   return { ok: true, task };
 }
 
-async function readError(res: Response): Promise<{ error: string; status: number }> {
+async function readError(res: Response): Promise<{ ok: false; error: string; status: number }> {
   const body = (await res.json().catch(() => ({}))) as { error?: string };
-  return { error: body.error ?? "(no error message in response body)", status: res.status };
+  return {
+    ok: false,
+    error: body.error ?? "(no error message in response body)",
+    status: res.status,
+  };
 }

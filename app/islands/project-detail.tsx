@@ -123,7 +123,7 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
         file.name,
         file.type || undefined,
       );
-      if ("error" in result) {
+      if (!result.ok) {
         const label = kind === "video" ? "動画" : "音声";
         setError(`${label} upload 失敗 (HTTP ${result.status}): ${result.error}`);
         return;

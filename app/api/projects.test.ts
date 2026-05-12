@@ -69,27 +69,19 @@ async function createUploadOk(
   return (await res.json()).upload;
 }
 
-function asBlob(bytes: Uint8Array): Blob {
-  // ArrayBufferLike 制約を ArrayBuffer に絞ってから Blob に渡す
-  return new Blob([bytes as Uint8Array<ArrayBuffer>]);
-}
-
 async function putRawChunk(
   client: ChunkedUploadClient,
   projectId: string,
   uploadId: string,
   index: number,
-  body: Uint8Array,
+  body: Uint8Array<ArrayBuffer>,
   contentType = "application/octet-stream",
 ): Promise<Response> {
   return await client.projects[":id"].uploads[":uploadId"].chunks[":index"].$put(
     { param: { id: projectId, uploadId, index: String(index) } },
     // headers は per-call options に置く (init.headers だと hc が hc-level headers を
     // 上書きしてしまう)
-    {
-      init: { body: body as Uint8Array<ArrayBuffer> },
-      headers: { "content-type": contentType },
-    },
+    { init: { body }, headers: { "content-type": contentType } },
   );
 }
 
@@ -98,44 +90,30 @@ async function uploadOk(
   projectId: string,
   kind: "video" | "audio",
   fileName: string,
-  bytes: Uint8Array,
+  source: Blob,
   chunkSize: number,
   contentType: string,
-): Promise<{ upload: ApiUpload; task: ApiTask }> {
+): Promise<{ upload: UploadRow; task: ApiTask }> {
   const result = await chunkedUpload(
     client,
     projectId,
     kind,
-    asBlob(bytes),
+    source,
     fileName,
     contentType,
     chunkSize,
   );
-  if (!("ok" in result)) {
+  if (!result.ok) {
     throw new Error(`uploadOk: chunkedUpload failed status=${result.status} err=${result.error}`);
   }
   const task = result.task;
-  // chunkedUpload は task しか返さないので Upload row は task.uploadId 経由で取り直す
-  const row = await prisma.upload.findFirstOrThrow({
+  const upload = await prisma.upload.findFirstOrThrow({
     where: { id: task.uploadId ?? "", tasks: { some: { id: task.id } } },
   });
-  const upload: ApiUpload = {
-    id: row.id,
-    projectId: row.projectId,
-    kind: row.kind as "video" | "audio",
-    fileName: row.fileName,
-    contentType: row.contentType,
-    totalBytes: Number(row.totalBytes),
-    chunkSize: row.chunkSize,
-    totalChunks: row.totalChunks,
-    receivedBytes: Number(row.receivedBytes),
-    status: row.status as "pending" | "completed" | "aborted",
-    expiresAt: row.expiresAt.toISOString(),
-    createdAt: row.createdAt.toISOString(),
-    updatedAt: row.updatedAt.toISOString(),
-  };
   return { task, upload };
 }
+
+type UploadRow = Awaited<ReturnType<typeof prisma.upload.findFirstOrThrow>>;
 
 async function pollTaskUntil(
   client: ChunkedUploadClient,
@@ -161,8 +139,8 @@ async function pollTaskUntil(
 function expectError(
   result: ChunkedUploadResult,
   status: number,
-): { error: string; status: number } {
-  if ("ok" in result) throw new Error(`expected error, got ok task=${result.task.id}`);
+): { ok: false; error: string; status: number } {
+  if (result.ok) throw new Error(`expected error, got ok task=${result.task.id}`);
   expect(result.status).toBe(status);
   return result;
 }
@@ -171,13 +149,13 @@ describe("chunked upload + media validation task", () => {
   it("audio: 複数チャンクで送って task が succeeded で Audio 行が生える", async () => {
     const client = makeClient();
     const pid = await createProject(client, "chunk-audio");
-    const bytes = new Uint8Array(await Bun.file(getMedia().audioMp3).arrayBuffer());
+    const file = Bun.file(getMedia().audioMp3);
     const { upload, task } = await uploadOk(
       client,
       pid,
       "audio",
       "tone.mp3",
-      bytes,
+      file,
       1024,
       "audio/mpeg",
     );
@@ -207,16 +185,8 @@ describe("chunked upload + media validation task", () => {
   it("video: 単一チャンクでも upload → task succeeded で Video 行が生える", async () => {
     const client = makeClient();
     const pid = await createProject(client, "chunk-video");
-    const bytes = new Uint8Array(await Bun.file(getMedia().videoMp4).arrayBuffer());
-    const { task } = await uploadOk(
-      client,
-      pid,
-      "video",
-      "clip.mp4",
-      bytes,
-      bytes.byteLength,
-      "video/mp4",
-    );
+    const file = Bun.file(getMedia().videoMp4);
+    const { task } = await uploadOk(client, pid, "video", "clip.mp4", file, file.size, "video/mp4");
     const finished = await pollTaskUntil(
       client,
       pid,
@@ -231,14 +201,14 @@ describe("chunked upload + media validation task", () => {
   it("invalid media は task が failed になりエラー文言が乗る", async () => {
     const client = makeClient();
     const pid = await createProject(client, "chunk-bad");
-    const bytes = new TextEncoder().encode("not media");
+    const blob = new Blob(["not media"]);
     const { task } = await uploadOk(
       client,
       pid,
       "audio",
       "garbage.bin",
-      bytes,
-      Math.max(bytes.byteLength, 1024),
+      blob,
+      Math.max(blob.size, 1024),
       "application/octet-stream",
     );
     const finished = await pollTaskUntil(
@@ -327,8 +297,15 @@ describe("chunked upload + media validation task", () => {
   it("waitForInflightTasks は task 完了後に解決する", async () => {
     const client = makeClient();
     const pid = await createProject(client, "chunk-wait");
-    const bytes = new Uint8Array(await Bun.file(getMedia().audioMp3).arrayBuffer());
-    await uploadOk(client, pid, "audio", "tone.mp3", bytes, 1024, "audio/mpeg");
+    await uploadOk(
+      client,
+      pid,
+      "audio",
+      "tone.mp3",
+      Bun.file(getMedia().audioMp3),
+      1024,
+      "audio/mpeg",
+    );
     await waitForInflightTasks();
     const tasks = await prisma.task.findMany({ where: { projectId: pid } });
     expect(tasks.every((t) => t.status === "succeeded" || t.status === "failed")).toBe(true);
@@ -356,14 +333,14 @@ describe("chunked upload + media validation task", () => {
   it("completed upload の DELETE は 409 で拒否し chunks を消さない", async () => {
     const client = makeClient();
     const pid = await createProject(client, "chunk-abort-completed");
-    const bytes = new Uint8Array(await Bun.file(getMedia().audioMp3).arrayBuffer());
+    const file = Bun.file(getMedia().audioMp3);
     const { upload } = await uploadOk(
       client,
       pid,
       "audio",
       "tone.mp3",
-      bytes,
-      bytes.byteLength,
+      file,
+      file.size,
       "audio/mpeg",
     );
     const del = await client.projects[":id"].uploads[":uploadId"].$delete({
@@ -378,15 +355,15 @@ describe("chunked upload + media validation task", () => {
   it("/complete は upload prefix の DeletionMark の nextRetryAt を TASK_GRACE_MS 先に伸ばす", async () => {
     const client = makeClient();
     const pid = await createProject(client, "chunk-bump-mark");
-    const bytes = new Uint8Array(await Bun.file(getMedia().audioMp3).arrayBuffer());
+    const file = Bun.file(getMedia().audioMp3);
     const before = Date.now();
     const { upload } = await uploadOk(
       client,
       pid,
       "audio",
       "tone.mp3",
-      bytes,
-      bytes.byteLength,
+      file,
+      file.size,
       "audio/mpeg",
     );
     const prefix = uploadPrefix(pid, upload.id);
@@ -481,14 +458,14 @@ describe("chunked upload + media validation task", () => {
   it("task 成功時 media prefix の DeletionMark が消える (途中失敗時は残る)", async () => {
     const client = makeClient();
     const pid = await createProject(client, "media-mark-cleanup");
-    const bytes = new Uint8Array(await Bun.file(getMedia().audioMp3).arrayBuffer());
+    const file = Bun.file(getMedia().audioMp3);
     const { task } = await uploadOk(
       client,
       pid,
       "audio",
       "tone.mp3",
-      bytes,
-      bytes.byteLength,
+      file,
+      file.size,
       "audio/mpeg",
     );
     await pollTaskUntil(client, pid, task.id, (t) => t.status === "succeeded", 60_000);
@@ -539,14 +516,14 @@ describe("chunked upload + media validation task", () => {
   it("Audio.create と task succeeded は同一 tx で commit される (中間状態が観測不可)", async () => {
     const client = makeClient();
     const pid = await createProject(client, "task-atomic");
-    const bytes = new Uint8Array(await Bun.file(getMedia().audioMp3).arrayBuffer());
+    const file = Bun.file(getMedia().audioMp3);
     const { task } = await uploadOk(
       client,
       pid,
       "audio",
       "tone.mp3",
-      bytes,
-      bytes.byteLength,
+      file,
+      file.size,
       "audio/mpeg",
     );
     await pollTaskUntil(client, pid, task.id, (t) => t.status === "succeeded", 60_000);
@@ -561,8 +538,15 @@ describe("chunked upload + media validation task", () => {
   it("task 完了後は UploadChunk 行も S3 prefix と一緒に削除される", async () => {
     const client = makeClient();
     const pid = await createProject(client, "chunk-rows-cleanup");
-    const bytes = new Uint8Array(await Bun.file(getMedia().audioMp3).arrayBuffer());
-    const { upload } = await uploadOk(client, pid, "audio", "tone.mp3", bytes, 1024, "audio/mpeg");
+    const { upload } = await uploadOk(
+      client,
+      pid,
+      "audio",
+      "tone.mp3",
+      Bun.file(getMedia().audioMp3),
+      1024,
+      "audio/mpeg",
+    );
     const beforeChunks = await prisma.uploadChunk.count({ where: { uploadId: upload.id } });
     expect(beforeChunks).toBeGreaterThan(1);
     await waitForInflightTasks();
@@ -573,14 +557,14 @@ describe("chunked upload + media validation task", () => {
   it("recoverTasksOnStartup は succeeded task に手を出さない", async () => {
     const client = makeClient();
     const pid = await createProject(client, "task-recover-skip-succeeded");
-    const bytes = new Uint8Array(await Bun.file(getMedia().audioMp3).arrayBuffer());
+    const file = Bun.file(getMedia().audioMp3);
     const { task } = await uploadOk(
       client,
       pid,
       "audio",
       "tone.mp3",
-      bytes,
-      bytes.byteLength,
+      file,
+      file.size,
       "audio/mpeg",
     );
     await pollTaskUntil(client, pid, task.id, (t) => t.status === "succeeded", 60_000);
@@ -637,7 +621,7 @@ describe("chunked upload + media validation task", () => {
       pid,
       // @ts-expect-error invalid kind for negative test
       "image",
-      asBlob(new Uint8Array([1])),
+      new Blob([new Uint8Array([1])]),
       "x.bin",
       "application/octet-stream",
       1024,
