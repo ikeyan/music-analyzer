@@ -1,6 +1,7 @@
 import { timingSafeEqual } from "node:crypto";
 import type { MiddlewareHandler } from "hono";
 import type { User } from "../generated/prisma/client";
+import { readSecretEnv } from "./env";
 import { prisma } from "./prisma";
 
 export type AuthContext = {
@@ -19,7 +20,7 @@ export function constantTimeEqual(a: string, b: string): boolean {
 }
 
 export const requireUser: MiddlewareHandler<AuthContext> = async (c, next) => {
-  const expectedSecret = process.env.AUTH_PROXY_SECRET;
+  const expectedSecret = readSecretEnv("AUTH_PROXY_SECRET");
   // dev fallback (DEV_SUB) は NODE_ENV=development のときだけ。staging/test/unset は fail-closed
   const isDevelopment = process.env.NODE_ENV === "development";
 

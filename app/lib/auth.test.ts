@@ -1,8 +1,11 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import { writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { Hono } from "hono";
 import { useDbFixture } from "../test-fixtures/db";
 import { type AuthContext, constantTimeEqual, requireUser } from "./auth";
 import { prisma } from "./prisma";
+import { tempDir } from "./temp-dir";
 
 useDbFixture();
 
@@ -28,7 +31,7 @@ describe("constantTimeEqual", () => {
   });
 });
 
-const ENV_KEYS = ["AUTH_PROXY_SECRET", "NODE_ENV"] as const;
+const ENV_KEYS = ["AUTH_PROXY_SECRET", "AUTH_PROXY_SECRET_FILE", "NODE_ENV"] as const;
 type Env = Partial<Record<(typeof ENV_KEYS)[number], string | undefined>>;
 let savedEnv: Env = {};
 
@@ -179,6 +182,51 @@ describe("requireUser middleware", () => {
       expect(res.status).toBe(200);
       const body = (await res.json()) as Record<string, unknown>;
       expect(body.sub).toBe("explicit-user");
+    });
+  });
+
+  describe("AUTH_PROXY_SECRET_FILE", () => {
+    it("authenticates against the secret loaded from the file", async () => {
+      await using td = await tempDir("auth-secret-");
+      const p = join(td.path, "proxy-secret");
+      writeFileSync(p, `${SECRET}\n`);
+      process.env.AUTH_PROXY_SECRET_FILE = p;
+      const res = await makeApp().request("/whoami", {
+        headers: {
+          "x-auth-proxy-secret": SECRET,
+          "x-authentik-uid": "user-file-secret",
+        },
+      });
+      expect(res.status).toBe(200);
+    });
+
+    it("rejects requests whose header doesn't match the file contents", async () => {
+      await using td = await tempDir("auth-secret-");
+      const p = join(td.path, "proxy-secret");
+      writeFileSync(p, SECRET);
+      process.env.AUTH_PROXY_SECRET_FILE = p;
+      const res = await makeApp().request("/whoami", {
+        headers: { "x-auth-proxy-secret": "wrong" },
+      });
+      expect(res.status).toBe(401);
+    });
+
+    it("fails closed (500) when both AUTH_PROXY_SECRET and AUTH_PROXY_SECRET_FILE are set", async () => {
+      await using td = await tempDir("auth-secret-");
+      const p = join(td.path, "proxy-secret");
+      writeFileSync(p, SECRET);
+      process.env.AUTH_PROXY_SECRET = SECRET;
+      process.env.AUTH_PROXY_SECRET_FILE = p;
+      // Hono の default error handler が console.error を呼ぶので test 出力ノイズを抑える
+      const errSpy = spyOn(console, "error").mockImplementation(() => {});
+      try {
+        const res = await makeApp().request("/whoami", {
+          headers: { "x-auth-proxy-secret": SECRET },
+        });
+        expect(res.status).toBe(500);
+      } finally {
+        errSpy.mockRestore();
+      }
     });
   });
 
