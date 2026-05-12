@@ -204,7 +204,7 @@ describe("startDeletionSweeper ready gating", () => {
     await prisma.deletionMark.create({
       data: { prefix: "gate-test/", nextRetryAt: new Date(Date.now() - 1000) },
     });
-    let resolveReady: () => void = () => {};
+    let resolveReady: (() => void) | undefined;
     const ready = new Promise<void>((r) => {
       resolveReady = r;
     });
@@ -219,7 +219,7 @@ describe("startDeletionSweeper ready gating", () => {
       // deletePrefix が例外 → attempts++)。gate が効いていれば attempts=0 のまま
       expect(stillPending?.attempts).toBe(0);
     } finally {
-      resolveReady();
+      resolveReady?.();
       stopDeletionSweeper();
     }
   });
