@@ -204,4 +204,173 @@ describe("ProjectDetail (frontend)", () => {
       tick();
     })`);
   }, 60_000);
+
+  it("編集ポップアップの直接入力で projStart/End が更新される", async () => {
+    const id = await createProject("edit-direct-test");
+    await goto(`/projects/${id}`);
+    await waitHydrated('input[type=file][accept="audio/*"]');
+    await injectFileToInput(getMedia().audioMp3, "audio/*", "direct.mp3", "audio/mpeg");
+    await waitFor(webview(), "audio source", 30_000);
+    await webview().click('button[aria-label="direct.mp3 を編集"]');
+    await waitFor(webview(), 'div[role="dialog"]');
+    // input[0]=倍率, [1]=projStart, [2]=projEnd の順に並ぶ
+    await webview().evaluate(`(() => {
+      const inputs = document.querySelectorAll('div[role="dialog"] input[type=number]');
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set;
+      setter.call(inputs[1], "10");
+      inputs[1].dispatchEvent(new Event("input", { bubbles: true }));
+      setter.call(inputs[2], "15");
+      inputs[2].dispatchEvent(new Event("input", { bubbles: true }));
+    })()`);
+    // 「直接入力」セクションの「適用」を押す
+    await webview().evaluate(`(() => {
+      const buttons = Array.from(document.querySelectorAll('div[role="dialog"] button'));
+      const apply = buttons.filter(b => b.textContent === "適用")[1];
+      if (!apply) throw new Error("直接入力の適用ボタンが見つからない");
+      apply.click();
+    })()`);
+    // dialog が閉じるのを待ち、API で値を検証
+    await webview().evaluate(`new Promise((res, rej) => {
+      const start = Date.now();
+      const tick = () => {
+        if (!document.querySelector('div[role="dialog"]')) return res();
+        if (Date.now() - start > 5000) return rej(new Error("dialog still open"));
+        setTimeout(tick, 50);
+      };
+      tick();
+    })`);
+    const detail = (await fetch(`${server()}/api/projects/${id}`).then((r) => r.json())) as {
+      project: { audios: { name: string; projStartSec: number; projEndSec: number }[] };
+    };
+    const audio = detail.project.audios.find((a) => a.name === "direct.mp3");
+    expect(audio).toBeDefined();
+    expect(audio!.projStartSec).toBeCloseTo(10, 3);
+    expect(audio!.projEndSec).toBeCloseTo(15, 3);
+  }, 60_000);
+
+  it("編集ポップアップの時間反転で projStart/End が入れ替わる", async () => {
+    const id = await createProject("edit-flip-test");
+    await goto(`/projects/${id}`);
+    await waitHydrated('input[type=file][accept="audio/*"]');
+    await injectFileToInput(getMedia().audioMp3, "audio/*", "flip.mp3", "audio/mpeg");
+    await waitFor(webview(), "audio source", 30_000);
+    const before = (await fetch(`${server()}/api/projects/${id}`).then((r) => r.json())) as {
+      project: { audios: { name: string; projStartSec: number; projEndSec: number }[] };
+    };
+    const a0 = before.project.audios.find((a) => a.name === "flip.mp3")!;
+    await webview().click('button[aria-label="flip.mp3 を編集"]');
+    await waitFor(webview(), 'div[role="dialog"]');
+    await webview().evaluate(`(() => {
+      const buttons = Array.from(document.querySelectorAll('div[role="dialog"] button'));
+      const flip = buttons.find(b => b.textContent === "反転");
+      if (!flip) throw new Error("反転 ボタンが見つからない");
+      flip.click();
+    })()`);
+    await webview().evaluate(`new Promise((res, rej) => {
+      const start = Date.now();
+      const tick = () => {
+        if (!document.querySelector('div[role="dialog"]')) return res();
+        if (Date.now() - start > 5000) return rej(new Error("dialog still open"));
+        setTimeout(tick, 50);
+      };
+      tick();
+    })`);
+    const after = (await fetch(`${server()}/api/projects/${id}`).then((r) => r.json())) as {
+      project: { audios: { name: string; projStartSec: number; projEndSec: number }[] };
+    };
+    const a1 = after.project.audios.find((a) => a.name === "flip.mp3")!;
+    expect(a1.projStartSec).toBeCloseTo(a0.projEndSec, 3);
+    expect(a1.projEndSec).toBeCloseTo(a0.projStartSec, 3);
+  }, 60_000);
+
+  it("編集ポップアップの移動・拡縮で別メディアの開始時刻に揃う", async () => {
+    const id = await createProject("edit-align-test");
+    await goto(`/projects/${id}`);
+    await waitHydrated('input[type=file][accept="audio/*"]');
+    await injectFileToInput(getMedia().audioMp3, "audio/*", "first.mp3", "audio/mpeg");
+    await waitFor(webview(), "audio source", 30_000);
+    await injectFileToInput(getMedia().audioMp3, "audio/*", "second.mp3", "audio/mpeg");
+    // 2 audio を待つ
+    await webview().evaluate(`new Promise((res, rej) => {
+      const start = Date.now();
+      const tick = () => {
+        if (document.querySelectorAll('audio').length >= 2) return res();
+        if (Date.now() - start > 30000) return rej(new Error("second audio timeout"));
+        setTimeout(tick, 100);
+      };
+      tick();
+    })`);
+    // second の編集ダイアログを開き、基準=first, 配置=same-start で適用
+    await webview().click('button[aria-label="second.mp3 を編集"]');
+    await waitFor(webview(), 'div[role="dialog"]');
+    await webview().evaluate(`(() => {
+      const dlg = document.querySelector('div[role="dialog"]');
+      const selects = dlg.querySelectorAll('select');
+      const anchorSel = selects[0]; // 基準
+      const patternSel = selects[1]; // 配置
+      const setter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value").set;
+      const firstOption = Array.from(anchorSel.options).find(o => o.textContent && o.textContent.includes("first.mp3"));
+      if (!firstOption) throw new Error("first.mp3 option not found");
+      setter.call(anchorSel, firstOption.value);
+      anchorSel.dispatchEvent(new Event("change", { bubbles: true }));
+      setter.call(patternSel, "same-start");
+      patternSel.dispatchEvent(new Event("change", { bubbles: true }));
+      // 移動・拡縮 セクションの最初の「適用」を押す
+      const buttons = Array.from(dlg.querySelectorAll('button'));
+      const apply = buttons.filter(b => b.textContent === "適用")[0];
+      apply.click();
+    })()`);
+    await webview().evaluate(`new Promise((res, rej) => {
+      const start = Date.now();
+      const tick = () => {
+        if (!document.querySelector('div[role="dialog"]')) return res();
+        if (Date.now() - start > 5000) return rej(new Error("dialog still open"));
+        setTimeout(tick, 50);
+      };
+      tick();
+    })`);
+    const after = (await fetch(`${server()}/api/projects/${id}`).then((r) => r.json())) as {
+      project: { audios: { name: string; projStartSec: number; projEndSec: number }[] };
+    };
+    const first = after.project.audios.find((a) => a.name === "first.mp3")!;
+    const second = after.project.audios.find((a) => a.name === "second.mp3")!;
+    expect(second.projStartSec).toBeCloseTo(first.projStartSec, 3);
+  }, 90_000);
+
+  it("トリミングポップアップで srcStart/End が更新される", async () => {
+    const id = await createProject("trim-test");
+    await goto(`/projects/${id}`);
+    await waitHydrated('input[type=file][accept="audio/*"]');
+    await injectFileToInput(getMedia().audioMp3, "audio/*", "trim.mp3", "audio/mpeg");
+    await waitFor(webview(), "audio source", 30_000);
+    await webview().click('button[aria-label="trim.mp3 をトリミング"]');
+    await waitFor(webview(), 'div[role="dialog"]');
+    await webview().evaluate(`(() => {
+      const inputs = document.querySelectorAll('div[role="dialog"] input[type=number]');
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set;
+      setter.call(inputs[0], "0.2");
+      inputs[0].dispatchEvent(new Event("input", { bubbles: true }));
+      setter.call(inputs[1], "0.5");
+      inputs[1].dispatchEvent(new Event("input", { bubbles: true }));
+      const buttons = Array.from(document.querySelectorAll('div[role="dialog"] button'));
+      const apply = buttons.find(b => b.textContent === "適用");
+      if (!apply) throw new Error("適用 ボタンが見つからない");
+      apply.click();
+    })()`);
+    await webview().evaluate(`new Promise((res, rej) => {
+      const start = Date.now();
+      const tick = () => {
+        if (!document.querySelector('div[role="dialog"]')) return res();
+        if (Date.now() - start > 5000) return rej(new Error("dialog still open"));
+        setTimeout(tick, 50);
+      };
+      tick();
+    })`);
+    const detail = (await fetch(`${server()}/api/projects/${id}`).then((r) => r.json())) as {
+      project: { audios: { name: string; srcStartSec: number; srcEndSec: number }[] };
+    };
+    const audio = detail.project.audios.find((a) => a.name === "trim.mp3")!;
+    expect(audio.srcStartSec).toBeCloseTo(0.2, 3);
+    expect(audio.srcEndSec).toBeCloseTo(0.5, 3);
+  }, 60_000);
 });

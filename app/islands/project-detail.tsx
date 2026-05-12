@@ -1,4 +1,4 @@
-import { type CSSProperties, useEffect, useMemo, useRef, useState } from "react";
+import { type CSSProperties, type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import type { ApiAudio, ApiProjectDetail, ApiThumbnail, ApiVideo } from "../api/types";
 import { apiClient } from "../lib/api-client";
 
@@ -14,6 +14,14 @@ const TRACK_GAP = 8;
 const PIXELS_PER_SECOND_DEFAULT = 40;
 const SYNC_DRIFT_TOLERANCE = 0.25;
 
+type TrackRef = { kind: Track["kind"]; id: string };
+type TimingUpdate = {
+  srcStartSec: number;
+  srcEndSec: number;
+  projStartSec: number;
+  projEndSec: number;
+};
+
 export default function ProjectDetail({ initial }: { initial: ProjectDetailData }) {
   const [data, setData] = useState(initial);
   const [pxPerSec, setPxPerSec] = useState(PIXELS_PER_SECOND_DEFAULT);
@@ -21,6 +29,8 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
   const [playing, setPlaying] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [editing, setEditing] = useState<TrackRef | null>(null);
+  const [trimming, setTrimming] = useState<TrackRef | null>(null);
 
   const tracks: Track[] = useMemo(() => {
     const all: Track[] = [
@@ -214,6 +224,39 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
     }
   }
 
+  async function updateTiming(
+    ref: TrackRef,
+    timing: TimingUpdate,
+  ): Promise<{ ok: true } | { error: string }> {
+    const res =
+      ref.kind === "video"
+        ? await apiClient.projects[":id"].videos[":videoId"].timing.$patch({
+            param: { id: data.id, videoId: ref.id },
+            json: timing,
+          })
+        : await apiClient.projects[":id"].audios[":audioId"].timing.$patch({
+            param: { id: data.id, audioId: ref.id },
+            json: timing,
+          });
+    if (!res.ok) {
+      const body = (await res.json().catch(() => ({}))) as { error?: string };
+      return { error: `更新失敗 (HTTP ${res.status}): ${body.error ?? "(no message)"}` };
+    }
+    await refresh();
+    return { ok: true };
+  }
+
+  const editingTrack = useMemo(
+    () =>
+      editing ? tracks.find((t) => t.kind === editing.kind && t.data.id === editing.id) : null,
+    [editing, tracks],
+  );
+  const trimmingTrack = useMemo(
+    () =>
+      trimming ? tracks.find((t) => t.kind === trimming.kind && t.data.id === trimming.id) : null,
+    [trimming, tracks],
+  );
+
   const totalWidth = displayDuration * pxPerSec;
 
   return (
@@ -332,6 +375,8 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
                 }}
                 onDelete={() => deleteTrack(t)}
                 onMove={(dir) => moveTrack(idx, dir)}
+                onEdit={() => setEditing({ kind: t.kind, id: t.data.id })}
+                onTrim={() => setTrimming({ kind: t.kind, id: t.data.id })}
                 attachRef={(el) => {
                   if (el) mediaRefs.current.set(trackKey(t), el);
                   else mediaRefs.current.delete(trackKey(t));
@@ -349,6 +394,28 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
           />
         </div>
       </div>
+
+      {editingTrack && (
+        <MediaEditDialog
+          target={editingTrack}
+          others={tracks.filter(
+            (t) => !(t.kind === editingTrack.kind && t.data.id === editingTrack.data.id),
+          )}
+          onClose={() => setEditing(null)}
+          onApply={(timing) =>
+            updateTiming({ kind: editingTrack.kind, id: editingTrack.data.id }, timing)
+          }
+        />
+      )}
+      {trimmingTrack && (
+        <MediaTrimDialog
+          target={trimmingTrack}
+          onClose={() => setTrimming(null)}
+          onApply={(timing) =>
+            updateTiming({ kind: trimmingTrack.kind, id: trimmingTrack.data.id }, timing)
+          }
+        />
+      )}
     </div>
   );
 }
@@ -490,6 +557,8 @@ function TrackRow({
   onSeek,
   onDelete,
   onMove,
+  onEdit,
+  onTrim,
   attachRef,
 }: {
   track: Track;
@@ -499,6 +568,8 @@ function TrackRow({
   onSeek: (time: number) => void;
   onDelete: () => void;
   onMove: (direction: -1 | 1) => void;
+  onEdit: () => void;
+  onTrim: () => void;
   attachRef: (el: HTMLMediaElement | null) => void;
 }) {
   const item = track.data;
@@ -613,6 +684,28 @@ function TrackRow({
           style={trackButtonStyle}
         >
           ↓
+        </button>
+        <button
+          type="button"
+          aria-label={`${item.name} を編集`}
+          onClick={(e) => {
+            e.stopPropagation();
+            onEdit();
+          }}
+          style={trackButtonStyle}
+        >
+          編集
+        </button>
+        <button
+          type="button"
+          aria-label={`${item.name} をトリミング`}
+          onClick={(e) => {
+            e.stopPropagation();
+            onTrim();
+          }}
+          style={trackButtonStyle}
+        >
+          トリミング
         </button>
         <button
           type="button"
@@ -747,3 +840,442 @@ function formatTime(sec: number): string {
   const s = sec - m * 60;
   return `${m}:${s.toFixed(2).padStart(5, "0")}`;
 }
+
+function ModalShell({
+  title,
+  onClose,
+  children,
+}: {
+  title: string;
+  onClose: () => void;
+  children: ReactNode;
+}) {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent): void => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+  return (
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-label={title}
+      style={{
+        position: "fixed",
+        inset: 0,
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        zIndex: 100,
+      }}
+    >
+      <button
+        type="button"
+        aria-label="閉じる (背景)"
+        onClick={onClose}
+        style={{
+          position: "absolute",
+          inset: 0,
+          background: "rgba(0,0,0,0.45)",
+          border: "none",
+          padding: 0,
+          margin: 0,
+          cursor: "pointer",
+        }}
+      />
+      <div
+        style={{
+          position: "relative",
+          background: "white",
+          borderRadius: 6,
+          padding: "1rem 1.25rem",
+          minWidth: 360,
+          maxWidth: "min(560px, 92vw)",
+          maxHeight: "90vh",
+          overflow: "auto",
+          boxShadow: "0 6px 24px rgba(0,0,0,0.3)",
+        }}
+      >
+        <header
+          style={{
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "center",
+            gap: "0.5rem",
+          }}
+        >
+          <h2 style={{ margin: 0, fontSize: 16 }}>{title}</h2>
+          <button type="button" aria-label="閉じる" onClick={onClose}>
+            ×
+          </button>
+        </header>
+        {children}
+      </div>
+    </div>
+  );
+}
+
+type AlignPattern = "same-start" | "same-end" | "after" | "before";
+
+function MediaEditDialog({
+  target,
+  others,
+  onClose,
+  onApply,
+}: {
+  target: Track;
+  others: Track[];
+  onClose: () => void;
+  onApply: (timing: TimingUpdate) => Promise<{ ok: true } | { error: string }>;
+}) {
+  const t = target.data;
+  const SELF_KEY = "__self__";
+  const initialAnchorKey = others[0] ? trackKey(others[0]) : SELF_KEY;
+  const [anchorKey, setAnchorKey] = useState<string>(initialAnchorKey);
+  const [pattern, setPattern] = useState<AlignPattern>("same-start");
+  const [scale, setScale] = useState<string>("1");
+  const [directStart, setDirectStart] = useState<string>(t.projStartSec.toString());
+  const [directEnd, setDirectEnd] = useState<string>(t.projEndSec.toString());
+  const [busy, setBusy] = useState<"align" | "direct" | "flip" | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const anchorIsSelf = anchorKey === SELF_KEY;
+  const anchorTrack = anchorIsSelf
+    ? target
+    : (others.find((o) => trackKey(o) === anchorKey) ?? null);
+
+  async function submit(timing: TimingUpdate, kind: "align" | "direct" | "flip"): Promise<void> {
+    setBusy(kind);
+    setError(null);
+    const result = await onApply(timing);
+    setBusy(null);
+    if ("error" in result) setError(result.error);
+    else onClose();
+  }
+
+  function applyAlign(): void {
+    if (!anchorTrack) {
+      setError("基準メディアを選択してください");
+      return;
+    }
+    const s = Number(scale);
+    if (!Number.isFinite(s) || s <= 0) {
+      setError("倍率は正の有限数で指定してください");
+      return;
+    }
+    if (anchorIsSelf && (pattern === "after" || pattern === "before")) {
+      setError("自分に対する「直後」「直前」は適用できません");
+      return;
+    }
+    const a = anchorTrack.data;
+    let anchorValue: number;
+    let setMyStart: boolean;
+    switch (pattern) {
+      case "same-start":
+        anchorValue = a.projStartSec;
+        setMyStart = true;
+        break;
+      case "same-end":
+        anchorValue = a.projEndSec;
+        setMyStart = false;
+        break;
+      case "after":
+        anchorValue = a.projEndSec;
+        setMyStart = true;
+        break;
+      case "before":
+        anchorValue = a.projStartSec;
+        setMyStart = false;
+        break;
+    }
+    const newSignedDur = (t.projEndSec - t.projStartSec) * s;
+    const projStartSec = setMyStart ? anchorValue : anchorValue - newSignedDur;
+    const projEndSec = setMyStart ? anchorValue + newSignedDur : anchorValue;
+    if (projStartSec < 0 || projEndSec < 0) {
+      setError("結果の projStart/End が負になります");
+      return;
+    }
+    void submit(
+      { srcStartSec: t.srcStartSec, srcEndSec: t.srcEndSec, projStartSec, projEndSec },
+      "align",
+    );
+  }
+
+  function applyDirect(): void {
+    const ps = Number(directStart);
+    const pe = Number(directEnd);
+    if (!Number.isFinite(ps) || ps < 0 || !Number.isFinite(pe) || pe < 0) {
+      setError("projStart / projEnd は 0 以上の有限数で指定してください");
+      return;
+    }
+    if (ps === pe) {
+      setError("projStart と projEnd は同じ値にできません");
+      return;
+    }
+    void submit(
+      { srcStartSec: t.srcStartSec, srcEndSec: t.srcEndSec, projStartSec: ps, projEndSec: pe },
+      "direct",
+    );
+  }
+
+  function applyFlip(): void {
+    void submit(
+      {
+        srcStartSec: t.srcStartSec,
+        srcEndSec: t.srcEndSec,
+        projStartSec: t.projEndSec,
+        projEndSec: t.projStartSec,
+      },
+      "flip",
+    );
+  }
+
+  return (
+    <ModalShell title={`編集: ${t.name}`} onClose={onClose}>
+      {error && (
+        <p
+          role="alert"
+          style={{
+            color: "crimson",
+            background: "#fff5f5",
+            border: "1px solid crimson",
+            padding: "0.4rem 0.6rem",
+            borderRadius: 4,
+            margin: "0.5rem 0",
+            fontSize: 13,
+          }}
+        >
+          {error}
+        </p>
+      )}
+
+      <p style={{ fontSize: 12, color: "#555", margin: "0.5rem 0" }}>
+        現在: projStart={t.projStartSec.toFixed(3)}s, projEnd={t.projEndSec.toFixed(3)}s （長さ=
+        {(t.projEndSec - t.projStartSec).toFixed(3)}s）
+      </p>
+
+      <section style={dialogSectionStyle}>
+        <h3 style={dialogH3Style}>移動・拡縮</h3>
+        <div style={dialogRowStyle}>
+          <label style={dialogLabelStyle}>
+            基準
+            <select
+              value={anchorKey}
+              onChange={(e) => setAnchorKey(e.target.value)}
+              disabled={busy !== null}
+            >
+              <option value={SELF_KEY}>自分</option>
+              {others.map((o) => (
+                <option key={trackKey(o)} value={trackKey(o)}>
+                  [{o.kind === "video" ? "V" : "A"}] {o.data.name}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label style={dialogLabelStyle}>
+            配置
+            <select
+              value={pattern}
+              onChange={(e) => setPattern(e.target.value as AlignPattern)}
+              disabled={busy !== null}
+            >
+              <option value="same-start">同じ開始時刻</option>
+              <option value="same-end">同じ終了時刻</option>
+              <option value="after" disabled={anchorIsSelf}>
+                終了直後 (自分の開始=基準の終了)
+              </option>
+              <option value="before" disabled={anchorIsSelf}>
+                開始直前 (自分の終了=基準の開始)
+              </option>
+            </select>
+          </label>
+          <label style={dialogLabelStyle}>
+            倍率
+            <input
+              type="number"
+              step="0.01"
+              min="0"
+              value={scale}
+              onChange={(e) => setScale(e.target.value)}
+              disabled={busy !== null}
+              style={{ width: 80 }}
+            />
+          </label>
+          <button type="button" onClick={applyAlign} disabled={busy !== null}>
+            {busy === "align" ? "適用中…" : "適用"}
+          </button>
+        </div>
+      </section>
+
+      <section style={dialogSectionStyle}>
+        <h3 style={dialogH3Style}>直接入力</h3>
+        <div style={dialogRowStyle}>
+          <label style={dialogLabelStyle}>
+            projStartSec
+            <input
+              type="number"
+              step="0.001"
+              min="0"
+              value={directStart}
+              onChange={(e) => setDirectStart(e.target.value)}
+              disabled={busy !== null}
+              style={{ width: 120 }}
+            />
+          </label>
+          <label style={dialogLabelStyle}>
+            projEndSec
+            <input
+              type="number"
+              step="0.001"
+              min="0"
+              value={directEnd}
+              onChange={(e) => setDirectEnd(e.target.value)}
+              disabled={busy !== null}
+              style={{ width: 120 }}
+            />
+          </label>
+          <button type="button" onClick={applyDirect} disabled={busy !== null}>
+            {busy === "direct" ? "適用中…" : "適用"}
+          </button>
+        </div>
+      </section>
+
+      <section style={dialogSectionStyle}>
+        <h3 style={dialogH3Style}>時間反転</h3>
+        <p style={{ fontSize: 12, color: "#555", margin: "0.25rem 0 0.5rem" }}>
+          projStart と projEnd を入れ替える。
+        </p>
+        <button type="button" onClick={applyFlip} disabled={busy !== null}>
+          {busy === "flip" ? "反転中…" : "反転"}
+        </button>
+      </section>
+    </ModalShell>
+  );
+}
+
+function MediaTrimDialog({
+  target,
+  onClose,
+  onApply,
+}: {
+  target: Track;
+  onClose: () => void;
+  onApply: (timing: TimingUpdate) => Promise<{ ok: true } | { error: string }>;
+}) {
+  const t = target.data;
+  const [srcStart, setSrcStart] = useState<string>(t.srcStartSec.toString());
+  const [srcEnd, setSrcEnd] = useState<string>(t.srcEndSec.toString());
+  const [busy, setBusy] = useState<boolean>(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function apply(): Promise<void> {
+    const ss = Number(srcStart);
+    const se = Number(srcEnd);
+    if (!Number.isFinite(ss) || ss < 0 || !Number.isFinite(se) || se < 0) {
+      setError("srcStart / srcEnd は 0 以上の有限数で指定してください");
+      return;
+    }
+    if (ss >= se) {
+      setError("srcStart は srcEnd より小さい必要があります");
+      return;
+    }
+    if (se > t.durationSec) {
+      setError(`srcEnd は durationSec (${t.durationSec}) 以下である必要があります`);
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    const result = await onApply({
+      srcStartSec: ss,
+      srcEndSec: se,
+      projStartSec: t.projStartSec,
+      projEndSec: t.projEndSec,
+    });
+    setBusy(false);
+    if ("error" in result) setError(result.error);
+    else onClose();
+  }
+
+  return (
+    <ModalShell title={`トリミング: ${t.name}`} onClose={onClose}>
+      {error && (
+        <p
+          role="alert"
+          style={{
+            color: "crimson",
+            background: "#fff5f5",
+            border: "1px solid crimson",
+            padding: "0.4rem 0.6rem",
+            borderRadius: 4,
+            margin: "0.5rem 0",
+            fontSize: 13,
+          }}
+        >
+          {error}
+        </p>
+      )}
+      <p style={{ fontSize: 12, color: "#555", margin: "0.5rem 0" }}>
+        全長 (durationSec): {t.durationSec.toFixed(3)}s
+      </p>
+      <div style={dialogRowStyle}>
+        <label style={dialogLabelStyle}>
+          srcStartSec
+          <input
+            type="number"
+            step="0.001"
+            min="0"
+            max={t.durationSec}
+            value={srcStart}
+            onChange={(e) => setSrcStart(e.target.value)}
+            disabled={busy}
+            style={{ width: 120 }}
+          />
+        </label>
+        <label style={dialogLabelStyle}>
+          srcEndSec
+          <input
+            type="number"
+            step="0.001"
+            min="0"
+            max={t.durationSec}
+            value={srcEnd}
+            onChange={(e) => setSrcEnd(e.target.value)}
+            disabled={busy}
+            style={{ width: 120 }}
+          />
+        </label>
+        <button type="button" onClick={apply} disabled={busy}>
+          {busy ? "適用中…" : "適用"}
+        </button>
+      </div>
+    </ModalShell>
+  );
+}
+
+const dialogSectionStyle: CSSProperties = {
+  margin: "0.75rem 0",
+  paddingTop: "0.75rem",
+  borderTop: "1px solid #eee",
+};
+
+const dialogH3Style: CSSProperties = {
+  margin: "0 0 0.5rem",
+  fontSize: 14,
+};
+
+const dialogRowStyle: CSSProperties = {
+  display: "flex",
+  flexWrap: "wrap",
+  alignItems: "flex-end",
+  gap: "0.6rem",
+};
+
+const dialogLabelStyle: CSSProperties = {
+  display: "flex",
+  flexDirection: "column",
+  gap: 2,
+  fontSize: 12,
+  color: "#444",
+};

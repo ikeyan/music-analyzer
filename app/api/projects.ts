@@ -61,6 +61,19 @@ const reorderTracksSchema = v.object({
   ),
 });
 
+// 反転は projStart > projEnd で表現するため proj 側に大小制約は置かない。
+// src は正方向のみで、durationSec 超過は row 取得後に handler 側で検証する
+const timingSchema = v.pipe(
+  v.object({
+    srcStartSec: v.pipe(v.number(), v.finite(), v.minValue(0)),
+    srcEndSec: v.pipe(v.number(), v.finite(), v.minValue(0)),
+    projStartSec: v.pipe(v.number(), v.finite(), v.minValue(0)),
+    projEndSec: v.pipe(v.number(), v.finite(), v.minValue(0)),
+  }),
+  v.check((d) => d.srcEndSec > d.srcStartSec, "srcEndSec must be > srcStartSec"),
+  v.check((d) => d.projEndSec !== d.projStartSec, "projEndSec must differ from projStartSec"),
+);
+
 async function findProjectOr404(userId: string, projectId: string) {
   const p = await prisma.project.findFirst({ where: { id: projectId, userId } });
   return p;
@@ -459,6 +472,37 @@ export const projects = new Hono<AuthContext>()
     return c.body(null, 204);
   })
 
+  .patch(
+    "/:id/videos/:videoId/timing",
+    vValidator("param", videoIdParamSchema),
+    vValidator("json", timingSchema),
+    async (c) => {
+      const user = c.var.user;
+      const { id, videoId } = c.req.valid("param");
+      const body = c.req.valid("json");
+      const project = await findProjectOr404(user.id, id);
+      if (!project) return c.json({ error: "project not found" }, 404);
+      const video = await prisma.video.findFirst({
+        where: { id: videoId, projectId: project.id },
+      });
+      if (!video) return c.json({ error: "video not found" }, 404);
+      if (body.srcEndSec > video.durationSec) {
+        return c.json({ error: `srcEndSec must be <= durationSec (${video.durationSec})` }, 400);
+      }
+      const updated = await prisma.video.update({
+        where: { id: video.id },
+        data: {
+          srcStartSec: body.srcStartSec,
+          srcEndSec: body.srcEndSec,
+          projStartSec: body.projStartSec,
+          projEndSec: body.projEndSec,
+        },
+        include: { thumbnails: { orderBy: { atSec: "asc" } } },
+      });
+      return c.json({ video: toApiVideo(updated) satisfies ApiVideo });
+    },
+  )
+
   .get("/:id/videos/:videoId/stream", vValidator("param", videoIdParamSchema), async (c) => {
     const user = c.var.user;
     const { id, videoId } = c.req.valid("param");
@@ -650,6 +694,36 @@ export const projects = new Hono<AuthContext>()
     await eagerCleanupAndUnmark(prefix);
     return c.body(null, 204);
   })
+
+  .patch(
+    "/:id/audios/:audioId/timing",
+    vValidator("param", audioIdParamSchema),
+    vValidator("json", timingSchema),
+    async (c) => {
+      const user = c.var.user;
+      const { id, audioId } = c.req.valid("param");
+      const body = c.req.valid("json");
+      const project = await findProjectOr404(user.id, id);
+      if (!project) return c.json({ error: "project not found" }, 404);
+      const audio = await prisma.audio.findFirst({
+        where: { id: audioId, projectId: project.id },
+      });
+      if (!audio) return c.json({ error: "audio not found" }, 404);
+      if (body.srcEndSec > audio.durationSec) {
+        return c.json({ error: `srcEndSec must be <= durationSec (${audio.durationSec})` }, 400);
+      }
+      const updated = await prisma.audio.update({
+        where: { id: audio.id },
+        data: {
+          srcStartSec: body.srcStartSec,
+          srcEndSec: body.srcEndSec,
+          projStartSec: body.projStartSec,
+          projEndSec: body.projEndSec,
+        },
+      });
+      return c.json({ audio: toApiAudio(updated) satisfies ApiAudio });
+    },
+  )
 
   .get("/:id/audios/:audioId/stream", vValidator("param", audioIdParamSchema), async (c) => {
     const user = c.var.user;
