@@ -1,26 +1,14 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { describe, expect, it } from "bun:test";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { useEnvSandbox } from "../test-fixtures/env-sandbox";
 import { readSecretEnv } from "./env";
 import { tempDir } from "./temp-dir";
 
 const NAME = "MUSIC_ANALYZER_TEST_SECRET";
 const FILE_NAME = `${NAME}_FILE`;
 
-let saved: { direct: string | undefined; file: string | undefined };
-
-beforeEach(() => {
-  saved = { direct: process.env[NAME], file: process.env[FILE_NAME] };
-  delete process.env[NAME];
-  delete process.env[FILE_NAME];
-});
-
-afterEach(() => {
-  if (saved.direct === undefined) delete process.env[NAME];
-  else process.env[NAME] = saved.direct;
-  if (saved.file === undefined) delete process.env[FILE_NAME];
-  else process.env[FILE_NAME] = saved.file;
-});
+useEnvSandbox([NAME]);
 
 describe("readSecretEnv", () => {
   it("returns undefined when neither is set", () => {

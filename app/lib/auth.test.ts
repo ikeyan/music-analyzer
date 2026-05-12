@@ -1,8 +1,9 @@
-import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { Hono } from "hono";
 import { useDbFixture } from "../test-fixtures/db";
+import { useEnvSandbox } from "../test-fixtures/env-sandbox";
 import { type AuthContext, constantTimeEqual, requireUser } from "./auth";
 import { prisma } from "./prisma";
 import { tempDir } from "./temp-dir";
@@ -31,9 +32,7 @@ describe("constantTimeEqual", () => {
   });
 });
 
-const ENV_KEYS = ["AUTH_PROXY_SECRET", "AUTH_PROXY_SECRET_FILE", "NODE_ENV"] as const;
-type Env = Partial<Record<(typeof ENV_KEYS)[number], string | undefined>>;
-let savedEnv: Env = {};
+useEnvSandbox(["AUTH_PROXY_SECRET", "NODE_ENV"]);
 
 const SECRET = "test-secret-aaaaaaaaaaaaaaaaaaaaaaaaa";
 
@@ -49,19 +48,6 @@ function makeApp() {
     });
   });
 }
-
-beforeEach(async () => {
-  savedEnv = Object.fromEntries(ENV_KEYS.map((k) => [k, process.env[k]]));
-  for (const k of ENV_KEYS) delete process.env[k];
-});
-
-afterEach(() => {
-  for (const k of ENV_KEYS) {
-    const v = savedEnv[k];
-    if (v === undefined) delete process.env[k];
-    else process.env[k] = v;
-  }
-});
 
 describe("requireUser middleware", () => {
   describe("AUTH_PROXY_SECRET set", () => {

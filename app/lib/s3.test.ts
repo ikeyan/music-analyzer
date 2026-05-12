@@ -1,33 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { useEnvSandbox } from "../test-fixtures/env-sandbox";
 import { getS3, resetS3ForTest } from "./s3";
 import { tempDir } from "./temp-dir";
 
-const ENV_KEYS = [
-  "S3_ACCESS_KEY_ID",
-  "S3_SECRET_ACCESS_KEY",
-  "S3_BUCKET",
-  "S3_ACCESS_KEY_ID_FILE",
-  "S3_SECRET_ACCESS_KEY_FILE",
-] as const;
-type Env = Partial<Record<(typeof ENV_KEYS)[number], string | undefined>>;
-let saved: Env = {};
+useEnvSandbox(["S3_ACCESS_KEY_ID", "S3_SECRET_ACCESS_KEY", "S3_BUCKET"]);
 
-beforeEach(() => {
-  saved = Object.fromEntries(ENV_KEYS.map((k) => [k, process.env[k]]));
-  for (const k of ENV_KEYS) delete process.env[k];
-  resetS3ForTest();
-});
-
-afterEach(() => {
-  for (const k of ENV_KEYS) {
-    const v = saved[k];
-    if (v === undefined) delete process.env[k];
-    else process.env[k] = v;
-  }
-  resetS3ForTest();
-});
+beforeEach(resetS3ForTest);
+afterEach(resetS3ForTest);
 
 describe("getS3 configuration", () => {
   it("throws when no env vars are set", () => {
