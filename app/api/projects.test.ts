@@ -2,7 +2,7 @@ import { describe, expect, it } from "bun:test";
 import { Hono } from "hono";
 import { prisma } from "../lib/prisma";
 import { getS3 } from "../lib/s3";
-import { uploadChunkKey, uploadPrefix } from "../lib/storage";
+import { projectKey, uploadChunkKey, uploadPrefix } from "../lib/storage";
 import { TASK_GRACE_MS, recoverTasksOnStartup, waitForInflightTasks } from "../lib/task-runner";
 import { useDbFixture } from "../test-fixtures/db";
 import { useMediaFixture } from "../test-fixtures/media";
@@ -478,6 +478,29 @@ describe("chunked upload + media validation task", () => {
     expect(stillStored.byteLength).toBe(4);
     expect(new Uint8Array(stillStored)).toEqual(new Uint8Array([1, 2, 3, 4]));
   });
+
+  it("task 成功時 media prefix の DeletionMark が消える (途中失敗時は残る)", async () => {
+    process.env.NODE_ENV = "development";
+    const app = appWithProjects();
+    const pid = await createProject(app, "media-mark-cleanup");
+    const bytes = new Uint8Array(await Bun.file(getMedia().audioMp3).arrayBuffer());
+    const { task } = await uploadChunked(
+      app,
+      pid,
+      "audio",
+      "tone.mp3",
+      bytes,
+      bytes.byteLength,
+      "audio/mpeg",
+    );
+    await pollTaskUntil(app, pid, task.id, (t) => t.status === "succeeded", 60_000);
+    await waitForInflightTasks();
+    // 成功すれば audios/<audioId>/ の mark は消えている
+    const marks = await prisma.deletionMark.findMany({
+      where: { prefix: { startsWith: `${projectKey(pid)}/audios/` } },
+    });
+    expect(marks).toHaveLength(0);
+  }, 120_000);
 
   it("recoverTasksOnStartup は pending task の upload prefix の DeletionMark を引き直す", async () => {
     process.env.NODE_ENV = "development";

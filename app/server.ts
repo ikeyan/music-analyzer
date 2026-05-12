@@ -17,8 +17,10 @@ const app = createApp({
   },
 });
 
-startDeletionSweeper();
-void recoverTasksOnStartup().catch(() => {});
+// recovery が pending task の upload prefix DeletionMark を引き直すまで sweeper の
+// 初回 sweep を待たせる。先に sweep が走ると古い nextRetryAt で chunks が消える
+const recoveryReady = recoverTasksOnStartup().catch(() => {});
+startDeletionSweeper(undefined, recoveryReady);
 
 showRoutes(app);
 

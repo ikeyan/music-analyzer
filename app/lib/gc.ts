@@ -86,10 +86,13 @@ export async function sweepPendingDeletions(): Promise<void> {
 }
 
 // 起動時に1度走らせて前runで残った墓標を回収し、以後 intervalMs ごとに再試行。
-// 既に走っているなら no-op
-export function startDeletionSweeper(intervalMs = 60_000): void {
+// 既に走っているなら no-op。`ready` を渡すと初回 sweep をそれが resolve するまで
+// 遅らせる (recoverTasksOnStartup が pending task の mark を引き直す前に
+// 古い nextRetryAt で chunks を消されないようにするため)
+export function startDeletionSweeper(intervalMs = 60_000, ready?: Promise<unknown>): void {
   if (sweeperHandle) return;
-  void sweepPendingDeletions().catch(() => {});
+  const initial = ready ? Promise.resolve(ready) : Promise.resolve();
+  void initial.then(() => sweepPendingDeletions()).catch(() => {});
   sweeperHandle = setInterval(() => {
     void sweepPendingDeletions().catch(() => {});
   }, intervalMs);
