@@ -2,6 +2,21 @@
 // bigint が JSON に乗らず Hono RPC の型推論も全フィールドにつく
 import type { Audio, Project, Task, Thumbnail, Upload, Video } from "../generated/prisma/client";
 
+const UPLOAD_KINDS = ["video", "audio"] as const;
+const UPLOAD_STATUSES = ["pending", "completed", "aborted"] as const;
+const TASK_TYPES = ["video_validation", "audio_validation"] as const;
+const TASK_STATUSES = ["pending", "running", "succeeded", "failed"] as const;
+
+function assertIn<T extends string>(
+  v: string,
+  values: readonly T[],
+  label: string,
+): asserts v is T {
+  if (!values.some((x) => x === v)) {
+    throw new Error(`unexpected ${label}: ${JSON.stringify(v)}`);
+  }
+}
+
 export type ApiThumbnail = {
   id: string;
   atSec: number;
@@ -210,17 +225,19 @@ export function toApiProjectSummary(
 }
 
 export function toApiUpload(u: Upload): ApiUpload {
+  assertIn(u.kind, UPLOAD_KINDS, "Upload.kind");
+  assertIn(u.status, UPLOAD_STATUSES, "Upload.status");
   return {
     id: u.id,
     projectId: u.projectId,
-    kind: u.kind as "video" | "audio",
+    kind: u.kind,
     fileName: u.fileName,
     contentType: u.contentType,
     totalBytes: Number(u.totalBytes),
     chunkSize: u.chunkSize,
     totalChunks: u.totalChunks,
     receivedBytes: Number(u.receivedBytes),
-    status: u.status as "pending" | "completed" | "aborted",
+    status: u.status,
     expiresAt: u.expiresAt.toISOString(),
     createdAt: u.createdAt.toISOString(),
     updatedAt: u.updatedAt.toISOString(),
@@ -230,16 +247,21 @@ export function toApiUpload(u: Upload): ApiUpload {
 export function toApiTask(
   t: Task & { upload?: { fileName: string; kind: string } | null },
 ): ApiTask {
+  assertIn(t.type, TASK_TYPES, "Task.type");
+  assertIn(t.status, TASK_STATUSES, "Task.status");
+  let upload: ApiTask["upload"] = null;
+  if (t.upload) {
+    assertIn(t.upload.kind, UPLOAD_KINDS, "Task.upload.kind");
+    upload = { fileName: t.upload.fileName, kind: t.upload.kind };
+  }
   return {
     id: t.id,
     projectId: t.projectId,
-    type: t.type as "video_validation" | "audio_validation",
-    status: t.status as "pending" | "running" | "succeeded" | "failed",
+    type: t.type,
+    status: t.status,
     error: t.error,
     uploadId: t.uploadId,
-    upload: t.upload
-      ? { fileName: t.upload.fileName, kind: t.upload.kind as "video" | "audio" }
-      : null,
+    upload,
     videoId: t.videoId,
     audioId: t.audioId,
     createdAt: t.createdAt.toISOString(),

@@ -415,11 +415,11 @@ export function enqueueTask(taskId: string): void {
     try {
       await executeTask(taskId);
     } catch (err) {
-      // executeTask が claim 後に throw した場合、row は running のまま残り
-      // UI が永遠 polling する。best-effort で failed に倒す
+      // executeTask が claim 前 (pending のまま) でも claim 後 (running) でも
+      // throw しうる。どちらも failed に倒さないと UI が永遠 polling する
       await prisma.task
         .updateMany({
-          where: { id: taskId, status: "running" },
+          where: { id: taskId, status: { in: ["pending", "running"] } },
           data: {
             status: "failed",
             error: err instanceof Error ? err.message.slice(0, 500) : String(err).slice(0, 500),
