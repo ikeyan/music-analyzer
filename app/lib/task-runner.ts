@@ -393,7 +393,8 @@ async function executeTask(taskId: string): Promise<void> {
   }
 
   // upload chunks はもう不要 (Video/Audio へ昇格済み or 失敗)。
-  // 同期 cleanup が失敗しても DeletionMark + sweeper が後で回収する
+  // S3 と UploadChunk 行を両方消す (Upload 行は task list の fileName 表示で使うので残す)。
+  // S3 cleanup が失敗しても DeletionMark + sweeper が後で回収する
   const prefix = uploadPrefix(task.upload.projectId, task.upload.id);
   try {
     await deletePrefix(prefix);
@@ -401,6 +402,9 @@ async function executeTask(taskId: string): Promise<void> {
   } catch {
     /* sweeperに任せる */
   }
+  await prisma.uploadChunk.deleteMany({ where: { uploadId: task.upload.id } }).catch(() => {
+    /* 残っても害は小さい (Upload 削除時に cascade されるか手動 cleanup) */
+  });
 }
 
 // 起動からの inflight task 集合。dev HMR / test 横断で重複起動しないよう global に持つ

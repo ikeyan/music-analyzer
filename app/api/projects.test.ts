@@ -637,6 +637,28 @@ describe("chunked upload + media validation task", () => {
     expect(audio).not.toBeNull();
   }, 120_000);
 
+  it("task 完了後は UploadChunk 行も S3 prefix と一緒に削除される", async () => {
+    process.env.NODE_ENV = "development";
+    const app = appWithProjects();
+    const pid = await createProject(app, "chunk-rows-cleanup");
+    const bytes = new Uint8Array(await Bun.file(getMedia().audioMp3).arrayBuffer());
+    const { upload } = await uploadChunked(
+      app,
+      pid,
+      "audio",
+      "tone.mp3",
+      bytes,
+      1024,
+      "audio/mpeg",
+    );
+    // 細かく刻んでいるので複数 row ある前提
+    const beforeChunks = await prisma.uploadChunk.count({ where: { uploadId: upload.id } });
+    expect(beforeChunks).toBeGreaterThan(1);
+    await waitForInflightTasks();
+    const afterChunks = await prisma.uploadChunk.count({ where: { uploadId: upload.id } });
+    expect(afterChunks).toBe(0);
+  }, 120_000);
+
   it("recoverTasksOnStartup は succeeded task に手を出さない", async () => {
     process.env.NODE_ENV = "development";
     const app = appWithProjects();
