@@ -78,6 +78,24 @@ async function findProjectOr404(userId: string, projectId: string) {
   return p;
 }
 
+// 同一 (uploadId, index) への並列 PUT を直列化する in-memory mutex。
+// 直列化しないと S3 への到着順と DB への到着順がずれて、DB の sizeBytes が
+// 実際の S3 オブジェクトと食い違う恐れがある。single-process 前提
+const chunkLocks = new Map<string, Promise<unknown>>();
+async function withChunkLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  const prev = chunkLocks.get(key);
+  const mine = (async () => {
+    if (prev) await prev.catch(() => {});
+    return await fn();
+  })();
+  chunkLocks.set(key, mine);
+  try {
+    return await mine;
+  } finally {
+    if (chunkLocks.get(key) === mine) chunkLocks.delete(key);
+  }
+}
+
 async function markPrefixForDeletion(prefix: string, graceMs: number): Promise<void> {
   await prisma.deletionMark.create({
     data: { prefix, nextRetryAt: new Date(Date.now() + graceMs) },
@@ -301,68 +319,87 @@ export const projects = new Hono<AuthContext>()
       }
       const contentType = c.req.header("content-type") ?? "application/octet-stream";
       const key = uploadChunkKey(project.id, upload.id, index);
-      let size: number;
-      try {
-        size = await uploadRawRequest(key, c.req.raw, contentType);
-      } catch (err) {
-        return c.json(
-          { error: `chunk upload failed: ${err instanceof Error ? err.message : String(err)}` },
-          500,
-        );
-      }
-      // クライアントが CL で嘘をついて多く送ってきた防衛策。CL を信じて write 前検証
-      // を通したあとに size > chunkSize にはならない想定だが念のため
-      if (size > upload.chunkSize) {
-        await getS3()
-          .delete(key)
-          .catch(() => {});
-        return c.json({ error: `chunk exceeds declared chunkSize ${upload.chunkSize}` }, 413);
-      }
-      // S3 write 完了から DB 反映までの間に /complete が status を flip しうるので、
-      // tx 内で status=pending を再確認してから書く。flipped していたら S3 にだけ
-      // 残った遅延書き込みは best-effort で消す (failed の場合 task 完了時の prefix
-      // cleanup or sweeper でも回収される)
-      const txResult = await prisma.$transaction(async (tx) => {
-        const fresh = await tx.upload.findUnique({
-          where: { id: upload.id },
-          select: { status: true, expiresAt: true },
-        });
-        if (!fresh || fresh.status !== "pending") {
-          return { stale: true as const, status: fresh?.status ?? "missing" };
+
+      // 同 (uploadId, index) への並列 PUT を直列化。直列化しないと S3 への到着順と
+      // DB の sizeBytes が食い違って /complete validate を通った後の merge で
+      // 壊れた byte set を読む恐れがある
+      type ChunkPutOutcome =
+        | { kind: "ok" }
+        | {
+            kind: "error";
+            status: 409 | 413 | 500;
+            error: string;
+          };
+      const outcome: ChunkPutOutcome = await withChunkLock(`${upload.id}:${index}`, async () => {
+        let size: number;
+        try {
+          size = await uploadRawRequest(key, c.req.raw, contentType);
+        } catch (err) {
+          return {
+            kind: "error",
+            status: 500,
+            error: `chunk upload failed: ${err instanceof Error ? err.message : String(err)}`,
+          };
         }
-        if (fresh.expiresAt.getTime() <= Date.now()) {
-          return { stale: true as const, status: "expired" as const };
+        if (size > upload.chunkSize) {
+          // CL を信じて write 前検証を通したあとには起きない想定。防衛策
+          await getS3()
+            .delete(key)
+            .catch(() => {});
+          return {
+            kind: "error",
+            status: 413,
+            error: `chunk exceeds declared chunkSize ${upload.chunkSize}`,
+          };
         }
-        const existing = await tx.uploadChunk.findUnique({
-          where: { uploadId_index: { uploadId: upload.id, index } },
-        });
-        if (existing) {
-          const delta = BigInt(size) - existing.sizeBytes;
-          await tx.uploadChunk.update({
+        // S3 write 完了から DB 反映までの間に /complete が status を flip しうるので、
+        // tx 内で status=pending を再確認してから書く。flipped していたら S3 にだけ
+        // 残った遅延書き込みは best-effort で消す
+        const txResult = await prisma.$transaction(async (tx) => {
+          const fresh = await tx.upload.findUnique({
+            where: { id: upload.id },
+            select: { status: true, expiresAt: true },
+          });
+          if (!fresh || fresh.status !== "pending") {
+            return { stale: true as const, status: fresh?.status ?? "missing" };
+          }
+          if (fresh.expiresAt.getTime() <= Date.now()) {
+            return { stale: true as const, status: "expired" as const };
+          }
+          const existing = await tx.uploadChunk.findUnique({
             where: { uploadId_index: { uploadId: upload.id, index } },
-            data: { sizeBytes: BigInt(size) },
           });
-          await tx.upload.update({
-            where: { id: upload.id },
-            data: { receivedBytes: { increment: delta } },
-          });
-        } else {
-          await tx.uploadChunk.create({
-            data: { uploadId: upload.id, index, sizeBytes: BigInt(size) },
-          });
-          await tx.upload.update({
-            where: { id: upload.id },
-            data: { receivedBytes: { increment: BigInt(size) } },
-          });
+          if (existing) {
+            const delta = BigInt(size) - existing.sizeBytes;
+            await tx.uploadChunk.update({
+              where: { uploadId_index: { uploadId: upload.id, index } },
+              data: { sizeBytes: BigInt(size) },
+            });
+            await tx.upload.update({
+              where: { id: upload.id },
+              data: { receivedBytes: { increment: delta } },
+            });
+          } else {
+            await tx.uploadChunk.create({
+              data: { uploadId: upload.id, index, sizeBytes: BigInt(size) },
+            });
+            await tx.upload.update({
+              where: { id: upload.id },
+              data: { receivedBytes: { increment: BigInt(size) } },
+            });
+          }
+          return { stale: false as const };
+        });
+        if (txResult.stale) {
+          await getS3()
+            .delete(key)
+            .catch(() => {});
+          return { kind: "error", status: 409, error: `upload is ${txResult.status}` };
         }
-        return { stale: false as const };
+        return { kind: "ok" };
       });
-      if (txResult.stale) {
-        await getS3()
-          .delete(key)
-          .catch(() => {});
-        return c.json({ error: `upload is ${txResult.status}` }, 409);
-      }
+
+      if (outcome.kind === "error") return c.json({ error: outcome.error }, outcome.status);
       const updated = await prisma.upload.findUniqueOrThrow({ where: { id: upload.id } });
       return c.json({ upload: toApiUpload(updated) satisfies ApiUpload });
     },

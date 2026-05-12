@@ -479,6 +479,56 @@ describe("chunked upload + media validation task", () => {
     expect(new Uint8Array(stillStored)).toEqual(new Uint8Array([1, 2, 3, 4]));
   });
 
+  it("同一 chunk index への並列 PUT は直列化され S3 と DB が一致する", async () => {
+    process.env.NODE_ENV = "development";
+    const app = appWithProjects();
+    const pid = await createProject(app, "chunk-serialize");
+    const create = await app.request(`/api/projects/${pid}/uploads`, {
+      method: "POST",
+      headers: { ...DEV_HEADERS, "content-type": "application/json" },
+      body: JSON.stringify({
+        kind: "audio",
+        fileName: "x.bin",
+        totalBytes: 8,
+        chunkSize: 1024,
+      }),
+    });
+    const upload = ((await create.json()) as { upload: ApiUpload }).upload;
+    // 2 つの異なる body を同 index に並列に投げる
+    const bodyA = new Uint8Array(8).fill(0xaa); // 8 bytes
+    const bodyB = new Uint8Array(4).fill(0xbb); // 4 bytes
+    const url = `/api/projects/${pid}/uploads/${upload.id}/chunks/0`;
+    const [resA, resB] = await Promise.all([
+      app.request(url, {
+        method: "PUT",
+        headers: {
+          ...DEV_HEADERS,
+          "content-type": "application/octet-stream",
+          "content-length": "8",
+        },
+        body: bodyA,
+      }),
+      app.request(url, {
+        method: "PUT",
+        headers: {
+          ...DEV_HEADERS,
+          "content-type": "application/octet-stream",
+          "content-length": "4",
+        },
+        body: bodyB,
+      }),
+    ]);
+    expect([resA.status, resB.status].every((s) => s === 200)).toBe(true);
+    // 直列化後の最終状態: S3 と DB の sizeBytes が一致する
+    const dbChunk = await prisma.uploadChunk.findUnique({
+      where: { uploadId_index: { uploadId: upload.id, index: 0 } },
+    });
+    const stored = await getS3()
+      .file(uploadChunkKey(pid, upload.id, 0))
+      .arrayBuffer();
+    expect(Number(dbChunk!.sizeBytes)).toBe(stored.byteLength);
+  });
+
   it("task 成功時 media prefix の DeletionMark が消える (途中失敗時は残る)", async () => {
     process.env.NODE_ENV = "development";
     const app = appWithProjects();
