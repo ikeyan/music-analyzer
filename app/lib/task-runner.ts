@@ -414,8 +414,21 @@ export function enqueueTask(taskId: string): void {
   void (async () => {
     try {
       await executeTask(taskId);
-    } catch {
-      /* executeTask 内で task row は failed に落としている */
+    } catch (err) {
+      // executeTask が claim 後に throw した場合、row は running のまま残り
+      // UI が永遠 polling する。best-effort で failed に倒す
+      await prisma.task
+        .updateMany({
+          where: { id: taskId, status: "running" },
+          data: {
+            status: "failed",
+            error: err instanceof Error ? err.message.slice(0, 500) : String(err).slice(0, 500),
+            finishedAt: new Date(),
+          },
+        })
+        .catch(() => {
+          /* DB 自体が死亡なら recovery 任せ */
+        });
     } finally {
       inflight.delete(taskId);
     }

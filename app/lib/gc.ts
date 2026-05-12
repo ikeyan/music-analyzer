@@ -115,7 +115,8 @@ async function runGatedSweep(): Promise<void> {
     try {
       await sweeperReady;
     } catch {
-      /* recovery 失敗でも sweep は走らせる */
+      // recovery が pending task の mark を引き直せていない可能性があるので sweep skip
+      return;
     }
   }
   await sweepPendingDeletions();

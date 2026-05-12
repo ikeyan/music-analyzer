@@ -18,8 +18,20 @@ const app = createApp({
 });
 
 // recovery が pending task の upload prefix DeletionMark を引き直すまで sweeper の
-// 初回 sweep を待たせる。先に sweep が走ると古い nextRetryAt で chunks が消える
-const recoveryReady = recoverTasksOnStartup().catch(() => {});
+// 初回 sweep を待たせる。recovery が transient DB error で失敗した場合は retry し続け、
+// 成功するまで sweep を走らせない (古い nextRetryAt で chunks を消さないため)
+const RECOVERY_RETRY_DELAY_MS = 5_000;
+const recoveryReady = (async () => {
+  while (true) {
+    try {
+      await recoverTasksOnStartup();
+      return;
+    } catch (err) {
+      console.error("task recovery failed, retrying", err);
+      await Bun.sleep(RECOVERY_RETRY_DELAY_MS);
+    }
+  }
+})();
 startDeletionSweeper(undefined, recoveryReady);
 
 showRoutes(app);
