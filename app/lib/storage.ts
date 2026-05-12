@@ -24,8 +24,8 @@ export async function uploadFile(key: string, path: string, contentType: string)
 
 // chunk upload で client から来た raw Request body を S3 に流す。
 // Bun.serve 経由の Request を S3Client.write に渡すと書き込みは成功するが
-// write の戻り値 size が常に 0 になる (戻り値バグ) ので、書き込み後の
-// HEAD で実サイズを取り直す
+// write の戻り値 size が常に 0 になる (戻り値バグ) ので Content-Length から取る。
+// CL なし (真の chunked encoding) のみ HEAD でフォールバック
 export async function uploadRawRequest(
   key: string,
   request: Request,
@@ -33,6 +33,11 @@ export async function uploadRawRequest(
 ): Promise<number> {
   const s3 = getS3();
   await s3.write(key, request, { type: contentType });
+  const declared = request.headers.get("content-length");
+  if (declared !== null) {
+    const n = Number(declared);
+    if (Number.isFinite(n) && n >= 0) return n;
+  }
   const stat = await s3.file(key).stat();
   return stat.size;
 }
