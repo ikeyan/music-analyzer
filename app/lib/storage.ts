@@ -22,17 +22,19 @@ export async function uploadFile(key: string, path: string, contentType: string)
   await getS3().write(key, Bun.file(path), { type: contentType });
 }
 
-// chunk upload で client から来た body を S3 に書く。
-// Bun S3 client は chunked-encoding な Request からは 0 byte しか取れないので、
-// ArrayBuffer に読み切ってから書く (chunk size は MAX_CHUNK_SIZE で押さえている)
+// chunk upload で client から来た raw Request body を S3 に流す。
+// Bun.serve 経由の Request を S3Client.write に渡すと書き込みは成功するが
+// write の戻り値 size が常に 0 になる (戻り値バグ) ので、書き込み後の
+// HEAD で実サイズを取り直す
 export async function uploadRawRequest(
   key: string,
   request: Request,
   contentType: string,
 ): Promise<number> {
-  const buf = await request.arrayBuffer();
-  await getS3().write(key, buf, { type: contentType });
-  return buf.byteLength;
+  const s3 = getS3();
+  await s3.write(key, request, { type: contentType });
+  const stat = await s3.file(key).stat();
+  return stat.size;
 }
 
 export async function deletePrefix(prefix: string): Promise<void> {
