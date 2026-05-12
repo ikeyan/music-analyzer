@@ -242,6 +242,8 @@ async function runVideoTask(taskId: string, upload: Upload): Promise<TaskResult>
         where: { id: taskId },
         data: { status: "succeeded", finishedAt: new Date(), videoId: v.id },
       });
+      // 同 tx で chunk 行も消す (terminal status 確定後の別 tick で消し損ねると永久残り)
+      await tx.uploadChunk.deleteMany({ where: { uploadId: upload.id } });
       return v;
     }),
   );
@@ -336,6 +338,8 @@ async function runAudioTask(taskId: string, upload: Upload): Promise<TaskResult>
         where: { id: taskId },
         data: { status: "succeeded", finishedAt: new Date(), audioId: a.id },
       });
+      // 同 tx で chunk 行も消す (terminal status 確定後の別 tick で消し損ねると永久残り)
+      await tx.uploadChunk.deleteMany({ where: { uploadId: upload.id } });
       return a;
     }),
   );
@@ -374,12 +378,15 @@ async function executeTask(taskId: string): Promise<void> {
     };
   }
 
-  // success は run* 内で同 tx flip 済み
+  // success は run* 内で同 tx flip + chunk 削除済み。failure もここで同 tx にする
   if (result.kind === "failure") {
-    await prisma.task.update({
-      where: { id: task.id },
-      data: { status: "failed", error: result.error, finishedAt: new Date() },
-    });
+    await prisma.$transaction([
+      prisma.task.update({
+        where: { id: task.id },
+        data: { status: "failed", error: result.error, finishedAt: new Date() },
+      }),
+      prisma.uploadChunk.deleteMany({ where: { uploadId: task.upload.id } }),
+    ]);
   }
 
   // Upload 行は task list の fileName 表示で使うので残す
@@ -390,7 +397,6 @@ async function executeTask(taskId: string): Promise<void> {
   } catch {
     /* sweeperに任せる */
   }
-  await prisma.uploadChunk.deleteMany({ where: { uploadId: task.upload.id } }).catch(() => {});
 }
 
 // dev HMR / test 横断で重複起動しないよう inflight set を global に置く
