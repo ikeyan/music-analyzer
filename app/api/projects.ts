@@ -1,7 +1,7 @@
 import { vValidator } from "@hono/valibot-validator";
 import * as runtime from "@prisma/client/runtime/client";
 import { Either } from "effect";
-import type { Context } from "hono";
+import type { Context, Input } from "hono";
 import { Hono } from "hono";
 import * as v from "valibot";
 import { type Prisma, type PrismaClient } from "../generated/prisma/client";
@@ -65,6 +65,19 @@ function leftErr<const E extends ApiError>(e: E): Either.Either<never, E> {
 function leftJson<const E extends ApiError>(c: Context, e: E) {
   const { status, ...body } = e;
   return c.json(body, status);
+}
+
+// Either を返す handler をラップ。Left → leftJson、Right → c.json(right, 200) に畳む。
+// 201 / 204 / stream を返す handler は対象外 (200 JSON 専用)。
+// AuthContext を固定にしないと chain の `new Hono<AuthContext>()` からの contextual
+// typing が wrapper の generic E に乗らず、inner の c.var.user が型を失う
+function eitherHandler<P extends string, I extends Input, R, L extends ApiError>(
+  inner: (c: Context<AuthContext, P, I>) => Promise<Either.Either<R, L>>,
+) {
+  return async (c: Context<AuthContext, P, I>) => {
+    const r = await inner(c);
+    return Either.isLeft(r) ? leftJson(c, r.left) : c.json(r.right);
+  };
 }
 
 // tx 内で Left を返した場合に rollback したい。Prisma の $transaction は
@@ -218,16 +231,16 @@ export const projects = new Hono<AuthContext>()
     if (Either.isLeft(projectR)) return leftJson(c, projectR.left);
     const project = projectR.right;
     const prefix = projectPrefix(project.id);
-    await prisma.$transaction(async (tx) => {
-      await tx.deletionMark.create({ data: { prefix } });
-      await tx.task.deleteMany({ where: { projectId: project.id } });
-      await tx.uploadChunk.deleteMany({ where: { upload: { projectId: project.id } } });
-      await tx.upload.deleteMany({ where: { projectId: project.id } });
-      await tx.thumbnail.deleteMany({ where: { video: { projectId: project.id } } });
-      await tx.video.deleteMany({ where: { projectId: project.id } });
-      await tx.audio.deleteMany({ where: { projectId: project.id } });
-      await tx.project.delete({ where: { id: project.id } });
-    });
+    await prisma.$transaction([
+      prisma.deletionMark.create({ data: { prefix } }),
+      prisma.task.deleteMany({ where: { projectId: project.id } }),
+      prisma.uploadChunk.deleteMany({ where: { upload: { projectId: project.id } } }),
+      prisma.upload.deleteMany({ where: { projectId: project.id } }),
+      prisma.thumbnail.deleteMany({ where: { video: { projectId: project.id } } }),
+      prisma.video.deleteMany({ where: { projectId: project.id } }),
+      prisma.audio.deleteMany({ where: { projectId: project.id } }),
+      prisma.project.delete({ where: { id: project.id } }),
+    ]);
     await eagerCleanupAndUnmark(prefix);
     return c.body(null, 204);
   })
@@ -569,34 +582,45 @@ export const projects = new Hono<AuthContext>()
     return c.body(null, 204);
   })
 
-  .get("/:id/tasks", vValidator("param", idParamSchema), async (c) => {
-    const user = c.var.user;
-    const projectR = await requireProject(user.id, c.req.valid("param").id);
-    if (Either.isLeft(projectR)) return leftJson(c, projectR.left);
-    const project = projectR.right;
-    const tasks = await prisma.task.findMany({
-      where: { projectId: project.id },
-      orderBy: { createdAt: "desc" },
-      include: { upload: { select: { fileName: true, kind: true } } },
-    });
-    return c.json({ tasks: tasks.map(toApiTask) satisfies ApiTask[] });
-  })
+  // eitherHandler 経由だと validator 由来の Input generic が伝わらず c.req.valid が
+  // 効かないので、path param は c.req.param で読む (P generic からは伝わる)
+  .get(
+    "/:id/tasks",
+    vValidator("param", idParamSchema),
+    eitherHandler(
+      async (c): Promise<Either.Either<{ tasks: ApiTask[] }, { status: 404; error: string }>> => {
+        const user = c.var.user;
+        const projectR = await requireProject(user.id, c.req.param("id"));
+        if (Either.isLeft(projectR)) return Either.left(projectR.left);
+        const project = projectR.right;
+        const tasks = await prisma.task.findMany({
+          where: { projectId: project.id },
+          orderBy: { createdAt: "desc" },
+          include: { upload: { select: { fileName: true, kind: true } } },
+        });
+        return Either.right({ tasks: tasks.map(toApiTask) satisfies ApiTask[] });
+      },
+    ),
+  )
 
-  .get("/:id/tasks/:taskId", vValidator("param", taskIdParamSchema), async (c) => {
-    const user = c.var.user;
-    const { id, taskId } = c.req.valid("param");
-    const projectR = await requireProject(user.id, id);
-
-    if (Either.isLeft(projectR)) return leftJson(c, projectR.left);
-
-    const project = projectR.right;
-    const task = await prisma.task.findFirst({
-      where: { id: taskId, projectId: project.id },
-      include: { upload: { select: { fileName: true, kind: true } } },
-    });
-    if (!task) return c.json({ error: "task not found" }, 404);
-    return c.json({ task: toApiTask(task) satisfies ApiTask });
-  })
+  .get(
+    "/:id/tasks/:taskId",
+    vValidator("param", taskIdParamSchema),
+    eitherHandler(
+      async (c): Promise<Either.Either<{ task: ApiTask }, { status: 404; error: string }>> => {
+        const user = c.var.user;
+        const projectR = await requireProject(user.id, c.req.param("id"));
+        if (Either.isLeft(projectR)) return Either.left(projectR.left);
+        const project = projectR.right;
+        const task = await prisma.task.findFirst({
+          where: { id: c.req.param("taskId"), projectId: project.id },
+          include: { upload: { select: { fileName: true, kind: true } } },
+        });
+        if (!task) return leftErr({ status: 404, error: "task not found" });
+        return Either.right({ task: toApiTask(task) satisfies ApiTask });
+      },
+    ),
+  )
 
   .delete("/:id/videos/:videoId", vValidator("param", videoIdParamSchema), async (c) => {
     const user = c.var.user;
@@ -611,11 +635,11 @@ export const projects = new Hono<AuthContext>()
     });
     if (!video) return c.json({ error: "video not found" }, 404);
     const prefix = videoPrefix(project.id, video.id);
-    await prisma.$transaction(async (tx) => {
-      await tx.deletionMark.create({ data: { prefix } });
-      await tx.thumbnail.deleteMany({ where: { videoId: video.id } });
-      await tx.video.delete({ where: { id: video.id } });
-    });
+    await prisma.$transaction([
+      prisma.deletionMark.create({ data: { prefix } }),
+      prisma.thumbnail.deleteMany({ where: { videoId: video.id } }),
+      prisma.video.delete({ where: { id: video.id } }),
+    ]);
     await eagerCleanupAndUnmark(prefix);
     return c.body(null, 204);
   })
@@ -682,10 +706,10 @@ export const projects = new Hono<AuthContext>()
     });
     if (!audio) return c.json({ error: "audio not found" }, 404);
     const prefix = audioPrefix(project.id, audio.id);
-    await prisma.$transaction(async (tx) => {
-      await tx.deletionMark.create({ data: { prefix } });
-      await tx.audio.delete({ where: { id: audio.id } });
-    });
+    await prisma.$transaction([
+      prisma.deletionMark.create({ data: { prefix } }),
+      prisma.audio.delete({ where: { id: audio.id } }),
+    ]);
     await eagerCleanupAndUnmark(prefix);
     return c.body(null, 204);
   })
