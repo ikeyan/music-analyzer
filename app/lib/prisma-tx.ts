@@ -3,17 +3,18 @@ import { Either } from "effect";
 import { type Prisma, type PrismaClient } from "../generated/prisma/client";
 import { prisma } from "./prisma";
 
+// PrismaClientLike の generic 制約。深いパスを毎回書かなくて済むよう re-export する
+export type LogOpts = Prisma.LogLevel;
+export type OmitOpts = Prisma.PrismaClientOptions["omit"];
+export type ExtArgs = runtime.Types.Extensions.InternalArgs;
+
 // 任意の Prisma generic で prisma / tx を受けたいときの一般形。
 // 呼び出し側は generics を素通しする (デフォルトを置くと推論に巻き込まれる)
 export type PrismaClientLike<
-  in LogOpts extends Prisma.LogLevel,
-  in out OmitOpts extends Prisma.PrismaClientOptions["omit"],
-  in out ExtArgs extends runtime.Types.Extensions.InternalArgs,
-> = Omit<PrismaClient<LogOpts, OmitOpts, ExtArgs>, runtime.ITXClientDenyList>;
-
-// このプロジェクトの prisma singleton の $transaction callback が受け取る tx の型。
-// `typeof prisma` も構造的にこれと assignable なので、prisma / tx の両方を 1 引数で受けられる
-export type TxClient = Parameters<Parameters<typeof prisma.$transaction>[0]>[0];
+  in L extends LogOpts,
+  in out O extends OmitOpts,
+  in out E extends ExtArgs,
+> = Omit<PrismaClient<L, O, E>, runtime.ITXClientDenyList>;
 
 // tx 内で Left を返したら rollback したい。Prisma の $transaction は throw でしか
 // rollback できないので、内部で throw → 外で catch して Left に戻す

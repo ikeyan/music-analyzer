@@ -22,7 +22,7 @@ type RightRes<R> = Response & TypedResponse<JSONParsed<R>, 200, "json">;
 // overload を切らないと isLeft narrow 後の Left<E, R> でも R が phantom として残り、
 // c.json(r.right) 経由で R が response 型に leak する
 export type EitherJsonFn = {
-  <const E extends ApiError>(r: Either.Left<E, unknown>): LeftRes<E>;
+  <const E extends ApiError>(r: Either.Either<never, E>): LeftRes<E>;
   <const E extends ApiError, R>(r: Either.Either<R, E>): LeftRes<E> | RightRes<R>;
 };
 
