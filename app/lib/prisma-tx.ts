@@ -1,5 +1,5 @@
 import * as runtime from "@prisma/client/runtime/client";
-import { Either } from "effect";
+import { Effect, Either, pipe } from "effect";
 import { type Prisma, type PrismaClient } from "../generated/prisma/client";
 import { prisma } from "./prisma";
 
@@ -16,6 +16,8 @@ export type PrismaClientLike<
   in out E extends ExtArgs,
 > = Omit<PrismaClient<L, O, E>, runtime.ITXClientDenyList>;
 
+export type TxClient = Parameters<Parameters<typeof prisma.$transaction>[0]>[0];
+
 // tx 内で Left を返したら rollback したい。Prisma の $transaction は throw でしか
 // rollback できないので、内部で throw → 外で catch して Left に戻す
 class TxRollback extends Error {
@@ -24,21 +26,23 @@ class TxRollback extends Error {
   }
 }
 
-export async function txEither<A, E>(
-  fn: (
-    tx: Parameters<Parameters<typeof prisma.$transaction>[0]>[0],
-  ) => Promise<Either.Either<A, E>>,
-): Promise<Either.Either<A, E>> {
-  try {
-    const a = await prisma.$transaction(async (tx) => {
-      const r = await fn(tx);
-      if (Either.isLeft(r)) throw new TxRollback(r.left);
-      return r.right;
-    });
-    return Either.right(a);
-  } catch (err) {
-    // throw / catch を自分で挟んでいるので left が E であることは確定
-    if (err instanceof TxRollback) return Either.left(err.left as E);
-    throw err;
-  }
-}
+// tx callback は Effect<A, E> を返す。txEither も Effect<A, E> を返すので、
+// 呼び出し側は Effect chain にそのまま乗せられる
+export const txEither = <A, E>(fn: (tx: TxClient) => Effect.Effect<A, E>): Effect.Effect<A, E> =>
+  pipe(
+    Effect.promise(async () => {
+      try {
+        const value = await prisma.$transaction(async (tx) => {
+          const r = await Effect.runPromise(Effect.either(fn(tx)));
+          if (Either.isLeft(r)) throw new TxRollback(r.left);
+          return r.right;
+        });
+        return Either.right<A>(value);
+      } catch (err) {
+        // throw / catch を自分で挟んでいるので left が E であることは確定
+        if (err instanceof TxRollback) return Either.left(err.left as E);
+        throw err;
+      }
+    }),
+    Effect.flatMap((r) => r),
+  );

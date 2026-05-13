@@ -1,4 +1,4 @@
-import { Either } from "effect";
+import { Effect, Either } from "effect";
 import { createRoute } from "honox/factory";
 import { requireProjectDetail } from "../../api/projects";
 import { toApiProjectDetail } from "../../api/types";
@@ -9,7 +9,7 @@ export default createRoute(requireUser, async (c) => {
   const user = c.var.user;
   const id = c.req.param("id");
   if (!id) return c.notFound();
-  const r = await requireProjectDetail(user.id, id);
+  const r = await Effect.runPromise(Effect.either(requireProjectDetail(user.id, id)));
   if (Either.isLeft(r)) return c.notFound();
   const project = r.right;
 

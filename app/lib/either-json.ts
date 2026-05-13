@@ -1,14 +1,20 @@
 import { Either } from "effect";
 import type { TypedResponse } from "hono";
 import { createMiddleware } from "hono/factory";
+import type { ContentfulStatusCode } from "hono/utils/http-status";
 import type { JSONParsed } from "hono/utils/types";
+import type { IsNumericLiteral } from "type-fest";
 
-// throw HTTPException は hc の response 型に乗らないので Either で返す。
-// `<const E>` で literal status / 追加プロパティをそのまま伝播させる
-export type ApiErrorStatus = 400 | 404 | 409 | 410 | 500;
-export type ApiError = { status: ApiErrorStatus; error: string };
+// 4xx / 5xx の literal numeric にだけマッチする制約。enumerate せずに
+// `${S}` extends `${4|5}${string}` で先頭桁を見る
+type ApiErrorConstraint<S extends ContentfulStatusCode> =
+  IsNumericLiteral<S> extends true ? (`${S}` extends `${4 | 5}${string}` ? S : never) : never;
 
-export function leftErr<const E extends ApiError>(e: E): Either.Either<never, E> {
+export type ApiError = { status: ContentfulStatusCode; error: string };
+
+export function leftErr<const E extends ApiError>(
+  e: E & { status: ApiErrorConstraint<E["status"]> },
+): Either.Either<never, E> {
   return Either.left(e);
 }
 
@@ -17,10 +23,6 @@ type LeftRes<E extends ApiError> = Response &
   TypedResponse<JSONParsed<Omit<E, "status">>, E["status"], "json">;
 type RightRes<R> = Response & TypedResponse<JSONParsed<R>, 200, "json">;
 
-// handler を wrapping する方式だと validator 由来の Input が HOF 越しに伝わらず
-// c.req.valid が無力化されるので、middleware で c.var に関数を生やす。
-// overload を切らないと isLeft narrow 後の Left<E, R> でも R が phantom として残り、
-// c.json(r.right) 経由で R が response 型に leak する
 // narrow 済み Left<E, R> でも match させたいので、A 位置が unknown / never の Left/Right を
 // 並べる。実際に来うる形 (Either.left() の戻り値、または isLeft 後の narrow) を網羅する
 export type EitherJsonFn = {
