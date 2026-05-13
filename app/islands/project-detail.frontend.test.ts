@@ -552,4 +552,27 @@ describe("ProjectDetail (frontend)", () => {
     const afterMedia = after.project.audios.find((a) => a.name === "after.mp3")!;
     expect(afterMedia.projStartSec).toBeGreaterThanOrEqual(revExtent - 1e-6);
   }, 90_000);
+
+  it("timing PATCH は projStartSec/projEndSec が上限超過なら 400", async () => {
+    const id = await createProject("timing-cap-test");
+    await goto(`/projects/${id}`);
+    await waitHydrated('input[type=file][accept="audio/*"]');
+    await injectFileToInput(getMedia().audioMp3, "audio/*", "cap.mp3", "audio/mpeg");
+    await waitFor(webview(), "audio source", 30_000);
+    const before = (await fetch(`${server()}/api/projects/${id}`).then((r) => r.json())) as {
+      project: { audios: { id: string }[] };
+    };
+    const audioId = before.project.audios[0]!.id;
+    const res = await fetch(`${server()}/api/projects/${id}/audios/${audioId}/timing`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        srcStartSec: 0,
+        srcEndSec: 1,
+        projStartSec: 0,
+        projEndSec: 1e9,
+      }),
+    });
+    expect(res.status).toBe(400);
+  }, 60_000);
 });

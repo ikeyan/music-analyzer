@@ -61,14 +61,18 @@ const reorderTracksSchema = v.object({
   ),
 });
 
+// proj 側は upload と違い row が制約に直接寄与しないので、tick 数爆発で
+// TimeRuler が固まるのを防ぐため API レベルで上限を置く
+const MAX_PROJECT_TIMING_SEC = 24 * 60 * 60;
+
 // 反転は projStart > projEnd で表現するため proj 側に大小制約は置かない。
 // src は正方向のみで、durationSec 超過は row 取得後に handler 側で検証する
 const timingSchema = v.pipe(
   v.object({
     srcStartSec: v.pipe(v.number(), v.finite(), v.minValue(0)),
     srcEndSec: v.pipe(v.number(), v.finite(), v.minValue(0)),
-    projStartSec: v.pipe(v.number(), v.finite(), v.minValue(0)),
-    projEndSec: v.pipe(v.number(), v.finite(), v.minValue(0)),
+    projStartSec: v.pipe(v.number(), v.finite(), v.minValue(0), v.maxValue(MAX_PROJECT_TIMING_SEC)),
+    projEndSec: v.pipe(v.number(), v.finite(), v.minValue(0), v.maxValue(MAX_PROJECT_TIMING_SEC)),
   }),
   v.check((d) => d.srcEndSec > d.srcStartSec, "srcEndSec must be > srcStartSec"),
   v.check((d) => d.projEndSec !== d.projStartSec, "projEndSec must differ from projStartSec"),
