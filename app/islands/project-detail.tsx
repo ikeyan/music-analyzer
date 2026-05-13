@@ -481,7 +481,7 @@ function syncMediaElement(
 }
 
 function TimeRuler({ duration, pxPerSec }: { duration: number; pxPerSec: number }) {
-  const step = chooseStep(pxPerSec);
+  const step = chooseStep(pxPerSec, duration);
   const ticks: number[] = [];
   for (let t = 0; t <= duration; t += step) ticks.push(t);
   return (
@@ -513,12 +513,15 @@ function TimeRuler({ duration, pxPerSec }: { duration: number; pxPerSec: number 
   );
 }
 
-function chooseStep(pxPerSec: number): number {
-  const candidates = [1, 2, 5, 10, 30, 60, 120, 300];
+// 間隔は最低 60px (label が読める)、tick 数は MAX_TICKS 以下に抑える。
+// 長尺 (>1h など) で 1s step が大量 DOM を作るのを防ぐ
+function chooseStep(pxPerSec: number, duration: number): number {
+  const candidates = [1, 2, 5, 10, 30, 60, 120, 300, 600, 1800, 3600];
+  const MAX_TICKS = 1000;
   for (const c of candidates) {
-    if (c * pxPerSec >= 60) return c;
+    if (c * pxPerSec >= 60 && duration / c <= MAX_TICKS) return c;
   }
-  return 600;
+  return 3600;
 }
 
 function Playhead({ time, pxPerSec, height }: { time: number; pxPerSec: number; height: number }) {
