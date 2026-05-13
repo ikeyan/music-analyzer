@@ -1,8 +1,7 @@
 import { vValidator } from "@hono/valibot-validator";
 import * as runtime from "@prisma/client/runtime/client";
+import type { Context } from "hono";
 import { Hono } from "hono";
-import { HTTPException } from "hono/http-exception";
-import type { ContentfulStatusCode } from "hono/utils/http-status";
 import * as v from "valibot";
 import { type Prisma, type PrismaClient, type Upload } from "../generated/prisma/client";
 import { type AuthContext, requireUser } from "../lib/auth";
@@ -51,11 +50,44 @@ type PrismaClientLike<
   in out ExtArgs extends runtime.Types.Extensions.InternalArgs,
 > = Omit<PrismaClient<LogOpts, OmitOpts, ExtArgs>, runtime.ITXClientDenyList>;
 
-// HTTPException のレスポンス本体を `{ error: message }` JSON に統一する
-function httpJsonError(status: ContentfulStatusCode, message: string): HTTPException {
-  return new HTTPException(status, {
-    res: Response.json({ error: message }, { status }),
-  });
+type ApiErrorStatus = 400 | 404 | 409 | 410 | 500;
+type ApiError = { status: ApiErrorStatus; error: string };
+// throw HTTPException は hc の response 型に乗らないので Either で返して
+// route handler 側で c.json する。hc がエラー status を全部拾えるようになる
+type Either<L, R> = { left: L } | { right: R };
+
+function leftErr(status: ApiErrorStatus, error: string): { left: ApiError } {
+  return { left: { status, error } };
+}
+
+function leftJson(c: Context, e: ApiError) {
+  return c.json({ error: e.error }, e.status);
+}
+
+// tx 内で Left を返した場合に rollback したい。Prisma の $transaction は
+// throw でしか rollback できないので、内部で throw → 外で catch して Left に戻す
+class TxRollback extends Error {
+  constructor(public left: ApiError) {
+    super(left.error);
+  }
+}
+
+async function txEither<T>(
+  fn: (
+    tx: Parameters<Parameters<typeof prisma.$transaction>[0]>[0],
+  ) => Promise<Either<ApiError, T>>,
+): Promise<Either<ApiError, T>> {
+  try {
+    const right = await prisma.$transaction(async (tx) => {
+      const r = await fn(tx);
+      if ("left" in r) throw new TxRollback(r.left);
+      return r.right;
+    });
+    return { right };
+  } catch (err) {
+    if (err instanceof TxRollback) return { left: err.left };
+    throw err;
+  }
 }
 
 const idParamSchema = v.object({ id: v.string() });
@@ -91,35 +123,38 @@ const createUploadSchema = v.object({
   ),
 });
 
-// project 不在なら 404 を throw。レスポンス本体は JSON `{ error }`
+// 戻り値の型は TS 推論に任せる: 明示すると Prisma の Extended Row 型が
+// bare Project / Upload と一致せず合わない
 async function requireProject(userId: string, projectId: string) {
   const p = await prisma.project.findFirst({ where: { id: projectId, userId } });
-  if (!p) throw httpJsonError(404, "project not found");
-  return p;
+  if (!p) return leftErr(404, "project not found");
+  return { right: p };
 }
 
-// upload 不在なら 404 を throw。prisma / tx どちらでも呼べる
+// prisma / tx のどちらでも呼べる。generics は呼び出し側から素通し
 async function requireUpload<
   LogOpts extends Prisma.LogLevel,
   OmitOpts extends Prisma.PrismaClientOptions["omit"],
   ExtArgs extends runtime.Types.Extensions.InternalArgs,
 >(client: PrismaClientLike<LogOpts, OmitOpts, ExtArgs>, uploadId: string, projectId: string) {
   const upload = await client.upload.findFirst({ where: { id: uploadId, projectId } });
-  if (!upload) throw httpJsonError(404, "upload not found");
-  return upload;
+  if (!upload) return leftErr(404, "upload not found");
+  return { right: upload };
 }
 
-// upload が pending かつ未期限であることを表明。fetched 済みの row に対して使う
-function assertUploadPending(upload: Pick<Upload, "status" | "expiresAt">): void {
-  if (upload.status !== "pending") throw httpJsonError(409, `upload is ${upload.status}`);
-  if (upload.expiresAt.getTime() <= Date.now()) throw httpJsonError(410, "upload expired");
+// fetched 済みの upload row の pending + 未期限 check
+function checkUploadPending(upload: Pick<Upload, "status" | "expiresAt">): ApiError | null {
+  if (upload.status !== "pending") return { status: 409, error: `upload is ${upload.status}` };
+  if (upload.expiresAt.getTime() <= Date.now()) return { status: 410, error: "upload expired" };
+  return null;
 }
 
-// tx 外用: 取得 + status/expiresAt チェックをまとめる
 async function requirePendingUpload(uploadId: string, projectId: string) {
-  const upload = await requireUpload(prisma, uploadId, projectId);
-  assertUploadPending(upload);
-  return upload;
+  const r = await requireUpload(prisma, uploadId, projectId);
+  if ("left" in r) return r;
+  const err = checkUploadPending(r.right);
+  if (err) return { left: err };
+  return r;
 }
 
 // GET /:id, PATCH /:id/track-order, SSR route で共通する Project detail loader。
@@ -165,7 +200,9 @@ export const projects = new Hono<AuthContext>()
   })
   .delete("/:id", vValidator("param", idParamSchema), async (c) => {
     const user = c.var.user;
-    const project = await requireProject(user.id, c.req.valid("param").id);
+    const projectR = await requireProject(user.id, c.req.valid("param").id);
+    if ("left" in projectR) return leftJson(c, projectR.left);
+    const project = projectR.right;
     const prefix = projectPrefix(project.id);
     await prisma.$transaction(async (tx) => {
       await tx.deletionMark.create({ data: { prefix } });
@@ -187,11 +224,15 @@ export const projects = new Hono<AuthContext>()
     vValidator("json", reorderTracksSchema),
     async (c) => {
       const user = c.var.user;
-      const project = await requireProject(user.id, c.req.valid("param").id);
+      const projectR = await requireProject(user.id, c.req.valid("param").id);
+      if ("left" in projectR) return leftJson(c, projectR.left);
+      const project = projectR.right;
       const { tracks: newOrder } = c.req.valid("json");
 
-      await withSlotRetry(() =>
-        prisma.$transaction(async (tx) => {
+      // withSlotRetry が P2002/P2034 throw を retry。validation 失敗の Left は
+      // txEither 内で rollback してから上に伝わるので retry 対象外
+      const txResult = await withSlotRetry(() =>
+        txEither<void>(async (tx) => {
           await tx.project.update({ where: { id: project.id }, data: { updatedAt: new Date() } });
           const [videos, audios] = await Promise.all([
             tx.video.findMany({
@@ -205,7 +246,7 @@ export const projects = new Hono<AuthContext>()
           ]);
           const expected = videos.length + audios.length;
           if (newOrder.length !== expected) {
-            throw new HTTPException(400, { message: "track-order: length mismatch" });
+            return leftErr(400, "track-order: length mismatch");
           }
           const videoMap = new Map(videos.map((row) => [row.id, row]));
           const audioMap = new Map(audios.map((row) => [row.id, row]));
@@ -213,15 +254,11 @@ export const projects = new Hono<AuthContext>()
           for (const t of newOrder) {
             const exists = t.kind === "video" ? videoMap.has(t.id) : audioMap.has(t.id);
             if (!exists) {
-              throw new HTTPException(400, {
-                message: `track-order: unknown ${t.kind} id ${t.id}`,
-              });
+              return leftErr(400, `track-order: unknown ${t.kind} id ${t.id}`);
             }
             const key = `${t.kind}:${t.id}`;
             if (seen.has(key)) {
-              throw new HTTPException(400, {
-                message: `track-order: duplicate ${t.kind} id ${t.id}`,
-              });
+              return leftErr(400, `track-order: duplicate ${t.kind} id ${t.id}`);
             }
             seen.add(key);
           }
@@ -240,8 +277,10 @@ export const projects = new Hono<AuthContext>()
             else await tx.audio.update({ where: { id: t.id }, data });
             cursor += duration;
           }
+          return { right: undefined };
         }),
       );
+      if ("left" in txResult) return leftJson(c, txResult.left);
 
       const updated = await findProjectDetail(user.id, project.id);
       if (!updated) return c.json({ error: "project not found" }, 404);
@@ -255,7 +294,9 @@ export const projects = new Hono<AuthContext>()
     vValidator("json", createUploadSchema),
     async (c) => {
       const user = c.var.user;
-      const project = await requireProject(user.id, c.req.valid("param").id);
+      const projectR = await requireProject(user.id, c.req.valid("param").id);
+      if ("left" in projectR) return leftJson(c, projectR.left);
+      const project = projectR.right;
       const {
         kind,
         fileName,
@@ -290,8 +331,12 @@ export const projects = new Hono<AuthContext>()
     async (c) => {
       const user = c.var.user;
       const { id, uploadId, index: indexStr } = c.req.valid("param");
-      const project = await requireProject(user.id, id);
-      const upload = await requirePendingUpload(uploadId, project.id);
+      const projectR = await requireProject(user.id, id);
+      if ("left" in projectR) return leftJson(c, projectR.left);
+      const project = projectR.right;
+      const uploadR = await requirePendingUpload(uploadId, project.id);
+      if ("left" in uploadR) return leftJson(c, uploadR.left);
+      const upload = uploadR.right;
       const index = Number(indexStr);
       if (!Number.isInteger(index) || index < 0 || index >= upload.totalChunks) {
         return c.json({ error: `chunk index out of range [0, ${upload.totalChunks})` }, 400);
@@ -386,13 +431,14 @@ export const projects = new Hono<AuthContext>()
   .post("/:id/uploads/:uploadId/complete", vValidator("param", uploadIdParamSchema), async (c) => {
     const user = c.var.user;
     const { id, uploadId } = c.req.valid("param");
-    const project = await requireProject(user.id, id);
+    const projectR = await requireProject(user.id, id);
+    if ("left" in projectR) return leftJson(c, projectR.left);
+    const project = projectR.right;
 
-    // claim-first: 全 precondition を updateMany.where に畳んで原子化する。
-    // 並行 /complete も PUT promotion tx も race しても deadlock しない (skill: prisma-claim-first)。
-    // 失敗時 (count===0) だけ findFirst で診断し、既に completed なら冪等返却、それ以外は throw。
-    // throw は $transaction が自動 rollback してくれるので claim も巻き戻る
-    const result = await prisma.$transaction(async (tx) => {
+    // claim-first: 全 precondition を updateMany.where に畳んで原子化 (skill: prisma-claim-first)。
+    // 失敗時 (count===0) だけ findFirst で診断し、既に completed なら冪等返却、それ以外は Left。
+    // claim 後の validate 失敗は txEither が内部 throw で rollback してくれる
+    const result = await txEither<{ task: ApiTask; enqueue: boolean }>(async (tx) => {
       const claimed = await tx.upload.updateMany({
         where: {
           id: uploadId,
@@ -403,20 +449,24 @@ export const projects = new Hono<AuthContext>()
         data: { status: "completed" },
       });
       if (claimed.count === 0) {
-        const upload = await requireUpload(tx, uploadId, project.id);
+        const uploadR = await requireUpload(tx, uploadId, project.id);
+        if ("left" in uploadR) return uploadR;
+        const upload = uploadR.right;
         if (upload.status === "completed") {
           // 冪等: 既存 task を返す。並行 /complete の loser もここに来る
-          const task = await tx.task.findFirst({
+          const existing = await tx.task.findFirst({
             where: { uploadId: upload.id },
             orderBy: { createdAt: "desc" },
             include: { upload: { select: { fileName: true, kind: true } } },
           });
-          if (!task) throw httpJsonError(500, "completed upload has no task");
-          return { task: toApiTask(task), enqueue: false };
+          if (!existing) return { left: { status: 500, error: "completed upload has no task" } };
+          return { right: { task: toApiTask(existing), enqueue: false } };
         }
-        // not pending / expired を共通ヘルパで仕分け
-        assertUploadPending(upload);
-        throw new Error("unreachable: claim failed but upload is pending and not expired");
+        const pendingErr = checkUploadPending(upload);
+        if (pendingErr) return { left: pendingErr };
+        return {
+          left: { status: 500, error: "unreachable: claim failed but upload is pending" },
+        };
       }
       // claim 済み行を read。write lock を握っているので並行 read+write しない
       const upload = await tx.upload.findUniqueOrThrow({ where: { id: uploadId } });
@@ -425,18 +475,25 @@ export const projects = new Hono<AuthContext>()
         select: { index: true, sizeBytes: true },
       });
       if (chunks.length !== upload.totalChunks) {
-        throw httpJsonError(400, `missing chunks: received ${chunks.length}/${upload.totalChunks}`);
+        return {
+          left: {
+            status: 400,
+            error: `missing chunks: received ${chunks.length}/${upload.totalChunks}`,
+          },
+        };
       }
       const seen = new Set(chunks.map((chunk) => chunk.index));
       for (let i = 0; i < upload.totalChunks; i++) {
-        if (!seen.has(i)) throw httpJsonError(400, `missing chunk ${i}`);
+        if (!seen.has(i)) return { left: { status: 400, error: `missing chunk ${i}` } };
       }
       const sum = chunks.reduce((acc, chunk) => acc + chunk.sizeBytes, 0n);
       if (sum !== upload.totalBytes) {
-        throw httpJsonError(
-          400,
-          `byte total mismatch: received ${sum}, declared ${upload.totalBytes}`,
-        );
+        return {
+          left: {
+            status: 400,
+            error: `byte total mismatch: received ${sum}, declared ${upload.totalBytes}`,
+          },
+        };
       }
       const task = await tx.task.create({
         data: {
@@ -452,40 +509,48 @@ export const projects = new Hono<AuthContext>()
         where: { prefix: uploadPrefix(project.id, upload.id) },
         data: { nextRetryAt: new Date(Date.now() + TASK_GRACE_MS) },
       });
-      return { task: toApiTask(task), enqueue: true };
+      return { right: { task: toApiTask(task), enqueue: true } };
     });
-
-    if (result.enqueue) enqueueTask(result.task.id);
-    return c.json({ task: result.task satisfies ApiTask });
+    if ("left" in result) return leftJson(c, result.left);
+    if (result.right.enqueue) enqueueTask(result.right.task.id);
+    return c.json({ task: result.right.task satisfies ApiTask });
   })
 
   // pending な upload の自発キャンセル用。completed 後は task が chunks を必要とするので拒否
   .delete("/:id/uploads/:uploadId", vValidator("param", uploadIdParamSchema), async (c) => {
     const user = c.var.user;
     const { id, uploadId } = c.req.valid("param");
-    const project = await requireProject(user.id, id);
+    const projectR = await requireProject(user.id, id);
+    if ("left" in projectR) return leftJson(c, projectR.left);
+    const project = projectR.right;
     const prefix = uploadPrefix(project.id, uploadId);
-    // tx 内で status=pending を再確認して /complete と直列化
     // claim-first で pending → aborted に遷移 (skill: prisma-claim-first)。
     // 期限切れ pending も abort 対象なので expiresAt 条件は付けない
-    await prisma.$transaction(async (tx) => {
+    const result = await txEither<void>(async (tx) => {
       const claimed = await tx.upload.updateMany({
         where: { id: uploadId, projectId: project.id, status: "pending" },
         data: { status: "aborted" },
       });
       if (claimed.count === 0) {
-        const upload = await requireUpload(tx, uploadId, project.id);
-        throw httpJsonError(409, `cannot abort: upload is ${upload.status}`);
+        const uploadR = await requireUpload(tx, uploadId, project.id);
+        if ("left" in uploadR) return uploadR;
+        return {
+          left: { status: 409, error: `cannot abort: upload is ${uploadR.right.status}` },
+        };
       }
       await tx.uploadChunk.deleteMany({ where: { uploadId } });
+      return { right: undefined };
     });
+    if ("left" in result) return leftJson(c, result.left);
     await eagerCleanupAndUnmark(prefix);
     return c.body(null, 204);
   })
 
   .get("/:id/tasks", vValidator("param", idParamSchema), async (c) => {
     const user = c.var.user;
-    const project = await requireProject(user.id, c.req.valid("param").id);
+    const projectR = await requireProject(user.id, c.req.valid("param").id);
+    if ("left" in projectR) return leftJson(c, projectR.left);
+    const project = projectR.right;
     const tasks = await prisma.task.findMany({
       where: { projectId: project.id },
       orderBy: { createdAt: "desc" },
@@ -497,7 +562,11 @@ export const projects = new Hono<AuthContext>()
   .get("/:id/tasks/:taskId", vValidator("param", taskIdParamSchema), async (c) => {
     const user = c.var.user;
     const { id, taskId } = c.req.valid("param");
-    const project = await requireProject(user.id, id);
+    const projectR = await requireProject(user.id, id);
+
+    if ("left" in projectR) return leftJson(c, projectR.left);
+
+    const project = projectR.right;
     const task = await prisma.task.findFirst({
       where: { id: taskId, projectId: project.id },
       include: { upload: { select: { fileName: true, kind: true } } },
@@ -509,7 +578,11 @@ export const projects = new Hono<AuthContext>()
   .delete("/:id/videos/:videoId", vValidator("param", videoIdParamSchema), async (c) => {
     const user = c.var.user;
     const { id, videoId } = c.req.valid("param");
-    const project = await requireProject(user.id, id);
+    const projectR = await requireProject(user.id, id);
+
+    if ("left" in projectR) return leftJson(c, projectR.left);
+
+    const project = projectR.right;
     const video = await prisma.video.findFirst({
       where: { id: videoId, projectId: project.id },
     });
@@ -527,7 +600,11 @@ export const projects = new Hono<AuthContext>()
   .get("/:id/videos/:videoId/stream", vValidator("param", videoIdParamSchema), async (c) => {
     const user = c.var.user;
     const { id, videoId } = c.req.valid("param");
-    const project = await requireProject(user.id, id);
+    const projectR = await requireProject(user.id, id);
+
+    if ("left" in projectR) return leftJson(c, projectR.left);
+
+    const project = projectR.right;
     const video = await prisma.video.findFirst({
       where: { id: videoId, projectId: project.id },
     });
@@ -538,7 +615,11 @@ export const projects = new Hono<AuthContext>()
   .get("/:id/videos/:videoId/audio", vValidator("param", videoIdParamSchema), async (c) => {
     const user = c.var.user;
     const { id, videoId } = c.req.valid("param");
-    const project = await requireProject(user.id, id);
+    const projectR = await requireProject(user.id, id);
+
+    if ("left" in projectR) return leftJson(c, projectR.left);
+
+    const project = projectR.right;
     const video = await prisma.video.findFirst({
       where: { id: videoId, projectId: project.id },
     });
@@ -552,7 +633,11 @@ export const projects = new Hono<AuthContext>()
     async (c) => {
       const user = c.var.user;
       const { id, thumbId } = c.req.valid("param");
-      const project = await requireProject(user.id, id);
+      const projectR = await requireProject(user.id, id);
+
+      if ("left" in projectR) return leftJson(c, projectR.left);
+
+      const project = projectR.right;
       const thumb = await prisma.thumbnail.findFirst({
         where: { id: thumbId, video: { projectId: project.id } },
       });
@@ -564,7 +649,11 @@ export const projects = new Hono<AuthContext>()
   .delete("/:id/audios/:audioId", vValidator("param", audioIdParamSchema), async (c) => {
     const user = c.var.user;
     const { id, audioId } = c.req.valid("param");
-    const project = await requireProject(user.id, id);
+    const projectR = await requireProject(user.id, id);
+
+    if ("left" in projectR) return leftJson(c, projectR.left);
+
+    const project = projectR.right;
     const audio = await prisma.audio.findFirst({
       where: { id: audioId, projectId: project.id },
     });
@@ -581,7 +670,11 @@ export const projects = new Hono<AuthContext>()
   .get("/:id/audios/:audioId/stream", vValidator("param", audioIdParamSchema), async (c) => {
     const user = c.var.user;
     const { id, audioId } = c.req.valid("param");
-    const project = await requireProject(user.id, id);
+    const projectR = await requireProject(user.id, id);
+
+    if ("left" in projectR) return leftJson(c, projectR.left);
+
+    const project = projectR.right;
     const audio = await prisma.audio.findFirst({
       where: { id: audioId, projectId: project.id },
     });
@@ -592,7 +685,11 @@ export const projects = new Hono<AuthContext>()
   .get("/:id/audios/:audioId/raw", vValidator("param", audioIdParamSchema), async (c) => {
     const user = c.var.user;
     const { id, audioId } = c.req.valid("param");
-    const project = await requireProject(user.id, id);
+    const projectR = await requireProject(user.id, id);
+
+    if ("left" in projectR) return leftJson(c, projectR.left);
+
+    const project = projectR.right;
     const audio = await prisma.audio.findFirst({
       where: { id: audioId, projectId: project.id },
     });
