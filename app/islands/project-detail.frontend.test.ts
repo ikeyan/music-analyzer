@@ -653,4 +653,60 @@ describe("ProjectDetail (frontend)", () => {
     });
     expect(reorderRes.status).toBe(400);
   }, 90_000);
+
+  it("反転 audio は再生中 frame seek で <audio>.currentTime が src 末尾側に飛ぶ", async () => {
+    const id = await createProject("reverse-seek-test");
+    await goto(`/projects/${id}`);
+    await waitHydrated('input[type=file][accept="audio/*"]');
+    await injectFileToInput(getMedia().audioMp3, "audio/*", "rseek.mp3", "audio/mpeg");
+    await waitFor(webview(), "audio source", 30_000);
+    const before = (await fetch(`${server()}/api/projects/${id}`).then((r) => r.json())) as {
+      project: {
+        audios: {
+          id: string;
+          name: string;
+          durationSec: number;
+          projStartSec: number;
+          projEndSec: number;
+        }[];
+      };
+    };
+    const a = before.project.audios[0]!;
+    // proj を反転 (projStart=duration, projEnd=0)
+    const flipRes = await fetch(`${server()}/api/projects/${id}/audios/${a.id}/timing`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        srcStartSec: 0,
+        srcEndSec: a.durationSec,
+        projStartSec: a.durationSec,
+        projEndSec: 0,
+      }),
+    });
+    expect(flipRes.ok).toBe(true);
+    await goto(`/projects/${id}`);
+    await waitHydrated('input[type=file][accept="audio/*"]');
+    await waitFor(webview(), "audio source", 30_000);
+    await webview().evaluate(`new Promise((res, rej) => {
+      const audio = document.querySelector('audio');
+      if (!audio) return rej(new Error("no audio"));
+      if (audio.readyState >= 2) return res();
+      const t = setTimeout(() => rej(new Error("audio canplay timeout")), 5000);
+      audio.addEventListener('canplay', () => { clearTimeout(t); res(); }, { once: true });
+      audio.load();
+    })`);
+    await webview().click('button[aria-label="play"]');
+    // proj 0 で開始 → mediaT = srcEnd, seek で currentTime が末尾近くへ飛ぶ
+    const seeked = await webview().evaluate<number>(`new Promise(res => {
+      const audio = document.querySelector('audio');
+      const start = Date.now();
+      const tick = () => {
+        if (audio && audio.currentTime > 0.5) return res(audio.currentTime);
+        if (Date.now() - start > 3000) return res(audio?.currentTime ?? 0);
+        setTimeout(tick, 50);
+      };
+      tick();
+    })`);
+    expect(seeked).toBeGreaterThan(0.5);
+  }, 60_000);
 });

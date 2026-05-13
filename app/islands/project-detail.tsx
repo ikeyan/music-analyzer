@@ -470,16 +470,16 @@ function syncMediaElement(
     return;
   }
   const rate = dSrc / dProj;
-  // <video>/<audio>はnegativeなplaybackRateをサポートしないので逆再生中は無音表示
+  const mediaT = item.srcStartSec + ((projTime - item.projStartSec) / dProj) * dSrc;
+  if (Math.abs(el.currentTime - mediaT) > SYNC_DRIFT_TOLERANCE) {
+    el.currentTime = mediaT;
+  }
+  // browser は negative playbackRate 不可なので逆再生は frame seek だけで preview する
   if (rate <= 0) {
     if (!el.paused) el.pause();
     return;
   }
-  const mediaT = item.srcStartSec + ((projTime - item.projStartSec) / dProj) * dSrc;
   el.playbackRate = Math.min(16, Math.max(0.0625, rate));
-  if (Math.abs(el.currentTime - mediaT) > SYNC_DRIFT_TOLERANCE) {
-    el.currentTime = mediaT;
-  }
   if (playing) {
     if (el.paused) {
       void el.play().catch((err: unknown) => {
