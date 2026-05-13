@@ -972,9 +972,7 @@ function MediaEditDialog({
       setError("自分に対する「直後」「直前」は適用できません");
       return;
     }
-    // 反転 target も timeline 上では低→高に占有するので visual low/high で配置を決め、
-    // 向きだけ projStart/End の swap で保つ。signed duration を直接足すと反転 target が
-    // anchor 内に重ねて置かれる
+    // 配置は visual low/high で決めて向きは projStart/End の swap で保つ
     const a = anchorTrack.data;
     const anchorLow = Math.min(a.projStartSec, a.projEndSec);
     const anchorHigh = Math.max(a.projStartSec, a.projEndSec);
