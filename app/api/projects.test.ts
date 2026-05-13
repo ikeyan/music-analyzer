@@ -15,7 +15,8 @@ import { useDbFixture } from "../test-fixtures/db";
 import { useMediaFixture } from "../test-fixtures/media";
 import { useS3Fixture } from "../test-fixtures/s3";
 import { type AppType, api } from "./index";
-import { UPLOAD_EXPIRY_MS, findProjectDetail } from "./projects";
+import { Either } from "effect";
+import { UPLOAD_EXPIRY_MS, requireProjectDetail } from "./projects";
 import type { ApiTask, ApiUpload } from "./types";
 
 useDbFixture();
@@ -621,33 +622,41 @@ describe("chunked upload + media validation task", () => {
   });
 });
 
-describe("findProjectDetail", () => {
+describe("requireProjectDetail", () => {
   async function makeProject(userSub: string, name: string): Promise<string> {
     const user = await prisma.user.create({ data: { authentikSub: userSub } });
     const project = await prisma.project.create({ data: { userId: user.id, name } });
     return project.id;
   }
 
-  it("returns the project with empty videos/audios/tasks arrays when none exist", async () => {
+  function unwrapRight<R, E>(r: Either.Either<R, E>): R {
+    if (Either.isLeft(r)) throw new Error(`expected Right, got Left: ${JSON.stringify(r.left)}`);
+    return r.right;
+  }
+
+  it("returns Right with empty videos/audios/tasks arrays when none exist", async () => {
     const pid = await makeProject("detail-empty", "empty");
     const owner = await prisma.user.findFirstOrThrow({ where: { authentikSub: "detail-empty" } });
-    const result = await findProjectDetail(owner.id, pid);
-    expect(result).not.toBeNull();
-    expect(result!.id).toBe(pid);
-    expect(result!.videos).toEqual([]);
-    expect(result!.audios).toEqual([]);
-    expect(result!.tasks).toEqual([]);
+    const project = unwrapRight(await requireProjectDetail(owner.id, pid));
+    expect(project.id).toBe(pid);
+    expect(project.videos).toEqual([]);
+    expect(project.audios).toEqual([]);
+    expect(project.tasks).toEqual([]);
   });
 
-  it("returns null when the project belongs to another user", async () => {
+  it("returns Left 404 when the project belongs to another user", async () => {
     const pidA = await makeProject("detail-owner-a", "a");
     const userB = await prisma.user.create({ data: { authentikSub: "detail-owner-b" } });
-    expect(await findProjectDetail(userB.id, pidA)).toBeNull();
+    const r = await requireProjectDetail(userB.id, pidA);
+    expect(Either.isLeft(r)).toBe(true);
+    if (Either.isLeft(r)) expect(r.left).toEqual({ status: 404, error: "project not found" });
   });
 
-  it("returns null for missing project id", async () => {
+  it("returns Left 404 for missing project id", async () => {
     const user = await prisma.user.create({ data: { authentikSub: "detail-missing" } });
-    expect(await findProjectDetail(user.id, "no-such-project")).toBeNull();
+    const r = await requireProjectDetail(user.id, "no-such-project");
+    expect(Either.isLeft(r)).toBe(true);
+    if (Either.isLeft(r)) expect(r.left).toEqual({ status: 404, error: "project not found" });
   });
 
   it("orders videos and audios by `order` ascending and thumbnails by atSec", async () => {
@@ -725,10 +734,10 @@ describe("findProjectDetail", () => {
       ],
     });
     const owner = await prisma.user.findFirstOrThrow({ where: { authentikSub: "detail-order" } });
-    const result = await findProjectDetail(owner.id, pid);
-    expect(result!.videos.map((v) => v.id)).toEqual(["v0", "v1"]);
-    expect(result!.audios.map((a) => a.id)).toEqual(["a0", "a1"]);
-    expect(result!.videos[0]!.thumbnails.map((t) => t.id)).toEqual(["t0", "t1"]);
+    const project = unwrapRight(await requireProjectDetail(owner.id, pid));
+    expect(project.videos.map((v) => v.id)).toEqual(["v0", "v1"]);
+    expect(project.audios.map((a) => a.id)).toEqual(["a0", "a1"]);
+    expect(project.videos[0]!.thumbnails.map((t) => t.id)).toEqual(["t0", "t1"]);
   });
 
   it("excludes succeeded tasks (they have already become Video/Audio rows)", async () => {
@@ -744,8 +753,8 @@ describe("findProjectDetail", () => {
     const owner = await prisma.user.findFirstOrThrow({
       where: { authentikSub: "detail-task-filter" },
     });
-    const result = await findProjectDetail(owner.id, pid);
-    const ids = result!.tasks.map((t) => t.id).toSorted();
+    const project = unwrapRight(await requireProjectDetail(owner.id, pid));
+    const ids = project.tasks.map((t) => t.id).toSorted();
     expect(ids).toEqual(["tf", "tp", "tr"]);
   });
 });

@@ -1,16 +1,17 @@
 import { vValidator } from "@hono/valibot-validator";
-import * as runtime from "@prisma/client/runtime/client";
 import { Either } from "effect";
-import type { Context, MiddlewareHandler, TypedResponse } from "hono";
+import type { TypedResponse } from "hono";
 import { Hono } from "hono";
+import { createMiddleware } from "hono/factory";
+import type { JSONParsed } from "hono/utils/types";
 import * as v from "valibot";
-import { type Prisma, type PrismaClient } from "../generated/prisma/client";
-import { type AuthContext, requireUser } from "../lib/auth";
+import { requireUser } from "../lib/auth";
 import { describeError } from "../lib/error";
 import { MAX_UPLOAD_BYTES } from "../lib/ffmpeg";
 import { eagerCleanupAndUnmark, markPrefixForDeletion } from "../lib/gc";
 import { prisma } from "../lib/prisma";
 import { withSlotRetry } from "../lib/prisma-retry";
+import { type TxClient, txEither } from "../lib/prisma-tx";
 import { getS3 } from "../lib/s3";
 import {
   audioPrefix,
@@ -43,14 +44,6 @@ const DEFAULT_CHUNK_SIZE = 8 * 1024 * 1024;
 const MIN_CHUNK_SIZE = 1024;
 const MAX_CHUNK_SIZE = 64 * 1024 * 1024;
 
-// prisma も tx もどちらも受けたいので $transaction だけ除いた型を作る。
-// 呼び出し側は generics を素通しする (デフォルトを置くと推論に巻き込まれる)
-type PrismaClientLike<
-  in LogOpts extends Prisma.LogLevel,
-  in out OmitOpts extends Prisma.PrismaClientOptions["omit"],
-  in out ExtArgs extends runtime.Types.Extensions.InternalArgs,
-> = Omit<PrismaClient<LogOpts, OmitOpts, ExtArgs>, runtime.ITXClientDenyList>;
-
 // throw HTTPException は hc の response 型に乗らないので Either で返す。
 // `<const E>` で literal status / 追加プロパティをそのまま伝播させる
 type ApiErrorStatus = 400 | 404 | 409 | 410 | 500;
@@ -60,68 +53,33 @@ function leftErr<const E extends ApiError>(e: E): Either.Either<never, E> {
   return Either.left(e);
 }
 
-// e.status の literal がそのまま c.json の status overload に渡るので、
-// hc がエラー status 毎に narrow した response 型を見られる
-function leftJson<const E extends ApiError>(c: Context, e: E) {
-  const { status, ...body } = e;
-  return c.json(body, status);
-}
+// c.json の戻り値型と一致させて as を排除する
+type LeftRes<E extends ApiError> = Response &
+  TypedResponse<JSONParsed<Omit<E, "status">>, E["status"], "json">;
+type RightRes<R> = Response & TypedResponse<JSONParsed<R>, 200, "json">;
 
-// c に閉じた eitherJson を作る。c.var.eitherJson 経由で handler から使う。
-// handler 自体をラップする方式 (eitherHandler) だと validator 由来の Input が
-// HOF 越しに伝わらず c.req.valid が無力化されるので、middleware で c.var に
-// 関数を生やすことで handler を素のまま (Hono 標準形) に保つ。
-// overload を切らないと isLeft で narrow した Left<E, R> を渡したときも
-// R が phantom として残り、c.json(r.right) 経由で R が response 型に leak する
-type LeftRes<E extends ApiError> = TypedResponse<Omit<E, "status">, E["status"], "json">;
-type RightRes<R> = TypedResponse<R, 200, "json">;
+// handler を wrapping すると validator 由来の Input が HOF 越しに伝わらず c.req.valid が
+// 無力化されるので、middleware で c.var に関数を生やすことで handler を素のまま保つ。
+// overload を切らないと isLeft narrow 後の Left<E, R> でも R が phantom として残り、
+// c.json(r.right) 経由で R が response 型に leak する
 type EitherJsonFn = {
   <const E extends ApiError>(r: Either.Left<E, unknown>): LeftRes<E>;
   <const E extends ApiError, R>(r: Either.Either<R, E>): LeftRes<E> | RightRes<R>;
 };
 
-function makeEitherJson(c: Context): EitherJsonFn {
-  return <const E extends ApiError, R>(r: Either.Either<R, E>) =>
-    (Either.isLeft(r) ? leftJson(c, r.left) : c.json(r.right)) as LeftRes<E> | RightRes<R>;
-}
-
-type ProjectsContext = {
-  Variables: AuthContext["Variables"] & {
-    eitherJson: EitherJsonFn;
+const provideEitherJson = createMiddleware<{
+  Variables: { eitherJson: EitherJsonFn };
+}>(async (c, next) => {
+  const eitherJson: EitherJsonFn = <const E extends ApiError, R>(r: Either.Either<R, E>) => {
+    if (Either.isLeft(r)) {
+      const { status, ...body } = r.left;
+      return c.json(body, status);
+    }
+    return c.json(r.right);
   };
-};
-
-const provideEitherJson: MiddlewareHandler<ProjectsContext> = async (c, next) => {
-  c.set("eitherJson", makeEitherJson(c));
+  c.set("eitherJson", eitherJson);
   await next();
-};
-
-// tx 内で Left を返した場合に rollback したい。Prisma の $transaction は
-// throw でしか rollback できないので、内部で throw → 外で catch して Left に戻す
-class TxRollback extends Error {
-  constructor(public left: unknown) {
-    super();
-  }
-}
-
-async function txEither<A, E>(
-  fn: (
-    tx: Parameters<Parameters<typeof prisma.$transaction>[0]>[0],
-  ) => Promise<Either.Either<A, E>>,
-): Promise<Either.Either<A, E>> {
-  try {
-    const a = await prisma.$transaction(async (tx) => {
-      const r = await fn(tx);
-      if (Either.isLeft(r)) throw new TxRollback(r.left);
-      return r.right;
-    });
-    return Either.right(a);
-  } catch (err) {
-    // throw / catch を自分で挟んでいるので left が E であることは確定
-    if (err instanceof TxRollback) return Either.left(err.left as E);
-    throw err;
-  }
-}
+});
 
 const idParamSchema = v.object({ id: v.string() });
 const videoIdParamSchema = v.object({ id: v.string(), videoId: v.string() });
@@ -163,12 +121,8 @@ async function requireProject(userId: string, projectId: string) {
   return Either.right(p);
 }
 
-// prisma / tx のどちらでも呼べる。generics は呼び出し側から素通し
-async function requireUpload<
-  LogOpts extends Prisma.LogLevel,
-  OmitOpts extends Prisma.PrismaClientOptions["omit"],
-  ExtArgs extends runtime.Types.Extensions.InternalArgs,
->(client: PrismaClientLike<LogOpts, OmitOpts, ExtArgs>, uploadId: string, projectId: string) {
+// prisma / tx のどちらでも呼べる (typeof prisma は構造的に TxClient のサブタイプ)
+async function requireUpload(client: TxClient, uploadId: string, projectId: string) {
   const upload = await client.upload.findFirst({ where: { id: uploadId, projectId } });
   if (!upload) return leftErr({ status: 404, error: "upload not found" });
   return Either.right(upload);
@@ -203,8 +157,8 @@ async function requirePendingUpload(
 // GET /:id, PATCH /:id/track-order, SSR route で共通する Project detail loader。
 // 戻り値の include shape は toApiProjectDetail への射影と合わせる。
 // succeeded task は Video/Audio として timeline に出るので除外
-export async function findProjectDetail(userId: string, projectId: string) {
-  return await prisma.project.findFirst({
+export async function requireProjectDetail(userId: string, projectId: string) {
+  const p = await prisma.project.findFirst({
     where: { id: projectId, userId },
     include: {
       videos: { orderBy: { order: "asc" }, include: { thumbnails: { orderBy: { atSec: "asc" } } } },
@@ -216,9 +170,11 @@ export async function findProjectDetail(userId: string, projectId: string) {
       },
     },
   });
+  if (!p) return leftErr({ status: 404, error: "project not found" });
+  return Either.right(p);
 }
 
-export const projects = new Hono<ProjectsContext>()
+export const projects = new Hono()
   .use("*", requireUser)
   .use("*", provideEitherJson)
   .get("/", async (c) => {
@@ -238,9 +194,9 @@ export const projects = new Hono<ProjectsContext>()
   })
   .get("/:id", vValidator("param", idParamSchema), async (c) => {
     const user = c.var.user;
-    const project = await findProjectDetail(user.id, c.req.valid("param").id);
-    if (!project) return c.json({ error: "project not found" }, 404);
-    return c.json({ project: toApiProjectDetail(project) satisfies ApiProjectDetail });
+    const r = await requireProjectDetail(user.id, c.req.valid("param").id);
+    if (Either.isLeft(r)) return c.var.eitherJson(r);
+    return c.json({ project: toApiProjectDetail(r.right) satisfies ApiProjectDetail });
   })
   .delete("/:id", vValidator("param", idParamSchema), async (c) => {
     const user = c.var.user;
@@ -333,9 +289,9 @@ export const projects = new Hono<ProjectsContext>()
       );
       if (Either.isLeft(txResult)) return c.var.eitherJson(txResult);
 
-      const updated = await findProjectDetail(user.id, project.id);
-      if (!updated) return c.json({ error: "project not found" }, 404);
-      return c.json({ project: toApiProjectDetail(updated) satisfies ApiProjectDetail });
+      const updatedR = await requireProjectDetail(user.id, project.id);
+      if (Either.isLeft(updatedR)) return c.var.eitherJson(updatedR);
+      return c.json({ project: toApiProjectDetail(updatedR.right) satisfies ApiProjectDetail });
     },
   )
 
