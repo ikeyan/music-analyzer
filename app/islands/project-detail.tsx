@@ -969,30 +969,32 @@ function MediaEditDialog({
       setError("自分に対する「直後」「直前」は適用できません");
       return;
     }
+    // 反転 target も timeline 上では低→高に占有するので visual low/high で配置を決め、
+    // 向きだけ projStart/End の swap で保つ。signed duration を直接足すと反転 target が
+    // anchor 内に重ねて置かれる
     const a = anchorTrack.data;
-    let anchorValue: number;
-    let setMyStart: boolean;
+    const anchorLow = Math.min(a.projStartSec, a.projEndSec);
+    const anchorHigh = Math.max(a.projStartSec, a.projEndSec);
+    const newAbsDur = Math.abs(t.projEndSec - t.projStartSec) * s;
+    const wasReversed = t.projEndSec < t.projStartSec;
+    let newLow: number;
     switch (pattern) {
       case "same-start":
-        anchorValue = a.projStartSec;
-        setMyStart = true;
+        newLow = anchorLow;
         break;
       case "same-end":
-        anchorValue = a.projEndSec;
-        setMyStart = false;
+        newLow = anchorHigh - newAbsDur;
         break;
       case "after":
-        anchorValue = a.projEndSec;
-        setMyStart = true;
+        newLow = anchorHigh;
         break;
       case "before":
-        anchorValue = a.projStartSec;
-        setMyStart = false;
+        newLow = anchorLow - newAbsDur;
         break;
     }
-    const newSignedDur = (t.projEndSec - t.projStartSec) * s;
-    const projStartSec = setMyStart ? anchorValue : anchorValue - newSignedDur;
-    const projEndSec = setMyStart ? anchorValue + newSignedDur : anchorValue;
+    const newHigh = newLow + newAbsDur;
+    const projStartSec = wasReversed ? newHigh : newLow;
+    const projEndSec = wasReversed ? newLow : newHigh;
     if (projStartSec < 0 || projEndSec < 0) {
       setError("結果の projStart/End が負になります");
       return;

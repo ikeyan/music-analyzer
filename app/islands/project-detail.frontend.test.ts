@@ -434,6 +434,84 @@ describe("ProjectDetail (frontend)", () => {
     expect(afterRev.projStartSec).toBeGreaterThanOrEqual(afterFwd.projEndSec);
   }, 90_000);
 
+  it("反転 target に「終了直後」を適用すると visually anchor の直後に置かれる", async () => {
+    const id = await createProject("align-after-reversed-test");
+    await goto(`/projects/${id}`);
+    await waitHydrated('input[type=file][accept="audio/*"]');
+    await injectFileToInput(getMedia().audioMp3, "audio/*", "anchor.mp3", "audio/mpeg");
+    await waitFor(webview(), "audio source", 30_000);
+    await injectFileToInput(getMedia().audioMp3, "audio/*", "target.mp3", "audio/mpeg");
+    await webview().evaluate(`new Promise((res, rej) => {
+      const start = Date.now();
+      const tick = () => {
+        if (document.querySelectorAll('audio').length >= 2) return res();
+        if (Date.now() - start > 30000) return rej(new Error("second audio timeout"));
+        setTimeout(tick, 100);
+      };
+      tick();
+    })`);
+    const before = (await fetch(`${server()}/api/projects/${id}`).then((r) => r.json())) as {
+      project: { audios: { id: string; name: string; projStartSec: number; projEndSec: number }[] };
+    };
+    const anchor = before.project.audios.find((a) => a.name === "anchor.mp3")!;
+    const target = before.project.audios.find((a) => a.name === "target.mp3")!;
+    const anchorHigh = Math.max(anchor.projStartSec, anchor.projEndSec);
+    const targetAbsDur = Math.abs(target.projEndSec - target.projStartSec);
+    // target を反転
+    const flipRes = await fetch(`${server()}/api/projects/${id}/audios/${target.id}/timing`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        srcStartSec: 0,
+        srcEndSec: 1,
+        projStartSec:
+          target.projEndSec === 0
+            ? target.projStartSec
+            : Math.max(target.projStartSec, target.projEndSec),
+        projEndSec: Math.min(target.projStartSec, target.projEndSec),
+      }),
+    });
+    expect(flipRes.ok).toBe(true);
+    // flip は直接 API で済ませたので SSR 再取得して React state に反映させる
+    await goto(`/projects/${id}`);
+    await waitHydrated('input[type=file][accept="audio/*"]');
+    // 編集ダイアログで基準=anchor, 配置=after, 倍率=1 で適用
+    await webview().click('button[aria-label="target.mp3 を編集"]');
+    await waitFor(webview(), 'div[role="dialog"]');
+    await webview().evaluate(`(() => {
+      const dlg = document.querySelector('div[role="dialog"]');
+      const selects = dlg.querySelectorAll('select');
+      const setter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value").set;
+      const anchorOpt = Array.from(selects[0].options).find(o => o.textContent && o.textContent.includes("anchor.mp3"));
+      if (!anchorOpt) throw new Error("anchor option not found");
+      setter.call(selects[0], anchorOpt.value);
+      selects[0].dispatchEvent(new Event("change", { bubbles: true }));
+      setter.call(selects[1], "after");
+      selects[1].dispatchEvent(new Event("change", { bubbles: true }));
+      const apply = Array.from(dlg.querySelectorAll('button')).filter(b => b.textContent === "適用")[0];
+      apply.click();
+    })()`);
+    await webview().evaluate(`new Promise((res, rej) => {
+      const start = Date.now();
+      const tick = () => {
+        if (!document.querySelector('div[role="dialog"]')) return res();
+        if (Date.now() - start > 5000) return rej(new Error("dialog still open"));
+        setTimeout(tick, 50);
+      };
+      tick();
+    })`);
+    const after = (await fetch(`${server()}/api/projects/${id}`).then((r) => r.json())) as {
+      project: { audios: { name: string; projStartSec: number; projEndSec: number }[] };
+    };
+    const afterTarget = after.project.audios.find((a) => a.name === "target.mp3")!;
+    const targetLow = Math.min(afterTarget.projStartSec, afterTarget.projEndSec);
+    const targetHigh = Math.max(afterTarget.projStartSec, afterTarget.projEndSec);
+    // 反転が保たれ、visually anchor の直後に置かれる
+    expect(afterTarget.projStartSec).toBeGreaterThan(afterTarget.projEndSec);
+    expect(targetLow).toBeCloseTo(anchorHigh, 3);
+    expect(targetHigh).toBeCloseTo(anchorHigh + targetAbsDur, 3);
+  }, 90_000);
+
   it("反転 track の後に upload した media は反転 track と overlap しない", async () => {
     const id = await createProject("alloc-after-reversed-test");
     await goto(`/projects/${id}`);
