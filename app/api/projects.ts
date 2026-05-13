@@ -88,7 +88,9 @@ async function allocSlot(
   projectId: string,
 ): Promise<{ order: number; projStart: number }> {
   await tx.project.update({ where: { id: projectId }, data: { updatedAt: new Date() } });
-  const [vOrder, aOrder, vEnd, aEnd] = await Promise.all([
+  // 反転 (projStart > projEnd) を許すので max(start, end) = max(max(start), max(end))
+  // の両方が必要。row 数が多くないので findFirst を 6 並列で済ます
+  const [vOrder, aOrder, vEnd, aEnd, vStart, aStart] = await Promise.all([
     tx.video.findFirst({
       where: { projectId },
       orderBy: { order: "desc" },
@@ -108,11 +110,26 @@ async function allocSlot(
       where: { projectId },
       orderBy: { projEndSec: "desc" },
       select: { projEndSec: true },
+    }),
+    tx.video.findFirst({
+      where: { projectId },
+      orderBy: { projStartSec: "desc" },
+      select: { projStartSec: true },
+    }),
+    tx.audio.findFirst({
+      where: { projectId },
+      orderBy: { projStartSec: "desc" },
+      select: { projStartSec: true },
     }),
   ]);
   return {
     order: Math.max(vOrder?.order ?? -1, aOrder?.order ?? -1) + 1,
-    projStart: Math.max(vEnd?.projEndSec ?? 0, aEnd?.projEndSec ?? 0),
+    projStart: Math.max(
+      vEnd?.projEndSec ?? 0,
+      aEnd?.projEndSec ?? 0,
+      vStart?.projStartSec ?? 0,
+      aStart?.projStartSec ?? 0,
+    ),
   };
 }
 

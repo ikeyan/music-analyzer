@@ -433,4 +433,45 @@ describe("ProjectDetail (frontend)", () => {
     expect(afterRev.projEndSec).toBeCloseTo(afterFwd.projEndSec, 3);
     expect(afterRev.projStartSec).toBeGreaterThanOrEqual(afterFwd.projEndSec);
   }, 90_000);
+
+  it("反転 track の後に upload した media は反転 track と overlap しない", async () => {
+    const id = await createProject("alloc-after-reversed-test");
+    await goto(`/projects/${id}`);
+    await waitHydrated('input[type=file][accept="audio/*"]');
+    await injectFileToInput(getMedia().audioMp3, "audio/*", "rev.mp3", "audio/mpeg");
+    await waitFor(webview(), "audio source", 30_000);
+    const before = (await fetch(`${server()}/api/projects/${id}`).then((r) => r.json())) as {
+      project: { audios: { id: string; name: string; projStartSec: number; projEndSec: number }[] };
+    };
+    const rev = before.project.audios.find((a) => a.name === "rev.mp3")!;
+    const revExtent = Math.max(rev.projStartSec, rev.projEndSec);
+    // rev を反転 (projStart > projEnd)
+    const flipRes = await fetch(`${server()}/api/projects/${id}/audios/${rev.id}/timing`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        srcStartSec: 0,
+        srcEndSec: 1,
+        projStartSec: rev.projEndSec === 0 ? rev.projStartSec : revExtent,
+        projEndSec: 0,
+      }),
+    });
+    expect(flipRes.ok).toBe(true);
+    // 反転後に新規 upload。allocSlot が max(start, end) を使えば revExtent 以後に置かれる
+    await injectFileToInput(getMedia().audioMp3, "audio/*", "after.mp3", "audio/mpeg");
+    await webview().evaluate(`new Promise((res, rej) => {
+      const start = Date.now();
+      const tick = () => {
+        if (document.querySelectorAll('audio').length >= 2) return res();
+        if (Date.now() - start > 30000) return rej(new Error("second audio timeout"));
+        setTimeout(tick, 100);
+      };
+      tick();
+    })`);
+    const after = (await fetch(`${server()}/api/projects/${id}`).then((r) => r.json())) as {
+      project: { audios: { name: string; projStartSec: number; projEndSec: number }[] };
+    };
+    const afterMedia = after.project.audios.find((a) => a.name === "after.mp3")!;
+    expect(afterMedia.projStartSec).toBeGreaterThanOrEqual(revExtent - 1e-6);
+  }, 90_000);
 });
