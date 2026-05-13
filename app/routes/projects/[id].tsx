@@ -12,6 +12,11 @@ export default createRoute(requireUser, async (c) => {
     include: {
       videos: { orderBy: { order: "asc" }, include: { thumbnails: { orderBy: { atSec: "asc" } } } },
       audios: { orderBy: { order: "asc" } },
+      tasks: {
+        where: { status: { in: ["pending", "running", "failed"] } },
+        orderBy: { createdAt: "desc" },
+        include: { upload: { select: { fileName: true, kind: true } } },
+      },
     },
   });
   if (!project) return c.notFound();

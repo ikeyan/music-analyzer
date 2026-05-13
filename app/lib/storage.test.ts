@@ -3,6 +3,8 @@ import {
   audioRawKey,
   audioTranscodedKey,
   projectKey,
+  uploadChunkKey,
+  uploadPrefix,
   videoAudioKey,
   videoSourceKey,
   videoThumbKey,
@@ -27,5 +29,17 @@ describe("storage paths", () => {
     expect(videoThumbKey(pid, vid, 0)).toBe("projects/p_1/videos/v_1/thumbs/000000.jpg");
     expect(videoThumbKey(pid, vid, 10)).toBe("projects/p_1/videos/v_1/thumbs/000010.jpg");
     expect(videoThumbKey(pid, vid, 3590)).toBe("projects/p_1/videos/v_1/thumbs/003590.jpg");
+  });
+
+  it("upload prefix と chunk key を 7桁 0-pad + writeId で発番する", () => {
+    const pid = "p_1";
+    const uid = "u_1";
+    const w = "abc";
+    expect(uploadPrefix(pid, uid)).toBe("projects/p_1/uploads/u_1/");
+    expect(uploadChunkKey(pid, uid, 0, w)).toBe("projects/p_1/uploads/u_1/chunks/0000000-abc");
+    expect(uploadChunkKey(pid, uid, 42, w)).toBe("projects/p_1/uploads/u_1/chunks/0000042-abc");
+    expect(uploadChunkKey(pid, uid, 9999999, w)).toBe(
+      "projects/p_1/uploads/u_1/chunks/9999999-abc",
+    );
   });
 });

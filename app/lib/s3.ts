@@ -1,4 +1,5 @@
 import { S3Client } from "bun";
+import { readSecretEnv } from "./env";
 
 declare global {
   // dev で HMR/再 import 時に S3Client を使い回すための単一スロット
@@ -7,8 +8,8 @@ declare global {
 }
 
 function createS3Client(): S3Client {
-  const accessKeyId = process.env.S3_ACCESS_KEY_ID;
-  const secretAccessKey = process.env.S3_SECRET_ACCESS_KEY;
+  const accessKeyId = readSecretEnv("S3_ACCESS_KEY_ID");
+  const secretAccessKey = readSecretEnv("S3_SECRET_ACCESS_KEY");
   const bucket = process.env.S3_BUCKET;
 
   if (!accessKeyId || !secretAccessKey || !bucket) {

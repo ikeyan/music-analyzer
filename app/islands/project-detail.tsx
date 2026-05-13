@@ -1,11 +1,23 @@
-import { type CSSProperties, type ReactNode, useEffect, useMemo, useRef, useState } from "react";
-import type { ApiAudio, ApiProjectDetail, ApiThumbnail, ApiVideo } from "../api/types";
+import {
+  type CSSProperties,
+  type ReactNode,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import type { ApiAudio, ApiProjectDetail, ApiTask, ApiThumbnail, ApiVideo } from "../api/types";
 import { apiClient } from "../lib/api-client";
+import { chunkedUpload } from "../lib/chunked-upload";
 
 export type Thumb = ApiThumbnail;
 export type VideoItem = ApiVideo;
 export type AudioItem = ApiAudio;
 export type ProjectDetailData = ApiProjectDetail;
+
+// active task がある間 1s 間隔で refresh (succeeded 後の Video/Audio 反映も兼ねる)
+const TASK_POLL_INTERVAL_MS = 1000;
 
 type Track = { kind: "video"; data: VideoItem } | { kind: "audio"; data: AudioItem };
 
@@ -109,43 +121,54 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
     }
   }, [tracks, currentTime, playing]);
 
-  async function refresh() {
-    const res = await apiClient.projects[":id"].$get({ param: { id: data.id } });
+  const projectId = data.id;
+  const refresh = useCallback(async () => {
+    const res = await apiClient.projects[":id"].$get({ param: { id: projectId } });
     if (!res.ok) return;
     const body = await res.json();
     setData(body.project);
+  }, [projectId]);
+
+  async function uploadMedia(kind: "video" | "audio", file: File) {
+    setBusy(kind);
+    setError(null);
+    try {
+      const result = await chunkedUpload(
+        apiClient,
+        data.id,
+        kind,
+        file,
+        file.name,
+        file.type || undefined,
+      );
+      if (!result.ok) {
+        const label = kind === "video" ? "動画" : "音声";
+        setError(`${label} upload 失敗 (HTTP ${result.status}): ${result.error}`);
+        return;
+      }
+      // refresh が transient error で失敗しても polling effect が動くよう task を直接 seed
+      setData((d) => ({
+        ...d,
+        tasks: [result.task, ...d.tasks.filter((t) => t.id !== result.task.id)],
+      }));
+      await refresh();
+    } finally {
+      setBusy(null);
+    }
   }
 
-  async function uploadVideo(file: File) {
-    setBusy("video");
-    setError(null);
-    try {
-      const url = apiClient.projects[":id"].videos.$url({ param: { id: data.id } });
-      const result = await uploadFileTo(url.toString(), file);
-      if ("error" in result) {
-        setError(`動画 upload 失敗 (HTTP ${result.status}): ${result.error}`);
-        return;
-      }
-      await refresh();
-    } finally {
-      setBusy(null);
-    }
-  }
-  async function uploadAudio(file: File) {
-    setBusy("audio");
-    setError(null);
-    try {
-      const url = apiClient.projects[":id"].audios.$url({ param: { id: data.id } });
-      const result = await uploadFileTo(url.toString(), file);
-      if ("error" in result) {
-        setError(`音声 upload 失敗 (HTTP ${result.status}): ${result.error}`);
-        return;
-      }
-      await refresh();
-    } finally {
-      setBusy(null);
-    }
-  }
+  // boolean に縮約して effect の再 mount を抑える
+  const hasActiveTasks = useMemo(
+    () => data.tasks.some((t) => t.status === "pending" || t.status === "running"),
+    [data.tasks],
+  );
+  useEffect(() => {
+    if (!hasActiveTasks) return;
+    const timer = setInterval(() => {
+      void refresh();
+    }, TASK_POLL_INTERVAL_MS);
+    return () => clearInterval(timer);
+  }, [hasActiveTasks, refresh]);
 
   // user-gesture 内で play().then(pause) して全 track を unlock。範囲外は mute で音漏れを防ぐ。
   // 範囲外要素は unlocking フラグで syncMediaElement の同期 pause から除外する
@@ -271,14 +294,14 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
           label="動画追加"
           accept="video/*"
           disabled={busy !== null}
-          onPick={uploadVideo}
+          onPick={(f) => uploadMedia("video", f)}
           busy={busy === "video"}
         />
         <UploadField
           label="音声追加"
           accept="audio/*"
           disabled={busy !== null}
-          onPick={uploadAudio}
+          onPick={(f) => uploadMedia("audio", f)}
           busy={busy === "audio"}
         />
       </section>
@@ -299,6 +322,8 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
           {error}
         </p>
       )}
+
+      {data.tasks.length > 0 && <TaskList tasks={data.tasks} />}
 
       <section
         style={{ display: "flex", alignItems: "center", gap: "0.75rem", margin: "0.75rem 0" }}
@@ -418,19 +443,6 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
       )}
     </div>
   );
-}
-
-async function uploadFileTo(
-  url: string,
-  file: File,
-): Promise<{ ok: true } | { error: string; status: number }> {
-  const fd = new FormData();
-  fd.append("file", file);
-  fd.append("name", file.name);
-  const res = await fetch(url, { method: "POST", body: fd });
-  if (res.ok) return { ok: true };
-  const body = (await res.json().catch(() => ({}))) as { error?: string };
-  return { error: body.error ?? "(no error message in response body)", status: res.status };
 }
 
 function trackKey(t: Track): string {
@@ -799,6 +811,104 @@ function ThumbnailStrip({
         );
       })}
     </div>
+  );
+}
+
+function TaskList({ tasks }: { tasks: ApiTask[] }) {
+  return (
+    <section
+      aria-label="処理中のタスク"
+      style={{
+        border: "1px solid #ddd",
+        borderRadius: 6,
+        background: "#f6f8fa",
+        padding: "0.5rem 0.75rem",
+        margin: "0.5rem 0",
+      }}
+    >
+      <h2 style={{ fontSize: "0.95rem", margin: "0 0 0.4rem 0" }}>処理中のタスク</h2>
+      <ul style={{ margin: 0, padding: 0, listStyle: "none", display: "grid", gap: "0.35rem" }}>
+        {tasks.map((t) => (
+          <TaskRow key={t.id} task={t} />
+        ))}
+      </ul>
+    </section>
+  );
+}
+
+function TaskRow({ task }: { task: ApiTask }) {
+  const kindLabel =
+    task.upload?.kind === "video" ? "動画" : task.upload?.kind === "audio" ? "音声" : "ファイル";
+  const statusLabel = (() => {
+    switch (task.status) {
+      case "pending":
+        return "待機中";
+      case "running":
+        return "処理中…";
+      case "failed":
+        return "失敗";
+      case "succeeded":
+        return "完了";
+    }
+  })();
+  const statusColor = (() => {
+    switch (task.status) {
+      case "running":
+        return "#1f6feb";
+      case "pending":
+        return "#6e7781";
+      case "failed":
+        return "crimson";
+      case "succeeded":
+        return "#1a7f37";
+    }
+  })();
+  const fileName = task.upload?.fileName ?? "(削除済み upload)";
+  return (
+    <li
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: "0.5rem",
+        fontSize: "0.85rem",
+        flexWrap: "wrap",
+      }}
+    >
+      <span
+        style={{
+          display: "inline-block",
+          minWidth: "2.5rem",
+          padding: "0 0.4rem",
+          background: task.upload?.kind === "video" ? "#3b82f6" : "#10b981",
+          color: "white",
+          borderRadius: 3,
+          fontSize: "0.75rem",
+          textAlign: "center",
+        }}
+      >
+        {kindLabel}
+      </span>
+      <span style={{ fontFamily: "monospace", overflow: "hidden", textOverflow: "ellipsis" }}>
+        {fileName}
+      </span>
+      <span style={{ color: statusColor, fontWeight: 600 }}>{statusLabel}</span>
+      {task.error && (
+        <span
+          role="alert"
+          style={{
+            color: "crimson",
+            flexBasis: "100%",
+            background: "#fff5f5",
+            padding: "0.25rem 0.4rem",
+            borderRadius: 3,
+            whiteSpace: "pre-wrap",
+            wordBreak: "break-word",
+          }}
+        >
+          {task.error}
+        </span>
+      )}
+    </li>
   );
 }
 
