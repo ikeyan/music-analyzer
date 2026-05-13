@@ -3,6 +3,7 @@ import { Hono } from "hono";
 import { HTTPException } from "hono/http-exception";
 import * as v from "valibot";
 import { type AuthContext, requireUser } from "../lib/auth";
+import { describeError } from "../lib/error";
 import { MAX_UPLOAD_BYTES } from "../lib/ffmpeg";
 import { eagerCleanupAndUnmark, markPrefixForDeletion } from "../lib/gc";
 import { prisma } from "../lib/prisma";
@@ -38,7 +39,6 @@ const DEFAULT_CHUNK_SIZE = 8 * 1024 * 1024;
 // 極小チャンク DoS 防止
 const MIN_CHUNK_SIZE = 1024;
 const MAX_CHUNK_SIZE = 64 * 1024 * 1024;
-const MAX_SINGLE_CHUNK_BYTES = MAX_CHUNK_SIZE;
 
 const idParamSchema = v.object({ id: v.string() });
 const videoIdParamSchema = v.object({ id: v.string(), videoId: v.string() });
@@ -73,8 +73,15 @@ const createUploadSchema = v.object({
   ),
 });
 
-async function findProjectOr404(userId: string, projectId: string) {
+// 見つからない場合は HTTPException(404) で response を確定させる。
+// 既存の API レスポンス契約を壊さないよう本文は JSON `{ error }` で返す
+async function requireProject(userId: string, projectId: string) {
   const p = await prisma.project.findFirst({ where: { id: projectId, userId } });
+  if (!p) {
+    throw new HTTPException(404, {
+      res: Response.json({ error: "project not found" }, { status: 404 }),
+    });
+  }
   return p;
 }
 
@@ -121,8 +128,7 @@ export const projects = new Hono<AuthContext>()
   })
   .delete("/:id", vValidator("param", idParamSchema), async (c) => {
     const user = c.var.user;
-    const project = await findProjectOr404(user.id, c.req.valid("param").id);
-    if (!project) return c.json({ error: "project not found" }, 404);
+    const project = await requireProject(user.id, c.req.valid("param").id);
     const prefix = projectPrefix(project.id);
     await prisma.$transaction(async (tx) => {
       await tx.deletionMark.create({ data: { prefix } });
@@ -144,8 +150,7 @@ export const projects = new Hono<AuthContext>()
     vValidator("json", reorderTracksSchema),
     async (c) => {
       const user = c.var.user;
-      const project = await findProjectOr404(user.id, c.req.valid("param").id);
-      if (!project) return c.json({ error: "project not found" }, 404);
+      const project = await requireProject(user.id, c.req.valid("param").id);
       const { tracks: newOrder } = c.req.valid("json");
 
       await withSlotRetry(() =>
@@ -213,8 +218,7 @@ export const projects = new Hono<AuthContext>()
     vValidator("json", createUploadSchema),
     async (c) => {
       const user = c.var.user;
-      const project = await findProjectOr404(user.id, c.req.valid("param").id);
-      if (!project) return c.json({ error: "project not found" }, 404);
+      const project = await requireProject(user.id, c.req.valid("param").id);
       const {
         kind,
         fileName,
@@ -249,8 +253,7 @@ export const projects = new Hono<AuthContext>()
     async (c) => {
       const user = c.var.user;
       const { id, uploadId, index: indexStr } = c.req.valid("param");
-      const project = await findProjectOr404(user.id, id);
-      if (!project) return c.json({ error: "project not found" }, 404);
+      const project = await requireProject(user.id, id);
       const upload = await prisma.upload.findFirst({
         where: { id: uploadId, projectId: project.id },
       });
@@ -277,8 +280,8 @@ export const projects = new Hono<AuthContext>()
       if (declared > upload.chunkSize) {
         return c.json({ error: `chunk exceeds declared chunkSize ${upload.chunkSize}` }, 413);
       }
-      if (declared > MAX_SINGLE_CHUNK_BYTES) {
-        return c.json({ error: `chunk too large (max ${MAX_SINGLE_CHUNK_BYTES} bytes)` }, 413);
+      if (declared > MAX_CHUNK_SIZE) {
+        return c.json({ error: `chunk too large (max ${MAX_CHUNK_SIZE} bytes)` }, 413);
       }
       const contentType = c.req.header("content-type") ?? "application/octet-stream";
       // PUT ごとに固有 s3Key (= DB row が指す 1 object)、tx で promote
@@ -288,10 +291,7 @@ export const projects = new Hono<AuthContext>()
       try {
         size = await uploadRawRequest(newS3Key, c.req.raw, contentType);
       } catch (err) {
-        return c.json(
-          { error: `chunk upload failed: ${err instanceof Error ? err.message : String(err)}` },
-          500,
-        );
+        return c.json({ error: `chunk upload failed: ${describeError(err)}` }, 500);
       }
       if (size > upload.chunkSize) {
         // CL pre-check の防衛策
@@ -354,8 +354,7 @@ export const projects = new Hono<AuthContext>()
   .post("/:id/uploads/:uploadId/complete", vValidator("param", uploadIdParamSchema), async (c) => {
     const user = c.var.user;
     const { id, uploadId } = c.req.valid("param");
-    const project = await findProjectOr404(user.id, id);
-    if (!project) return c.json({ error: "project not found" }, 404);
+    const project = await requireProject(user.id, id);
 
     type CompleteOutcome =
       | { kind: "claimed"; task: ApiTask }
@@ -474,8 +473,7 @@ export const projects = new Hono<AuthContext>()
   .delete("/:id/uploads/:uploadId", vValidator("param", uploadIdParamSchema), async (c) => {
     const user = c.var.user;
     const { id, uploadId } = c.req.valid("param");
-    const project = await findProjectOr404(user.id, id);
-    if (!project) return c.json({ error: "project not found" }, 404);
+    const project = await requireProject(user.id, id);
     const prefix = uploadPrefix(project.id, uploadId);
     // tx 内で status=pending を再確認して /complete と直列化
     const aborted = await prisma.$transaction(async (tx) => {
@@ -502,8 +500,7 @@ export const projects = new Hono<AuthContext>()
 
   .get("/:id/tasks", vValidator("param", idParamSchema), async (c) => {
     const user = c.var.user;
-    const project = await findProjectOr404(user.id, c.req.valid("param").id);
-    if (!project) return c.json({ error: "project not found" }, 404);
+    const project = await requireProject(user.id, c.req.valid("param").id);
     const tasks = await prisma.task.findMany({
       where: { projectId: project.id },
       orderBy: { createdAt: "desc" },
@@ -515,8 +512,7 @@ export const projects = new Hono<AuthContext>()
   .get("/:id/tasks/:taskId", vValidator("param", taskIdParamSchema), async (c) => {
     const user = c.var.user;
     const { id, taskId } = c.req.valid("param");
-    const project = await findProjectOr404(user.id, id);
-    if (!project) return c.json({ error: "project not found" }, 404);
+    const project = await requireProject(user.id, id);
     const task = await prisma.task.findFirst({
       where: { id: taskId, projectId: project.id },
       include: { upload: { select: { fileName: true, kind: true } } },
@@ -528,8 +524,7 @@ export const projects = new Hono<AuthContext>()
   .delete("/:id/videos/:videoId", vValidator("param", videoIdParamSchema), async (c) => {
     const user = c.var.user;
     const { id, videoId } = c.req.valid("param");
-    const project = await findProjectOr404(user.id, id);
-    if (!project) return c.json({ error: "project not found" }, 404);
+    const project = await requireProject(user.id, id);
     const video = await prisma.video.findFirst({
       where: { id: videoId, projectId: project.id },
     });
@@ -547,8 +542,7 @@ export const projects = new Hono<AuthContext>()
   .get("/:id/videos/:videoId/stream", vValidator("param", videoIdParamSchema), async (c) => {
     const user = c.var.user;
     const { id, videoId } = c.req.valid("param");
-    const project = await findProjectOr404(user.id, id);
-    if (!project) return c.notFound();
+    const project = await requireProject(user.id, id);
     const video = await prisma.video.findFirst({
       where: { id: videoId, projectId: project.id },
     });
@@ -559,8 +553,7 @@ export const projects = new Hono<AuthContext>()
   .get("/:id/videos/:videoId/audio", vValidator("param", videoIdParamSchema), async (c) => {
     const user = c.var.user;
     const { id, videoId } = c.req.valid("param");
-    const project = await findProjectOr404(user.id, id);
-    if (!project) return c.notFound();
+    const project = await requireProject(user.id, id);
     const video = await prisma.video.findFirst({
       where: { id: videoId, projectId: project.id },
     });
@@ -574,8 +567,7 @@ export const projects = new Hono<AuthContext>()
     async (c) => {
       const user = c.var.user;
       const { id, thumbId } = c.req.valid("param");
-      const project = await findProjectOr404(user.id, id);
-      if (!project) return c.notFound();
+      const project = await requireProject(user.id, id);
       const thumb = await prisma.thumbnail.findFirst({
         where: { id: thumbId, video: { projectId: project.id } },
       });
@@ -587,8 +579,7 @@ export const projects = new Hono<AuthContext>()
   .delete("/:id/audios/:audioId", vValidator("param", audioIdParamSchema), async (c) => {
     const user = c.var.user;
     const { id, audioId } = c.req.valid("param");
-    const project = await findProjectOr404(user.id, id);
-    if (!project) return c.json({ error: "project not found" }, 404);
+    const project = await requireProject(user.id, id);
     const audio = await prisma.audio.findFirst({
       where: { id: audioId, projectId: project.id },
     });
@@ -605,8 +596,7 @@ export const projects = new Hono<AuthContext>()
   .get("/:id/audios/:audioId/stream", vValidator("param", audioIdParamSchema), async (c) => {
     const user = c.var.user;
     const { id, audioId } = c.req.valid("param");
-    const project = await findProjectOr404(user.id, id);
-    if (!project) return c.notFound();
+    const project = await requireProject(user.id, id);
     const audio = await prisma.audio.findFirst({
       where: { id: audioId, projectId: project.id },
     });
@@ -617,8 +607,7 @@ export const projects = new Hono<AuthContext>()
   .get("/:id/audios/:audioId/raw", vValidator("param", audioIdParamSchema), async (c) => {
     const user = c.var.user;
     const { id, audioId } = c.req.valid("param");
-    const project = await findProjectOr404(user.id, id);
-    if (!project) return c.notFound();
+    const project = await requireProject(user.id, id);
     const audio = await prisma.audio.findFirst({
       where: { id: audioId, projectId: project.id },
     });

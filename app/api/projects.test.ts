@@ -10,6 +10,7 @@ import { prisma } from "../lib/prisma";
 import { getS3 } from "../lib/s3";
 import { projectKey, uploadPrefix } from "../lib/storage";
 import { TASK_GRACE_MS, recoverTasksOnStartup, waitForInflightTasks } from "../lib/task-runner";
+import { withAutoContentLength } from "../test-fixtures/app-request";
 import { useDbFixture } from "../test-fixtures/db";
 import { useMediaFixture } from "../test-fixtures/media";
 import { useS3Fixture } from "../test-fixtures/s3";
@@ -27,26 +28,10 @@ const DEV_HEADERS = { "x-authentik-uid": "dev:test" };
 function makeClient(): ChunkedUploadClient {
   process.env.NODE_ENV = "development";
   const app = new Hono().route("/api", api);
-  // app.request は body から CL を自動付与しない (本番 fetch は付ける) ので
-  // テスト経路でだけ補う
-  const customFetch: typeof app.request = async (input, init) => {
-    const headers = new Headers(init?.headers);
-    const body = init?.body;
-    if (body != null && !headers.has("content-length")) {
-      const size = bodyByteLength(body);
-      if (size !== undefined) headers.set("content-length", String(size));
-    }
-    return await app.request(input, { ...init, headers });
-  };
-  return hc<AppType>("http://test/api", { fetch: customFetch, headers: DEV_HEADERS });
-}
-
-function bodyByteLength(body: BodyInit): number | undefined {
-  if (body instanceof Uint8Array) return body.byteLength;
-  if (body instanceof ArrayBuffer) return body.byteLength;
-  if (body instanceof Blob) return body.size;
-  if (typeof body === "string") return new TextEncoder().encode(body).byteLength;
-  return undefined;
+  return hc<AppType>("http://test/api", {
+    fetch: withAutoContentLength(app),
+    headers: DEV_HEADERS,
+  });
 }
 
 async function createProject(client: ChunkedUploadClient, name: string): Promise<string> {

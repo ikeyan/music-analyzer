@@ -1,5 +1,6 @@
 import { extname, join } from "node:path";
 import type { Upload } from "../generated/prisma/client";
+import { describeError } from "./error";
 import {
   MAX_DURATION_SEC,
   extractAudio,
@@ -354,10 +355,7 @@ async function executeTask(taskId: string): Promise<void> {
         ? await runVideoTask(task.id, task.upload)
         : await runAudioTask(task.id, task.upload);
   } catch (err) {
-    result = {
-      kind: "failure",
-      error: err instanceof Error ? err.message.slice(0, 500) : String(err).slice(0, 500),
-    };
+    result = { kind: "failure", error: describeError(err) };
   }
 
   // success は run* 内で同 tx flip + chunk 削除済み。failure もここで同 tx にする
@@ -396,11 +394,7 @@ export function enqueueTask(taskId: string): void {
       await prisma.task
         .updateMany({
           where: { id: taskId, status: { in: ["pending", "running"] } },
-          data: {
-            status: "failed",
-            error: err instanceof Error ? err.message.slice(0, 500) : String(err).slice(0, 500),
-            finishedAt: new Date(),
-          },
+          data: { status: "failed", error: describeError(err), finishedAt: new Date() },
         })
         .catch(() => {
           /* DB 自体が死亡なら recovery 任せ */

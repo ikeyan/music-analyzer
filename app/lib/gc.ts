@@ -1,3 +1,4 @@
+import { describeError } from "./error";
 import { prisma } from "./prisma";
 import { deletePrefix } from "./storage";
 
@@ -6,11 +7,6 @@ export const BASE_RETRY_DELAY_MS = 30_000;
 
 let sweeperHandle: ReturnType<typeof setInterval> | null = null;
 let running = false;
-
-function describeError(err: unknown): string {
-  if (err instanceof Error) return err.message.slice(0, 500);
-  return String(err).slice(0, 500);
-}
 
 // 指数バックオフ + 半量jitter。上限なし (Number.MAX_SAFE_INTEGER でクランプ)。
 // attempts は失敗回数 (0 = まだ失敗していない) で次の delay を計算する
