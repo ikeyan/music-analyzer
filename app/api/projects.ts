@@ -612,24 +612,35 @@ export const projects = new Hono<AuthContext>()
       const body = c.req.valid("json");
       const project = await findProjectOr404(user.id, id);
       if (!project) return c.json({ error: "project not found" }, 404);
-      const video = await prisma.video.findFirst({
-        where: { id: videoId, projectId: project.id },
+      // task-runner.allocSlot と同じ project-row 書き込みを先に取り、新規 upload の
+      // slot 計算と timing 変更が interleave して overlap しないよう serialize する
+      const result = await prisma.$transaction(async (tx) => {
+        await tx.project.update({ where: { id: project.id }, data: { updatedAt: new Date() } });
+        const video = await tx.video.findFirst({
+          where: { id: videoId, projectId: project.id },
+        });
+        if (!video) return { kind: "not_found" as const };
+        if (body.srcEndSec > video.durationSec) {
+          return {
+            kind: "invalid" as const,
+            message: `srcEndSec must be <= durationSec (${video.durationSec})`,
+          };
+        }
+        const updated = await tx.video.update({
+          where: { id: video.id },
+          data: {
+            srcStartSec: body.srcStartSec,
+            srcEndSec: body.srcEndSec,
+            projStartSec: body.projStartSec,
+            projEndSec: body.projEndSec,
+          },
+          include: { thumbnails: { orderBy: { atSec: "asc" } } },
+        });
+        return { kind: "ok" as const, video: updated };
       });
-      if (!video) return c.json({ error: "video not found" }, 404);
-      if (body.srcEndSec > video.durationSec) {
-        return c.json({ error: `srcEndSec must be <= durationSec (${video.durationSec})` }, 400);
-      }
-      const updated = await prisma.video.update({
-        where: { id: video.id },
-        data: {
-          srcStartSec: body.srcStartSec,
-          srcEndSec: body.srcEndSec,
-          projStartSec: body.projStartSec,
-          projEndSec: body.projEndSec,
-        },
-        include: { thumbnails: { orderBy: { atSec: "asc" } } },
-      });
-      return c.json({ video: toApiVideo(updated) satisfies ApiVideo });
+      if (result.kind === "not_found") return c.json({ error: "video not found" }, 404);
+      if (result.kind === "invalid") return c.json({ error: result.message }, 400);
+      return c.json({ video: toApiVideo(result.video) satisfies ApiVideo });
     },
   )
 
@@ -701,23 +712,32 @@ export const projects = new Hono<AuthContext>()
       const body = c.req.valid("json");
       const project = await findProjectOr404(user.id, id);
       if (!project) return c.json({ error: "project not found" }, 404);
-      const audio = await prisma.audio.findFirst({
-        where: { id: audioId, projectId: project.id },
+      const result = await prisma.$transaction(async (tx) => {
+        await tx.project.update({ where: { id: project.id }, data: { updatedAt: new Date() } });
+        const audio = await tx.audio.findFirst({
+          where: { id: audioId, projectId: project.id },
+        });
+        if (!audio) return { kind: "not_found" as const };
+        if (body.srcEndSec > audio.durationSec) {
+          return {
+            kind: "invalid" as const,
+            message: `srcEndSec must be <= durationSec (${audio.durationSec})`,
+          };
+        }
+        const updated = await tx.audio.update({
+          where: { id: audio.id },
+          data: {
+            srcStartSec: body.srcStartSec,
+            srcEndSec: body.srcEndSec,
+            projStartSec: body.projStartSec,
+            projEndSec: body.projEndSec,
+          },
+        });
+        return { kind: "ok" as const, audio: updated };
       });
-      if (!audio) return c.json({ error: "audio not found" }, 404);
-      if (body.srcEndSec > audio.durationSec) {
-        return c.json({ error: `srcEndSec must be <= durationSec (${audio.durationSec})` }, 400);
-      }
-      const updated = await prisma.audio.update({
-        where: { id: audio.id },
-        data: {
-          srcStartSec: body.srcStartSec,
-          srcEndSec: body.srcEndSec,
-          projStartSec: body.projStartSec,
-          projEndSec: body.projEndSec,
-        },
-      });
-      return c.json({ audio: toApiAudio(updated) satisfies ApiAudio });
+      if (result.kind === "not_found") return c.json({ error: "audio not found" }, 404);
+      if (result.kind === "invalid") return c.json({ error: result.message }, 400);
+      return c.json({ audio: toApiAudio(result.audio) satisfies ApiAudio });
     },
   )
 
