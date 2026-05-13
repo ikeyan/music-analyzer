@@ -391,11 +391,21 @@ describe("ProjectDetail (frontend)", () => {
       tick();
     })`);
     const detail = (await fetch(`${server()}/api/projects/${id}`).then((r) => r.json())) as {
-      project: { audios: { name: string; srcStartSec: number; srcEndSec: number }[] };
+      project: {
+        audios: {
+          name: string;
+          srcStartSec: number;
+          srcEndSec: number;
+          projStartSec: number;
+          projEndSec: number;
+        }[];
+      };
     };
     const audio = detail.project.audios.find((a) => a.name === "trim.mp3")!;
     expect(audio.srcStartSec).toBeCloseTo(0.2, 3);
     expect(audio.srcEndSec).toBeCloseTo(0.5, 3);
+    // 再生速度を保つため proj 区間も新しい src 長 0.3s に合わせて縮む
+    expect(audio.projEndSec - audio.projStartSec).toBeCloseTo(0.3, 3);
   }, 60_000);
 
   it("反転 track を含む状態で並び替えても向きを保ち back-to-back に並ぶ", async () => {

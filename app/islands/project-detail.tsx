@@ -1300,11 +1300,16 @@ function MediaTrimDialog({
     }
     setBusy(true);
     setError(null);
+    // src 区間を縮める分だけ projEnd を寄せて playback speed を維持する
+    // (proj を据え置くと <video>/<audio> が間延びして「トリミング」にならない)
+    const oldSrcDur = t.srcEndSec - t.srcStartSec;
+    const ratio = oldSrcDur === 0 ? 1 : (se - ss) / oldSrcDur;
+    const newSignedProjDur = (t.projEndSec - t.projStartSec) * ratio;
     const result = await onApply({
       srcStartSec: ss,
       srcEndSec: se,
       projStartSec: t.projStartSec,
-      projEndSec: t.projEndSec,
+      projEndSec: t.projStartSec + newSignedProjDur,
     });
     setBusy(false);
     if ("error" in result) setError(result.error);
