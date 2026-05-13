@@ -269,6 +269,16 @@ export const projects = new Hono<AuthContext>()
             }
             seen.add(key);
           }
+          // 反転を absDur で詰め直すので、累積が単体 timing edit の上限を超えうる。
+          // 直接 timing edit の cap と整合させるため reorder 時も合計で抑える
+          const totalAbsDur =
+            videos.reduce((s, r) => s + Math.abs(r.projEndSec - r.projStartSec), 0) +
+            audios.reduce((s, r) => s + Math.abs(r.projEndSec - r.projStartSec), 0);
+          if (totalAbsDur > MAX_PROJECT_TIMING_SEC) {
+            throw new HTTPException(400, {
+              message: `track-order: total duration ${totalAbsDur} exceeds ${MAX_PROJECT_TIMING_SEC}`,
+            });
+          }
           // Phase 1: 既存 row を一時的に負の order に逃がして unique 衝突を回避
           for (const [i, t] of newOrder.entries()) {
             const data = { order: -(i + 1) };

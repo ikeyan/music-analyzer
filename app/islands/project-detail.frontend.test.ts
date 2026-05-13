@@ -575,4 +575,48 @@ describe("ProjectDetail (frontend)", () => {
     });
     expect(res.status).toBe(400);
   }, 60_000);
+
+  it("track-order PATCH は absDur 合計が上限を超えるなら 400", async () => {
+    const id = await createProject("reorder-cap-test");
+    await goto(`/projects/${id}`);
+    await waitHydrated('input[type=file][accept="audio/*"]');
+    await injectFileToInput(getMedia().audioMp3, "audio/*", "a.mp3", "audio/mpeg");
+    await waitFor(webview(), "audio source", 30_000);
+    await injectFileToInput(getMedia().audioMp3, "audio/*", "b.mp3", "audio/mpeg");
+    await webview().evaluate(`new Promise((res, rej) => {
+      const start = Date.now();
+      const tick = () => {
+        if (document.querySelectorAll('audio').length >= 2) return res();
+        if (Date.now() - start > 30000) return rej(new Error("second audio timeout"));
+        setTimeout(tick, 100);
+      };
+      tick();
+    })`);
+    const before = (await fetch(`${server()}/api/projects/${id}`).then((r) => r.json())) as {
+      project: { audios: { id: string; name: string }[] };
+    };
+    // 2 track をそれぞれ cap 近くまで伸ばす (16h 相当, srcEndSec=1 は audio fixture 上限)
+    for (const a of before.project.audios) {
+      const r = await fetch(`${server()}/api/projects/${id}/audios/${a.id}/timing`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          srcStartSec: 0,
+          srcEndSec: 1,
+          projStartSec: 0,
+          projEndSec: 16 * 60 * 60,
+        }),
+      });
+      expect(r.ok).toBe(true);
+    }
+    // reorder すると 16h * 2 = 32h で 24h cap 超過 → 400
+    const reorderRes = await fetch(`${server()}/api/projects/${id}/track-order`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        tracks: before.project.audios.toReversed().map((a) => ({ kind: "audio", id: a.id })),
+      }),
+    });
+    expect(reorderRes.status).toBe(400);
+  }, 90_000);
 });
