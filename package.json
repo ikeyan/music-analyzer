@@ -25,6 +25,7 @@
     "@hono/react-renderer": "^0.3.0",
     "@hono/valibot-validator": "^0.6.1",
     "@prisma/client": "^7",
+    "effect": "^3.21.2",
     "hono": "^4.6.14",
     "honox": "^0.1.35",
     "prisma-adapter-bun-sqlite": "^0.7.1",
