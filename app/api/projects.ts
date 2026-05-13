@@ -166,7 +166,7 @@ export const projects = new Hono()
   .get("/:id", vValidator("param", idParamSchema), async (c) => {
     const user = c.var.user;
     const r = await requireProjectDetail(user.id, c.req.valid("param").id);
-    if (Either.isLeft(r)) return c.var.eitherJson(Either.left(r.left));
+    if (Either.isLeft(r)) return c.var.eitherJson(r);
     return c.json({ project: toApiProjectDetail(r.right) satisfies ApiProjectDetail });
   })
   .delete("/:id", vValidator("param", idParamSchema), (c) =>
@@ -300,7 +300,7 @@ export const projects = new Hono()
     async (c) => {
       const user = c.var.user;
       const projectR = await requireProject(user.id, c.req.valid("param").id);
-      if (Either.isLeft(projectR)) return c.var.eitherJson(Either.left(projectR.left));
+      if (Either.isLeft(projectR)) return c.var.eitherJson(projectR);
       const project = projectR.right;
       const {
         kind,
@@ -337,10 +337,10 @@ export const projects = new Hono()
       const user = c.var.user;
       const { id, uploadId, index: indexStr } = c.req.valid("param");
       const projectR = await requireProject(user.id, id);
-      if (Either.isLeft(projectR)) return c.var.eitherJson(Either.left(projectR.left));
+      if (Either.isLeft(projectR)) return c.var.eitherJson(projectR);
       const project = projectR.right;
       const uploadR = await requirePendingUpload(uploadId, project.id);
-      if (Either.isLeft(uploadR)) return c.var.eitherJson(Either.left(uploadR.left));
+      if (Either.isLeft(uploadR)) return c.var.eitherJson(uploadR);
       const upload = uploadR.right;
       const index = Number(indexStr);
       if (!Number.isInteger(index) || index < 0 || index >= upload.totalChunks) {
@@ -539,7 +539,7 @@ export const projects = new Hono()
     const user = c.var.user;
     const { id, uploadId } = c.req.valid("param");
     const projectR = await requireProject(user.id, id);
-    if (Either.isLeft(projectR)) return c.var.eitherJson(Either.left(projectR.left));
+    if (Either.isLeft(projectR)) return c.var.eitherJson(projectR);
     const project = projectR.right;
     const prefix = uploadPrefix(project.id, uploadId);
     // claim-first で pending → aborted に遷移 (skill: prisma-claim-first)。
@@ -561,7 +561,7 @@ export const projects = new Hono()
       await tx.uploadChunk.deleteMany({ where: { uploadId } });
       return Either.right(undefined);
     });
-    if (Either.isLeft(result)) return c.var.eitherJson(Either.left(result.left));
+    if (Either.isLeft(result)) return c.var.eitherJson(result);
     await eagerCleanupAndUnmark(prefix);
     return c.body(null, 204);
   })
@@ -569,7 +569,7 @@ export const projects = new Hono()
   .get("/:id/tasks", vValidator("param", idParamSchema), async (c) => {
     const user = c.var.user;
     const projectR = await requireProject(user.id, c.req.valid("param").id);
-    if (Either.isLeft(projectR)) return c.var.eitherJson(Either.left(projectR.left));
+    if (Either.isLeft(projectR)) return c.var.eitherJson(projectR);
     const project = projectR.right;
     const tasks = await prisma.task.findMany({
       where: { projectId: project.id },
@@ -583,7 +583,7 @@ export const projects = new Hono()
     const user = c.var.user;
     const { id, taskId } = c.req.valid("param");
     const projectR = await requireProject(user.id, id);
-    if (Either.isLeft(projectR)) return c.var.eitherJson(Either.left(projectR.left));
+    if (Either.isLeft(projectR)) return c.var.eitherJson(projectR);
     const project = projectR.right;
     const task = await prisma.task.findFirst({
       where: { id: taskId, projectId: project.id },
@@ -598,7 +598,7 @@ export const projects = new Hono()
     const { id, videoId } = c.req.valid("param");
     const projectR = await requireProject(user.id, id);
 
-    if (Either.isLeft(projectR)) return c.var.eitherJson(Either.left(projectR.left));
+    if (Either.isLeft(projectR)) return c.var.eitherJson(projectR);
 
     const project = projectR.right;
     const video = await prisma.video.findFirst({
@@ -620,7 +620,7 @@ export const projects = new Hono()
     const { id, videoId } = c.req.valid("param");
     const projectR = await requireProject(user.id, id);
 
-    if (Either.isLeft(projectR)) return c.var.eitherJson(Either.left(projectR.left));
+    if (Either.isLeft(projectR)) return c.var.eitherJson(projectR);
 
     const project = projectR.right;
     const video = await prisma.video.findFirst({
@@ -635,7 +635,7 @@ export const projects = new Hono()
     const { id, videoId } = c.req.valid("param");
     const projectR = await requireProject(user.id, id);
 
-    if (Either.isLeft(projectR)) return c.var.eitherJson(Either.left(projectR.left));
+    if (Either.isLeft(projectR)) return c.var.eitherJson(projectR);
 
     const project = projectR.right;
     const video = await prisma.video.findFirst({
@@ -653,7 +653,7 @@ export const projects = new Hono()
       const { id, thumbId } = c.req.valid("param");
       const projectR = await requireProject(user.id, id);
 
-      if (Either.isLeft(projectR)) return c.var.eitherJson(Either.left(projectR.left));
+      if (Either.isLeft(projectR)) return c.var.eitherJson(projectR);
 
       const project = projectR.right;
       const thumb = await prisma.thumbnail.findFirst({
@@ -669,7 +669,7 @@ export const projects = new Hono()
     const { id, audioId } = c.req.valid("param");
     const projectR = await requireProject(user.id, id);
 
-    if (Either.isLeft(projectR)) return c.var.eitherJson(Either.left(projectR.left));
+    if (Either.isLeft(projectR)) return c.var.eitherJson(projectR);
 
     const project = projectR.right;
     const audio = await prisma.audio.findFirst({
@@ -690,7 +690,7 @@ export const projects = new Hono()
     const { id, audioId } = c.req.valid("param");
     const projectR = await requireProject(user.id, id);
 
-    if (Either.isLeft(projectR)) return c.var.eitherJson(Either.left(projectR.left));
+    if (Either.isLeft(projectR)) return c.var.eitherJson(projectR);
 
     const project = projectR.right;
     const audio = await prisma.audio.findFirst({
@@ -705,7 +705,7 @@ export const projects = new Hono()
     const { id, audioId } = c.req.valid("param");
     const projectR = await requireProject(user.id, id);
 
-    if (Either.isLeft(projectR)) return c.var.eitherJson(Either.left(projectR.left));
+    if (Either.isLeft(projectR)) return c.var.eitherJson(projectR);
 
     const project = projectR.right;
     const audio = await prisma.audio.findFirst({

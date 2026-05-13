@@ -21,8 +21,12 @@ type RightRes<R> = Response & TypedResponse<JSONParsed<R>, 200, "json">;
 // c.req.valid が無力化されるので、middleware で c.var に関数を生やす。
 // overload を切らないと isLeft narrow 後の Left<E, R> でも R が phantom として残り、
 // c.json(r.right) 経由で R が response 型に leak する
+// narrow 済み Left<E, R> でも match させたいので、A 位置が unknown / never の Left/Right を
+// 並べる。実際に来うる形 (Either.left() の戻り値、または isLeft 後の narrow) を網羅する
 export type EitherJsonFn = {
-  <const E extends ApiError>(r: Either.Either<never, E>): LeftRes<E>;
+  <const E extends ApiError>(
+    r: Either.Left<E, never> | Either.Left<never, unknown> | Either.Right<unknown, never>,
+  ): LeftRes<E>;
   <const E extends ApiError, R>(r: Either.Either<R, E>): LeftRes<E> | RightRes<R>;
 };
 
