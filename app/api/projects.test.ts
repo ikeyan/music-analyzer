@@ -325,11 +325,12 @@ describe("chunked upload + media validation task", () => {
       file.size,
       "audio/mpeg",
     );
-    const del = await client.projects[":id"].uploads[":uploadId"].$delete({
+    // HTTPException(409) は hc の response 型に乗らないので Response で受ける
+    const del: Response = await client.projects[":id"].uploads[":uploadId"].$delete({
       param: { id: pid, uploadId: upload.id },
     });
-    if (del.status !== 409) throw new Error(`expected 409, got ${del.status}`);
-    const body = await del.json();
+    expect(del.status).toBe(409);
+    const body = (await del.json()) as { error: string };
     expect(body.error).toContain("completed");
     await waitForInflightTasks();
   }, 60_000);

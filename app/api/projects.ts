@@ -1,7 +1,10 @@
 import { vValidator } from "@hono/valibot-validator";
+import * as runtime from "@prisma/client/runtime/client";
 import { Hono } from "hono";
 import { HTTPException } from "hono/http-exception";
+import type { ContentfulStatusCode } from "hono/utils/http-status";
 import * as v from "valibot";
+import { type Prisma, type PrismaClient, type Upload } from "../generated/prisma/client";
 import { type AuthContext, requireUser } from "../lib/auth";
 import { describeError } from "../lib/error";
 import { MAX_UPLOAD_BYTES } from "../lib/ffmpeg";
@@ -40,6 +43,21 @@ const DEFAULT_CHUNK_SIZE = 8 * 1024 * 1024;
 const MIN_CHUNK_SIZE = 1024;
 const MAX_CHUNK_SIZE = 64 * 1024 * 1024;
 
+// prisma も tx もどちらも受けたいので $transaction だけ除いた型を作る。
+// 呼び出し側は generics を素通しする (デフォルトを置くと推論に巻き込まれる)
+type PrismaClientLike<
+  in LogOpts extends Prisma.LogLevel,
+  in out OmitOpts extends Prisma.PrismaClientOptions["omit"],
+  in out ExtArgs extends runtime.Types.Extensions.InternalArgs,
+> = Omit<PrismaClient<LogOpts, OmitOpts, ExtArgs>, runtime.ITXClientDenyList>;
+
+// HTTPException のレスポンス本体を `{ error: message }` JSON に統一する
+function httpJsonError(status: ContentfulStatusCode, message: string): HTTPException {
+  return new HTTPException(status, {
+    res: Response.json({ error: message }, { status }),
+  });
+}
+
 const idParamSchema = v.object({ id: v.string() });
 const videoIdParamSchema = v.object({ id: v.string(), videoId: v.string() });
 const audioIdParamSchema = v.object({ id: v.string(), audioId: v.string() });
@@ -73,16 +91,35 @@ const createUploadSchema = v.object({
   ),
 });
 
-// 見つからない場合は HTTPException(404) で response を確定させる。
-// 既存の API レスポンス契約を壊さないよう本文は JSON `{ error }` で返す
+// project 不在なら 404 を throw。レスポンス本体は JSON `{ error }`
 async function requireProject(userId: string, projectId: string) {
   const p = await prisma.project.findFirst({ where: { id: projectId, userId } });
-  if (!p) {
-    throw new HTTPException(404, {
-      res: Response.json({ error: "project not found" }, { status: 404 }),
-    });
-  }
+  if (!p) throw httpJsonError(404, "project not found");
   return p;
+}
+
+// upload 不在なら 404 を throw。prisma / tx どちらでも呼べる
+async function requireUpload<
+  LogOpts extends Prisma.LogLevel,
+  OmitOpts extends Prisma.PrismaClientOptions["omit"],
+  ExtArgs extends runtime.Types.Extensions.InternalArgs,
+>(client: PrismaClientLike<LogOpts, OmitOpts, ExtArgs>, uploadId: string, projectId: string) {
+  const upload = await client.upload.findFirst({ where: { id: uploadId, projectId } });
+  if (!upload) throw httpJsonError(404, "upload not found");
+  return upload;
+}
+
+// upload が pending かつ未期限であることを表明。fetched 済みの row に対して使う
+function assertUploadPending(upload: Pick<Upload, "status" | "expiresAt">): void {
+  if (upload.status !== "pending") throw httpJsonError(409, `upload is ${upload.status}`);
+  if (upload.expiresAt.getTime() <= Date.now()) throw httpJsonError(410, "upload expired");
+}
+
+// tx 外用: 取得 + status/expiresAt チェックをまとめる
+async function requirePendingUpload(uploadId: string, projectId: string) {
+  const upload = await requireUpload(prisma, uploadId, projectId);
+  assertUploadPending(upload);
+  return upload;
 }
 
 // GET /:id, PATCH /:id/track-order, SSR route で共通する Project detail loader。
@@ -254,16 +291,7 @@ export const projects = new Hono<AuthContext>()
       const user = c.var.user;
       const { id, uploadId, index: indexStr } = c.req.valid("param");
       const project = await requireProject(user.id, id);
-      const upload = await prisma.upload.findFirst({
-        where: { id: uploadId, projectId: project.id },
-      });
-      if (!upload) return c.json({ error: "upload not found" }, 404);
-      if (upload.status !== "pending") {
-        return c.json({ error: `upload is ${upload.status}` }, 409);
-      }
-      if (upload.expiresAt.getTime() <= Date.now()) {
-        return c.json({ error: "upload expired" }, 410);
-      }
+      const upload = await requirePendingUpload(uploadId, project.id);
       const index = Number(indexStr);
       if (!Number.isInteger(index) || index < 0 || index >= upload.totalChunks) {
         return c.json({ error: `chunk index out of range [0, ${upload.totalChunks})` }, 400);
@@ -300,38 +328,42 @@ export const projects = new Hono<AuthContext>()
           .catch(() => {});
         return c.json({ error: `chunk exceeds declared chunkSize ${upload.chunkSize}` }, 413);
       }
+      // delta 計算用に既存 chunk を read してから、upload の precondition を畳んだ
+      // updateMany で claim-first する (skill: prisma-claim-first)。
+      // stale (count===0) なら新規 S3 を消すために throw ではなく戻り値で stale を表す
       const promoteResult = await prisma.$transaction(async (tx) => {
-        const fresh = await tx.upload.findUnique({
-          where: { id: upload.id },
-          select: { status: true, expiresAt: true },
-        });
-        if (!fresh || fresh.status !== "pending") {
-          return { stale: true as const, status: fresh?.status ?? "missing", oldS3Key: null };
-        }
-        if (fresh.expiresAt.getTime() <= Date.now()) {
-          return { stale: true as const, status: "expired" as const, oldS3Key: null };
-        }
         const existing = await tx.uploadChunk.findUnique({
           where: { uploadId_index: { uploadId: upload.id, index } },
         });
+        const delta = existing ? BigInt(size) - existing.sizeBytes : BigInt(size);
+        const claimed = await tx.upload.updateMany({
+          where: {
+            id: upload.id,
+            status: "pending",
+            expiresAt: { gt: new Date() },
+          },
+          data: { receivedBytes: { increment: delta } },
+        });
+        if (claimed.count === 0) {
+          const fresh = await tx.upload.findUnique({
+            where: { id: upload.id },
+            select: { status: true, expiresAt: true },
+          });
+          if (!fresh) return { stale: true as const, status: "missing" as const, oldS3Key: null };
+          if (fresh.status !== "pending") {
+            return { stale: true as const, status: fresh.status, oldS3Key: null };
+          }
+          return { stale: true as const, status: "expired" as const, oldS3Key: null };
+        }
         if (existing) {
-          const delta = BigInt(size) - existing.sizeBytes;
           await tx.uploadChunk.update({
             where: { uploadId_index: { uploadId: upload.id, index } },
             data: { sizeBytes: BigInt(size), s3Key: newS3Key },
-          });
-          await tx.upload.update({
-            where: { id: upload.id },
-            data: { receivedBytes: { increment: delta } },
           });
           return { stale: false as const, oldS3Key: existing.s3Key };
         }
         await tx.uploadChunk.create({
           data: { uploadId: upload.id, index, sizeBytes: BigInt(size), s3Key: newS3Key },
-        });
-        await tx.upload.update({
-          where: { id: upload.id },
-          data: { receivedBytes: { increment: BigInt(size) } },
         });
         return { stale: false as const, oldS3Key: null };
       });
@@ -356,120 +388,75 @@ export const projects = new Hono<AuthContext>()
     const { id, uploadId } = c.req.valid("param");
     const project = await requireProject(user.id, id);
 
-    // 冪等化: 既に completed なら新規 claim せず既存 task をそのまま返す。
-    // enqueue は claim を取った request だけが行う (一度 enqueue した task を
-    // 再 enqueue しても task-runner 側 inflight set で no-op になるが、ここで
-    // 絞っておけば「リトライ毎に inflight set へ問い合わせ」を避けられる)
-    type CompleteOutcome =
-      | { kind: "ok"; task: ApiTask; enqueue: boolean }
-      | {
-          kind: "error";
-          status: 400 | 404 | 409 | 410 | 500;
-          error: string;
-        };
-
-    // chunks の read + validate を claim より後ろに置く。
-    // PUT promotion tx と /complete の race を塞ぐため、claim 先行 →
-    // validate 失敗時は throw で tx abort して claim を巻き戻す
-    class CompleteValidationFailure extends Error {
-      constructor(public outcome: Extract<CompleteOutcome, { kind: "error" }>) {
-        super(outcome.error);
-      }
-    }
-    let outcome: CompleteOutcome;
-    try {
-      outcome = await prisma.$transaction(async (tx) => {
-        const upload = await tx.upload.findFirst({
-          where: { id: uploadId, projectId: project.id },
-        });
-        if (!upload) {
-          return { kind: "error", status: 404, error: "upload not found" };
-        }
-        if (upload.status === "completed") {
-          const existing = await tx.task.findFirst({
-            where: { uploadId: upload.id },
-            orderBy: { createdAt: "desc" },
-            include: { upload: { select: { fileName: true, kind: true } } },
-          });
-          if (existing) return { kind: "ok", task: toApiTask(existing), enqueue: false };
-          return { kind: "error", status: 500, error: "completed upload has no task" };
-        }
-        if (upload.status !== "pending") {
-          return { kind: "error", status: 409, error: `upload is ${upload.status}` };
-        }
-        if (upload.expiresAt.getTime() <= Date.now()) {
-          return { kind: "error", status: 410, error: "upload expired" };
-        }
-        const claimed = await tx.upload.updateMany({
-          where: { id: upload.id, status: "pending" },
-          data: { status: "completed" },
-        });
-        if (claimed.count === 0) {
-          const existing = await tx.task.findFirst({
-            where: { uploadId: upload.id },
-            orderBy: { createdAt: "desc" },
-            include: { upload: { select: { fileName: true, kind: true } } },
-          });
-          if (existing) return { kind: "ok", task: toApiTask(existing), enqueue: false };
-          return { kind: "error", status: 500, error: "race lost but no task found" };
-        }
-        // claim 後に chunks 確定状態を read。PUT promotion はこの時点で stale 扱い
-        const chunks = await tx.uploadChunk.findMany({
-          where: { uploadId: upload.id },
-          select: { index: true, sizeBytes: true },
-        });
-        if (chunks.length !== upload.totalChunks) {
-          throw new CompleteValidationFailure({
-            kind: "error",
-            status: 400,
-            error: `missing chunks: received ${chunks.length}/${upload.totalChunks}`,
-          });
-        }
-        const seen = new Set(chunks.map((chunk) => chunk.index));
-        for (let i = 0; i < upload.totalChunks; i++) {
-          if (!seen.has(i)) {
-            throw new CompleteValidationFailure({
-              kind: "error",
-              status: 400,
-              error: `missing chunk ${i}`,
-            });
-          }
-        }
-        const sum = chunks.reduce((acc, chunk) => acc + chunk.sizeBytes, 0n);
-        if (sum !== upload.totalBytes) {
-          throw new CompleteValidationFailure({
-            kind: "error",
-            status: 400,
-            error: `byte total mismatch: received ${sum}, declared ${upload.totalBytes}`,
-          });
-        }
-        const task = await tx.task.create({
-          data: {
-            projectId: project.id,
-            type: upload.kind === "video" ? "video_validation" : "audio_validation",
-            uploadId: upload.id,
-            status: "pending",
-          },
-          include: { upload: { select: { fileName: true, kind: true } } },
-        });
-        // task 走行中の sweep を防ぐ。完了時 executeTask が mark ごと回収
-        await tx.deletionMark.updateMany({
-          where: { prefix: uploadPrefix(project.id, upload.id) },
-          data: { nextRetryAt: new Date(Date.now() + TASK_GRACE_MS) },
-        });
-        return { kind: "ok", task: toApiTask(task), enqueue: true };
+    // claim-first: 全 precondition を updateMany.where に畳んで原子化する。
+    // 並行 /complete も PUT promotion tx も race しても deadlock しない (skill: prisma-claim-first)。
+    // 失敗時 (count===0) だけ findFirst で診断し、既に completed なら冪等返却、それ以外は throw。
+    // throw は $transaction が自動 rollback してくれるので claim も巻き戻る
+    const result = await prisma.$transaction(async (tx) => {
+      const claimed = await tx.upload.updateMany({
+        where: {
+          id: uploadId,
+          projectId: project.id,
+          status: "pending",
+          expiresAt: { gt: new Date() },
+        },
+        data: { status: "completed" },
       });
-    } catch (err) {
-      if (err instanceof CompleteValidationFailure) {
-        outcome = err.outcome;
-      } else {
-        throw err;
+      if (claimed.count === 0) {
+        const upload = await requireUpload(tx, uploadId, project.id);
+        if (upload.status === "completed") {
+          // 冪等: 既存 task を返す。並行 /complete の loser もここに来る
+          const task = await tx.task.findFirst({
+            where: { uploadId: upload.id },
+            orderBy: { createdAt: "desc" },
+            include: { upload: { select: { fileName: true, kind: true } } },
+          });
+          if (!task) throw httpJsonError(500, "completed upload has no task");
+          return { task: toApiTask(task), enqueue: false };
+        }
+        // not pending / expired を共通ヘルパで仕分け
+        assertUploadPending(upload);
+        throw new Error("unreachable: claim failed but upload is pending and not expired");
       }
-    }
+      // claim 済み行を read。write lock を握っているので並行 read+write しない
+      const upload = await tx.upload.findUniqueOrThrow({ where: { id: uploadId } });
+      const chunks = await tx.uploadChunk.findMany({
+        where: { uploadId: upload.id },
+        select: { index: true, sizeBytes: true },
+      });
+      if (chunks.length !== upload.totalChunks) {
+        throw httpJsonError(400, `missing chunks: received ${chunks.length}/${upload.totalChunks}`);
+      }
+      const seen = new Set(chunks.map((chunk) => chunk.index));
+      for (let i = 0; i < upload.totalChunks; i++) {
+        if (!seen.has(i)) throw httpJsonError(400, `missing chunk ${i}`);
+      }
+      const sum = chunks.reduce((acc, chunk) => acc + chunk.sizeBytes, 0n);
+      if (sum !== upload.totalBytes) {
+        throw httpJsonError(
+          400,
+          `byte total mismatch: received ${sum}, declared ${upload.totalBytes}`,
+        );
+      }
+      const task = await tx.task.create({
+        data: {
+          projectId: project.id,
+          type: upload.kind === "video" ? "video_validation" : "audio_validation",
+          uploadId: upload.id,
+          status: "pending",
+        },
+        include: { upload: { select: { fileName: true, kind: true } } },
+      });
+      // task 走行中の sweep を防ぐ。完了時 executeTask が mark ごと回収
+      await tx.deletionMark.updateMany({
+        where: { prefix: uploadPrefix(project.id, upload.id) },
+        data: { nextRetryAt: new Date(Date.now() + TASK_GRACE_MS) },
+      });
+      return { task: toApiTask(task), enqueue: true };
+    });
 
-    if (outcome.kind === "error") return c.json({ error: outcome.error }, outcome.status);
-    if (outcome.enqueue) enqueueTask(outcome.task.id);
-    return c.json({ task: outcome.task satisfies ApiTask });
+    if (result.enqueue) enqueueTask(result.task.id);
+    return c.json({ task: result.task satisfies ApiTask });
   })
 
   // pending な upload の自発キャンセル用。completed 後は task が chunks を必要とするので拒否
@@ -479,24 +466,19 @@ export const projects = new Hono<AuthContext>()
     const project = await requireProject(user.id, id);
     const prefix = uploadPrefix(project.id, uploadId);
     // tx 内で status=pending を再確認して /complete と直列化
-    const aborted = await prisma.$transaction(async (tx) => {
-      const upload = await tx.upload.findFirst({
-        where: { id: uploadId, projectId: project.id },
-        select: { status: true },
+    // claim-first で pending → aborted に遷移 (skill: prisma-claim-first)。
+    // 期限切れ pending も abort 対象なので expiresAt 条件は付けない
+    await prisma.$transaction(async (tx) => {
+      const claimed = await tx.upload.updateMany({
+        where: { id: uploadId, projectId: project.id, status: "pending" },
+        data: { status: "aborted" },
       });
-      if (!upload) return { ok: false as const, status: 404 as const, error: "upload not found" };
-      if (upload.status !== "pending") {
-        return {
-          ok: false as const,
-          status: 409 as const,
-          error: `cannot abort: upload is ${upload.status}`,
-        };
+      if (claimed.count === 0) {
+        const upload = await requireUpload(tx, uploadId, project.id);
+        throw httpJsonError(409, `cannot abort: upload is ${upload.status}`);
       }
       await tx.uploadChunk.deleteMany({ where: { uploadId } });
-      await tx.upload.update({ where: { id: uploadId }, data: { status: "aborted" } });
-      return { ok: true as const };
     });
-    if (!aborted.ok) return c.json({ error: aborted.error }, aborted.status);
     await eagerCleanupAndUnmark(prefix);
     return c.body(null, 204);
   })
