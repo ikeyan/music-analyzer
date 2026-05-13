@@ -356,9 +356,12 @@ export const projects = new Hono<AuthContext>()
     const { id, uploadId } = c.req.valid("param");
     const project = await requireProject(user.id, id);
 
+    // 冪等化: 既に completed なら新規 claim せず既存 task をそのまま返す。
+    // enqueue は claim を取った request だけが行う (一度 enqueue した task を
+    // 再 enqueue しても task-runner 側 inflight set で no-op になるが、ここで
+    // 絞っておけば「リトライ毎に inflight set へ問い合わせ」を避けられる)
     type CompleteOutcome =
-      | { kind: "claimed"; task: ApiTask }
-      | { kind: "race_lost"; task: ApiTask }
+      | { kind: "ok"; task: ApiTask; enqueue: boolean }
       | {
           kind: "error";
           status: 400 | 404 | 409 | 410 | 500;
@@ -388,7 +391,7 @@ export const projects = new Hono<AuthContext>()
             orderBy: { createdAt: "desc" },
             include: { upload: { select: { fileName: true, kind: true } } },
           });
-          if (existing) return { kind: "race_lost", task: toApiTask(existing) };
+          if (existing) return { kind: "ok", task: toApiTask(existing), enqueue: false };
           return { kind: "error", status: 500, error: "completed upload has no task" };
         }
         if (upload.status !== "pending") {
@@ -407,7 +410,7 @@ export const projects = new Hono<AuthContext>()
             orderBy: { createdAt: "desc" },
             include: { upload: { select: { fileName: true, kind: true } } },
           });
-          if (existing) return { kind: "race_lost", task: toApiTask(existing) };
+          if (existing) return { kind: "ok", task: toApiTask(existing), enqueue: false };
           return { kind: "error", status: 500, error: "race lost but no task found" };
         }
         // claim 後に chunks 確定状態を read。PUT promotion はこの時点で stale 扱い
@@ -454,7 +457,7 @@ export const projects = new Hono<AuthContext>()
           where: { prefix: uploadPrefix(project.id, upload.id) },
           data: { nextRetryAt: new Date(Date.now() + TASK_GRACE_MS) },
         });
-        return { kind: "claimed", task: toApiTask(task) };
+        return { kind: "ok", task: toApiTask(task), enqueue: true };
       });
     } catch (err) {
       if (err instanceof CompleteValidationFailure) {
@@ -465,8 +468,8 @@ export const projects = new Hono<AuthContext>()
     }
 
     if (outcome.kind === "error") return c.json({ error: outcome.error }, outcome.status);
-    if (outcome.kind === "claimed") enqueueTask(outcome.task.id);
-    return c.json({ task: outcome.task satisfies ApiTask }, outcome.kind === "claimed" ? 201 : 200);
+    if (outcome.enqueue) enqueueTask(outcome.task.id);
+    return c.json({ task: outcome.task satisfies ApiTask });
   })
 
   // pending な upload の自発キャンセル用。completed 後は task が chunks を必要とするので拒否

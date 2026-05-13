@@ -306,7 +306,7 @@ describe("chunked upload + media validation task", () => {
     const complete = await client.projects[":id"].uploads[":uploadId"].complete.$post({
       param: { id: pid, uploadId: upload.id },
     });
-    expect(complete.status).toBe(201);
+    expect(complete.status).toBe(200);
     const retry = await putRawChunk(client, pid, upload.id, 0, new Uint8Array([9, 9, 9, 9]));
     expect(retry.status).toBe(409);
     await waitForInflightTasks();
@@ -357,9 +357,9 @@ describe("chunked upload + media validation task", () => {
     await waitForInflightTasks();
   }, 120_000);
 
-  it("並行 /complete は片方が race_lost で 200 を返し task は 1 つだけ", async () => {
+  it("/complete は冪等。並行呼び出しも逐次リトライも同じ task を 200 で返す", async () => {
     const client = makeClient();
-    const pid = await createProject(client, "chunk-race-complete");
+    const pid = await createProject(client, "chunk-complete-idempotent");
     const bytes = new Uint8Array(await Bun.file(getMedia().audioMp3).arrayBuffer());
     const upload = await createUploadOk(client, pid, {
       kind: "audio",
@@ -377,12 +377,21 @@ describe("chunked upload + media validation task", () => {
         param: { id: pid, uploadId: upload.id },
       }),
     ]);
-    const statuses = [a.status, b.status].toSorted();
-    expect(statuses).toEqual([200, 201]);
+    expect([a.status, b.status]).toEqual([200, 200]);
     if (!a.ok || !b.ok) throw new Error("both should be 2xx");
     const ja = await a.json();
     const jb = await b.json();
     expect(ja.task.id).toBe(jb.task.id);
+
+    // 逐次リトライも同じ task を返し、task は 1 つのまま
+    const retry = await client.projects[":id"].uploads[":uploadId"].complete.$post({
+      param: { id: pid, uploadId: upload.id },
+    });
+    expect(retry.status).toBe(200);
+    if (!retry.ok) throw new Error("retry should be 2xx");
+    const jr = await retry.json();
+    expect(jr.task.id).toBe(ja.task.id);
+
     await waitForInflightTasks();
     const tasks = await prisma.task.findMany({ where: { uploadId: upload.id } });
     expect(tasks).toHaveLength(1);
