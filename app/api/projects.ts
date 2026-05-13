@@ -3,7 +3,7 @@ import { Hono } from "hono";
 import { HTTPException } from "hono/http-exception";
 import * as v from "valibot";
 import { type AuthContext, requireUser } from "../lib/auth";
-import { MAX_UPLOAD_BYTES } from "../lib/ffmpeg";
+import { MAX_PROJECT_TIMING_SEC, MAX_UPLOAD_BYTES } from "../lib/ffmpeg";
 import { prisma } from "../lib/prisma";
 import { getS3 } from "../lib/s3";
 import {
@@ -73,10 +73,6 @@ const createUploadSchema = v.object({
     v.pipe(v.number(), v.integer(), v.minValue(MIN_CHUNK_SIZE), v.maxValue(MAX_CHUNK_SIZE)),
   ),
 });
-
-// proj 側は upload と違い row が制約に直接寄与しないので、tick 数爆発で
-// TimeRuler が固まるのを防ぐため API レベルで上限を置く
-const MAX_PROJECT_TIMING_SEC = 24 * 60 * 60;
 
 // 反転は projStart > projEnd で表現するため proj 側に大小制約は置かない。
 // src は正方向のみで、durationSec 超過は row 取得後に handler 側で検証する

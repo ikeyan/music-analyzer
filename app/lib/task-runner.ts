@@ -5,6 +5,7 @@ import type { Upload } from "../generated/prisma/client";
 export const TASK_GRACE_MS = 4 * 60 * 60 * 1000;
 import {
   MAX_DURATION_SEC,
+  MAX_PROJECT_TIMING_SEC,
   extractAudio,
   extractThumbnails,
   ffprobe,
@@ -220,9 +221,15 @@ async function runVideoTask(taskId: string, upload: Upload): Promise<TaskResult>
   ]);
 
   const duration = finalProbe.durationSec;
-  const created = await withSlotRetry(() =>
-    prisma.$transaction(async (tx) => {
+  type AllocResult =
+    | { kind: "ok"; video: Awaited<ReturnType<typeof prisma.video.create>> }
+    | { kind: "over_cap"; projEnd: number };
+  const allocResult: AllocResult = await withSlotRetry(() =>
+    prisma.$transaction(async (tx): Promise<AllocResult> => {
       const { order, projStart } = await allocSlot(tx, upload.projectId);
+      if (projStart + duration > MAX_PROJECT_TIMING_SEC) {
+        return { kind: "over_cap", projEnd: projStart + duration };
+      }
       const v = await tx.video.create({
         data: {
           id: videoId,
@@ -260,10 +267,16 @@ async function runVideoTask(taskId: string, upload: Upload): Promise<TaskResult>
       });
       // 同 tx で chunk 行も消す (terminal status 確定後の別 tick で消し損ねると永久残り)
       await tx.uploadChunk.deleteMany({ where: { uploadId: upload.id } });
-      return v;
+      return { kind: "ok", video: v };
     }),
   );
-  return { kind: "success", videoId: created.id };
+  if (allocResult.kind === "over_cap") {
+    return {
+      kind: "failure",
+      error: `project timeline cap exceeded: would end at ${allocResult.projEnd}s (max ${MAX_PROJECT_TIMING_SEC}s)`,
+    };
+  }
+  return { kind: "success", videoId: allocResult.video.id };
 }
 
 async function runAudioTask(taskId: string, upload: Upload): Promise<TaskResult> {
@@ -325,9 +338,15 @@ async function runAudioTask(taskId: string, upload: Upload): Promise<TaskResult>
   ]);
 
   const duration = finalProbe.durationSec;
-  const created = await withSlotRetry(() =>
-    prisma.$transaction(async (tx) => {
+  type AllocResult =
+    | { kind: "ok"; audio: Awaited<ReturnType<typeof prisma.audio.create>> }
+    | { kind: "over_cap"; projEnd: number };
+  const allocResult: AllocResult = await withSlotRetry(() =>
+    prisma.$transaction(async (tx): Promise<AllocResult> => {
       const { order, projStart } = await allocSlot(tx, upload.projectId);
+      if (projStart + duration > MAX_PROJECT_TIMING_SEC) {
+        return { kind: "over_cap", projEnd: projStart + duration };
+      }
       const a = await tx.audio.create({
         data: {
           id: audioId,
@@ -356,10 +375,16 @@ async function runAudioTask(taskId: string, upload: Upload): Promise<TaskResult>
       });
       // 同 tx で chunk 行も消す (terminal status 確定後の別 tick で消し損ねると永久残り)
       await tx.uploadChunk.deleteMany({ where: { uploadId: upload.id } });
-      return a;
+      return { kind: "ok", audio: a };
     }),
   );
-  return { kind: "success", audioId: created.id };
+  if (allocResult.kind === "over_cap") {
+    return {
+      kind: "failure",
+      error: `project timeline cap exceeded: would end at ${allocResult.projEnd}s (max ${MAX_PROJECT_TIMING_SEC}s)`,
+    };
+  }
+  return { kind: "success", audioId: allocResult.audio.id };
 }
 
 async function executeTask(taskId: string): Promise<void> {

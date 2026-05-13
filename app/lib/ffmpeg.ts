@@ -5,6 +5,8 @@ import { join } from "node:path";
 export const MAX_DURATION_SEC = 3600;
 // 1h@~17Mbps 相当。仕様 (1080p/8Mbps 出力) に十分余裕
 export const MAX_UPLOAD_BYTES = 8 * 1024 * 1024 * 1024;
+// TimeRuler tick 上限と整合する project timeline 全長
+export const MAX_PROJECT_TIMING_SEC = 24 * 60 * 60;
 export const THUMBNAIL_INTERVAL_SEC = 10;
 export const THUMBNAIL_WIDTH = 320;
 
