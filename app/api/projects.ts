@@ -254,16 +254,23 @@ export const projects = new Hono<AuthContext>()
             if (t.kind === "video") await tx.video.update({ where: { id: t.id }, data });
             else await tx.audio.update({ where: { id: t.id }, data });
           }
-          // Phase 2: 本来の order と back-to-back な projStart/End を書き込む
+          // Phase 2: 本来の order と back-to-back な projStart/End を書き込む。
+          // 反転 (projEnd < projStart) は signed duration が負なので絶対値で cursor を進め、
+          // 向きだけ保存して reorder で undo されないようにする
           let cursor = 0;
           for (const [i, t] of newOrder.entries()) {
             const row = (t.kind === "video" ? videoMap : audioMap).get(t.id);
             if (!row) throw new Error("unreachable");
-            const duration = row.projEndSec - row.projStartSec;
-            const data = { order: i, projStartSec: cursor, projEndSec: cursor + duration };
+            const absDur = Math.abs(row.projEndSec - row.projStartSec);
+            const reversed = row.projEndSec < row.projStartSec;
+            const data = {
+              order: i,
+              projStartSec: reversed ? cursor + absDur : cursor,
+              projEndSec: reversed ? cursor : cursor + absDur,
+            };
             if (t.kind === "video") await tx.video.update({ where: { id: t.id }, data });
             else await tx.audio.update({ where: { id: t.id }, data });
-            cursor += duration;
+            cursor += absDur;
           }
         }),
       );

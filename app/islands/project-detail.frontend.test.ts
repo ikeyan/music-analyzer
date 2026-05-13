@@ -373,4 +373,64 @@ describe("ProjectDetail (frontend)", () => {
     expect(audio.srcStartSec).toBeCloseTo(0.2, 3);
     expect(audio.srcEndSec).toBeCloseTo(0.5, 3);
   }, 60_000);
+
+  it("反転 track を含む状態で並び替えても向きを保ち back-to-back に並ぶ", async () => {
+    const id = await createProject("reorder-flip-test");
+    await goto(`/projects/${id}`);
+    await waitHydrated('input[type=file][accept="audio/*"]');
+    await injectFileToInput(getMedia().audioMp3, "audio/*", "rev.mp3", "audio/mpeg");
+    await waitFor(webview(), "audio source", 30_000);
+    await injectFileToInput(getMedia().audioMp3, "audio/*", "fwd.mp3", "audio/mpeg");
+    await webview().evaluate(`new Promise((res, rej) => {
+      const start = Date.now();
+      const tick = () => {
+        if (document.querySelectorAll('audio').length >= 2) return res();
+        if (Date.now() - start > 30000) return rej(new Error("second audio timeout"));
+        setTimeout(tick, 100);
+      };
+      tick();
+    })`);
+    const before = (await fetch(`${server()}/api/projects/${id}`).then((r) => r.json())) as {
+      project: { audios: { id: string; name: string; projStartSec: number; projEndSec: number }[] };
+    };
+    const rev = before.project.audios.find((a) => a.name === "rev.mp3")!;
+    // rev を反転して projStart > projEnd にする
+    const flipRes = await fetch(`${server()}/api/projects/${id}/audios/${rev.id}/timing`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        srcStartSec: 0,
+        srcEndSec: 1,
+        projStartSec: rev.projEndSec,
+        projEndSec: rev.projStartSec,
+      }),
+    });
+    expect(flipRes.ok).toBe(true);
+    // rev を下に移動 (rev.mp3 が order 0、fwd.mp3 が order 1 から、swap で fwd→rev に)
+    await webview().click('button[aria-label="rev.mp3 を下に移動"]');
+    // refresh を待ってから検証
+    await webview().evaluate(`new Promise((res, rej) => {
+      const start = Date.now();
+      const tick = () => {
+        const names = Array.from(document.querySelectorAll('honox-island span'))
+          .map(s => s.textContent ?? "")
+          .filter(t => t.includes(".mp3"));
+        if (names.length >= 2 && names[0].includes("fwd") && names[1].includes("rev")) return res();
+        if (Date.now() - start > 5000) return rej(new Error("reorder not reflected: " + JSON.stringify(names)));
+        setTimeout(tick, 50);
+      };
+      tick();
+    })`);
+    const after = (await fetch(`${server()}/api/projects/${id}`).then((r) => r.json())) as {
+      project: { audios: { name: string; projStartSec: number; projEndSec: number }[] };
+    };
+    const afterFwd = after.project.audios.find((a) => a.name === "fwd.mp3")!;
+    const afterRev = after.project.audios.find((a) => a.name === "rev.mp3")!;
+    // fwd は order 0 で 0 から、rev は反転を維持しつつ fwd の直後に置かれる
+    expect(afterFwd.projStartSec).toBeCloseTo(0, 3);
+    expect(afterFwd.projEndSec).toBeGreaterThan(0);
+    expect(afterRev.projStartSec).toBeGreaterThan(afterRev.projEndSec);
+    expect(afterRev.projEndSec).toBeCloseTo(afterFwd.projEndSec, 3);
+    expect(afterRev.projStartSec).toBeGreaterThanOrEqual(afterFwd.projEndSec);
+  }, 90_000);
 });
