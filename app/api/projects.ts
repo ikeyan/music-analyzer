@@ -1,11 +1,9 @@
 import { vValidator } from "@hono/valibot-validator";
-import { Either } from "effect";
-import type { TypedResponse } from "hono";
+import { Effect, Either, pipe } from "effect";
 import { Hono } from "hono";
-import { createMiddleware } from "hono/factory";
-import type { JSONParsed } from "hono/utils/types";
 import * as v from "valibot";
 import { requireUser } from "../lib/auth";
+import { leftErr, provideEitherJson } from "../lib/either-json";
 import { describeError } from "../lib/error";
 import { MAX_UPLOAD_BYTES } from "../lib/ffmpeg";
 import { eagerCleanupAndUnmark, markPrefixForDeletion } from "../lib/gc";
@@ -43,43 +41,6 @@ const DEFAULT_CHUNK_SIZE = 8 * 1024 * 1024;
 // 極小チャンク DoS 防止
 const MIN_CHUNK_SIZE = 1024;
 const MAX_CHUNK_SIZE = 64 * 1024 * 1024;
-
-// throw HTTPException は hc の response 型に乗らないので Either で返す。
-// `<const E>` で literal status / 追加プロパティをそのまま伝播させる
-type ApiErrorStatus = 400 | 404 | 409 | 410 | 500;
-type ApiError = { status: ApiErrorStatus; error: string };
-
-function leftErr<const E extends ApiError>(e: E): Either.Either<never, E> {
-  return Either.left(e);
-}
-
-// c.json の戻り値型と一致させて as を排除する
-type LeftRes<E extends ApiError> = Response &
-  TypedResponse<JSONParsed<Omit<E, "status">>, E["status"], "json">;
-type RightRes<R> = Response & TypedResponse<JSONParsed<R>, 200, "json">;
-
-// handler を wrapping すると validator 由来の Input が HOF 越しに伝わらず c.req.valid が
-// 無力化されるので、middleware で c.var に関数を生やすことで handler を素のまま保つ。
-// overload を切らないと isLeft narrow 後の Left<E, R> でも R が phantom として残り、
-// c.json(r.right) 経由で R が response 型に leak する
-type EitherJsonFn = {
-  <const E extends ApiError>(r: Either.Left<E, unknown>): LeftRes<E>;
-  <const E extends ApiError, R>(r: Either.Either<R, E>): LeftRes<E> | RightRes<R>;
-};
-
-const provideEitherJson = createMiddleware<{
-  Variables: { eitherJson: EitherJsonFn };
-}>(async (c, next) => {
-  const eitherJson: EitherJsonFn = <const E extends ApiError, R>(r: Either.Either<R, E>) => {
-    if (Either.isLeft(r)) {
-      const { status, ...body } = r.left;
-      return c.json(body, status);
-    }
-    return c.json(r.right);
-  };
-  c.set("eitherJson", eitherJson);
-  await next();
-});
 
 const idParamSchema = v.object({ id: v.string() });
 const videoIdParamSchema = v.object({ id: v.string(), videoId: v.string() });
@@ -224,74 +185,91 @@ export const projects = new Hono()
     vValidator("json", reorderTracksSchema),
     async (c) => {
       const user = c.var.user;
-      const projectR = await requireProject(user.id, c.req.valid("param").id);
-      if (Either.isLeft(projectR)) return c.var.eitherJson(projectR);
-      const project = projectR.right;
       const { tracks: newOrder } = c.req.valid("json");
-
       // withSlotRetry が P2002/P2034 throw を retry。validation 失敗の Left は
       // txEither 内で rollback してから上に伝わるので retry 対象外
       type TrackOrderErr = { status: 400; error: string };
-      const txResult = await withSlotRetry(() =>
-        txEither<void, TrackOrderErr>(async (tx) => {
-          await tx.project.update({ where: { id: project.id }, data: { updatedAt: new Date() } });
-          const [videos, audios] = await Promise.all([
-            tx.video.findMany({
-              where: { projectId: project.id },
-              select: { id: true, projStartSec: true, projEndSec: true },
-            }),
-            tx.audio.findMany({
-              where: { projectId: project.id },
-              select: { id: true, projStartSec: true, projEndSec: true },
-            }),
-          ]);
-          const expected = videos.length + audios.length;
-          if (newOrder.length !== expected) {
-            return leftErr({ status: 400, error: "track-order: length mismatch" });
-          }
-          const videoMap = new Map(videos.map((row) => [row.id, row]));
-          const audioMap = new Map(audios.map((row) => [row.id, row]));
-          const seen = new Set<string>();
-          for (const t of newOrder) {
-            const exists = t.kind === "video" ? videoMap.has(t.id) : audioMap.has(t.id);
-            if (!exists) {
-              return leftErr({
-                status: 400,
-                error: `track-order: unknown ${t.kind} id ${t.id}`,
-              });
-            }
-            const key = `${t.kind}:${t.id}`;
-            if (seen.has(key)) {
-              return leftErr({
-                status: 400,
-                error: `track-order: duplicate ${t.kind} id ${t.id}`,
-              });
-            }
-            seen.add(key);
-          }
-          for (const [i, t] of newOrder.entries()) {
-            const data = { order: -(i + 1) };
-            if (t.kind === "video") await tx.video.update({ where: { id: t.id }, data });
-            else await tx.audio.update({ where: { id: t.id }, data });
-          }
-          let cursor = 0;
-          for (const [i, t] of newOrder.entries()) {
-            const row = (t.kind === "video" ? videoMap : audioMap).get(t.id);
-            if (!row) throw new Error("unreachable");
-            const duration = row.projEndSec - row.projStartSec;
-            const data = { order: i, projStartSec: cursor, projEndSec: cursor + duration };
-            if (t.kind === "video") await tx.video.update({ where: { id: t.id }, data });
-            else await tx.audio.update({ where: { id: t.id }, data });
-            cursor += duration;
-          }
-          return Either.right(undefined);
-        }),
+      const result = await pipe(
+        Effect.promise(() => requireProject(user.id, c.req.valid("param").id)),
+        Effect.flatMap((r) => r),
+        Effect.flatMap((project) =>
+          pipe(
+            Effect.promise(() =>
+              withSlotRetry(() =>
+                txEither<void, TrackOrderErr>(async (tx) => {
+                  await tx.project.update({
+                    where: { id: project.id },
+                    data: { updatedAt: new Date() },
+                  });
+                  const [videos, audios] = await Promise.all([
+                    tx.video.findMany({
+                      where: { projectId: project.id },
+                      select: { id: true, projStartSec: true, projEndSec: true },
+                    }),
+                    tx.audio.findMany({
+                      where: { projectId: project.id },
+                      select: { id: true, projStartSec: true, projEndSec: true },
+                    }),
+                  ]);
+                  const expected = videos.length + audios.length;
+                  if (newOrder.length !== expected) {
+                    return leftErr({ status: 400, error: "track-order: length mismatch" });
+                  }
+                  const videoMap = new Map(videos.map((row) => [row.id, row]));
+                  const audioMap = new Map(audios.map((row) => [row.id, row]));
+                  const seen = new Set<string>();
+                  for (const t of newOrder) {
+                    const exists = t.kind === "video" ? videoMap.has(t.id) : audioMap.has(t.id);
+                    if (!exists) {
+                      return leftErr({
+                        status: 400,
+                        error: `track-order: unknown ${t.kind} id ${t.id}`,
+                      });
+                    }
+                    const key = `${t.kind}:${t.id}`;
+                    if (seen.has(key)) {
+                      return leftErr({
+                        status: 400,
+                        error: `track-order: duplicate ${t.kind} id ${t.id}`,
+                      });
+                    }
+                    seen.add(key);
+                  }
+                  for (const [i, t] of newOrder.entries()) {
+                    const data = { order: -(i + 1) };
+                    if (t.kind === "video") await tx.video.update({ where: { id: t.id }, data });
+                    else await tx.audio.update({ where: { id: t.id }, data });
+                  }
+                  let cursor = 0;
+                  for (const [i, t] of newOrder.entries()) {
+                    const row = (t.kind === "video" ? videoMap : audioMap).get(t.id);
+                    if (!row) throw new Error("unreachable");
+                    const duration = row.projEndSec - row.projStartSec;
+                    const data = {
+                      order: i,
+                      projStartSec: cursor,
+                      projEndSec: cursor + duration,
+                    };
+                    if (t.kind === "video") await tx.video.update({ where: { id: t.id }, data });
+                    else await tx.audio.update({ where: { id: t.id }, data });
+                    cursor += duration;
+                  }
+                  return Either.right(undefined);
+                }),
+              ),
+            ),
+            Effect.flatMap((r) => r),
+            Effect.flatMap(() => Effect.promise(() => requireProjectDetail(user.id, project.id))),
+            Effect.flatMap((r) => r),
+          ),
+        ),
+        Effect.map((updated): { project: ApiProjectDetail } => ({
+          project: toApiProjectDetail(updated),
+        })),
+        Effect.either,
+        Effect.runPromise,
       );
-      if (Either.isLeft(txResult)) return c.var.eitherJson(txResult);
-
-      const updatedR = await requireProjectDetail(user.id, project.id);
-      if (Either.isLeft(updatedR)) return c.var.eitherJson(updatedR);
-      return c.json({ project: toApiProjectDetail(updatedR.right) satisfies ApiProjectDetail });
+      return c.var.eitherJson(result);
     },
   )
 
@@ -438,89 +416,102 @@ export const projects = new Hono()
   .post("/:id/uploads/:uploadId/complete", vValidator("param", uploadIdParamSchema), async (c) => {
     const user = c.var.user;
     const { id, uploadId } = c.req.valid("param");
-    const projectR = await requireProject(user.id, id);
-    if (Either.isLeft(projectR)) return c.var.eitherJson(projectR);
-    const project = projectR.right;
-
     // claim-first: 全 precondition を updateMany.where に畳んで原子化 (skill: prisma-claim-first)。
     // 失敗時 (count===0) だけ findFirst で診断し、既に completed なら冪等返却、それ以外は Left。
     // claim 後の validate 失敗は txEither が内部 throw で rollback してくれる
     type CompleteResult = { task: ApiTask; enqueue: boolean };
     type CompleteErr = { status: 400 | 404 | 409 | 410 | 500; error: string };
-    const result = await txEither<CompleteResult, CompleteErr>(async (tx) => {
-      const claimed = await tx.upload.updateMany({
-        where: {
-          id: uploadId,
-          projectId: project.id,
-          status: "pending",
-          expiresAt: { gt: new Date() },
-        },
-        data: { status: "completed" },
-      });
-      if (claimed.count === 0) {
-        const uploadR = await requireUpload(tx, uploadId, project.id);
-        // Right の型が違う Either はそのまま return できないので Either.left で rewrap する
-        if (Either.isLeft(uploadR)) return Either.left(uploadR.left);
-        const upload = uploadR.right;
-        if (upload.status === "completed") {
-          // 冪等: 既存 task を返す。並行 /complete の loser もここに来る
-          const existing = await tx.task.findFirst({
-            where: { uploadId: upload.id },
-            orderBy: { createdAt: "desc" },
-            include: { upload: { select: { fileName: true, kind: true } } },
-          });
-          if (!existing) return leftErr({ status: 500, error: "completed upload has no task" });
-          return Either.right({ task: toApiTask(existing), enqueue: false });
-        }
-        const check = checkUploadPending(upload);
-        if (Either.isLeft(check)) return Either.left(check.left);
-        return leftErr({
-          status: 500,
-          error: "unreachable: claim failed but upload is pending",
-        });
-      }
-      // claim 済み行を read。write lock を握っているので並行 read+write しない
-      const upload = await tx.upload.findUniqueOrThrow({ where: { id: uploadId } });
-      const chunks = await tx.uploadChunk.findMany({
-        where: { uploadId: upload.id },
-        select: { index: true, sizeBytes: true },
-      });
-      if (chunks.length !== upload.totalChunks) {
-        return leftErr({
-          status: 400,
-          error: `missing chunks: received ${chunks.length}/${upload.totalChunks}`,
-        });
-      }
-      const seen = new Set(chunks.map((chunk) => chunk.index));
-      for (let i = 0; i < upload.totalChunks; i++) {
-        if (!seen.has(i)) return leftErr({ status: 400, error: `missing chunk ${i}` });
-      }
-      const sum = chunks.reduce((acc, chunk) => acc + chunk.sizeBytes, 0n);
-      if (sum !== upload.totalBytes) {
-        return leftErr({
-          status: 400,
-          error: `byte total mismatch: received ${sum}, declared ${upload.totalBytes}`,
-        });
-      }
-      const task = await tx.task.create({
-        data: {
-          projectId: project.id,
-          type: upload.kind === "video" ? "video_validation" : "audio_validation",
-          uploadId: upload.id,
-          status: "pending",
-        },
-        include: { upload: { select: { fileName: true, kind: true } } },
-      });
-      // task 走行中の sweep を防ぐ。完了時 executeTask が mark ごと回収
-      await tx.deletionMark.updateMany({
-        where: { prefix: uploadPrefix(project.id, upload.id) },
-        data: { nextRetryAt: new Date(Date.now() + TASK_GRACE_MS) },
-      });
-      return Either.right({ task: toApiTask(task), enqueue: true });
-    });
-    if (Either.isLeft(result)) return c.var.eitherJson(result);
-    if (result.right.enqueue) enqueueTask(result.right.task.id);
-    return c.json({ task: result.right.task satisfies ApiTask });
+    const result = await pipe(
+      Effect.promise(() => requireProject(user.id, id)),
+      Effect.flatMap((r) => r),
+      Effect.flatMap((project) =>
+        pipe(
+          Effect.promise(() =>
+            txEither<CompleteResult, CompleteErr>(async (tx) => {
+              const claimed = await tx.upload.updateMany({
+                where: {
+                  id: uploadId,
+                  projectId: project.id,
+                  status: "pending",
+                  expiresAt: { gt: new Date() },
+                },
+                data: { status: "completed" },
+              });
+              if (claimed.count === 0) {
+                const uploadR = await requireUpload(tx, uploadId, project.id);
+                // Right の型が違う Either はそのまま return できないので Either.left で rewrap する
+                if (Either.isLeft(uploadR)) return Either.left(uploadR.left);
+                const upload = uploadR.right;
+                if (upload.status === "completed") {
+                  // 冪等: 既存 task を返す。並行 /complete の loser もここに来る
+                  const existing = await tx.task.findFirst({
+                    where: { uploadId: upload.id },
+                    orderBy: { createdAt: "desc" },
+                    include: { upload: { select: { fileName: true, kind: true } } },
+                  });
+                  if (!existing) {
+                    return leftErr({ status: 500, error: "completed upload has no task" });
+                  }
+                  return Either.right({ task: toApiTask(existing), enqueue: false });
+                }
+                const check = checkUploadPending(upload);
+                if (Either.isLeft(check)) return Either.left(check.left);
+                return leftErr({
+                  status: 500,
+                  error: "unreachable: claim failed but upload is pending",
+                });
+              }
+              // claim 済み行を read。write lock を握っているので並行 read+write しない
+              const upload = await tx.upload.findUniqueOrThrow({ where: { id: uploadId } });
+              const chunks = await tx.uploadChunk.findMany({
+                where: { uploadId: upload.id },
+                select: { index: true, sizeBytes: true },
+              });
+              if (chunks.length !== upload.totalChunks) {
+                return leftErr({
+                  status: 400,
+                  error: `missing chunks: received ${chunks.length}/${upload.totalChunks}`,
+                });
+              }
+              const seen = new Set(chunks.map((chunk) => chunk.index));
+              for (let i = 0; i < upload.totalChunks; i++) {
+                if (!seen.has(i)) return leftErr({ status: 400, error: `missing chunk ${i}` });
+              }
+              const sum = chunks.reduce((acc, chunk) => acc + chunk.sizeBytes, 0n);
+              if (sum !== upload.totalBytes) {
+                return leftErr({
+                  status: 400,
+                  error: `byte total mismatch: received ${sum}, declared ${upload.totalBytes}`,
+                });
+              }
+              const task = await tx.task.create({
+                data: {
+                  projectId: project.id,
+                  type: upload.kind === "video" ? "video_validation" : "audio_validation",
+                  uploadId: upload.id,
+                  status: "pending",
+                },
+                include: { upload: { select: { fileName: true, kind: true } } },
+              });
+              // task 走行中の sweep を防ぐ。完了時 executeTask が mark ごと回収
+              await tx.deletionMark.updateMany({
+                where: { prefix: uploadPrefix(project.id, upload.id) },
+                data: { nextRetryAt: new Date(Date.now() + TASK_GRACE_MS) },
+              });
+              return Either.right({ task: toApiTask(task), enqueue: true });
+            }),
+          ),
+          Effect.flatMap((r) => r),
+        ),
+      ),
+      Effect.map(({ task, enqueue }): { task: ApiTask } => {
+        if (enqueue) enqueueTask(task.id);
+        return { task };
+      }),
+      Effect.either,
+      Effect.runPromise,
+    );
+    return c.var.eitherJson(result);
   })
 
   // pending な upload の自発キャンセル用。completed 後は task が chunks を必要とするので拒否
