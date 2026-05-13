@@ -1,7 +1,7 @@
 import { vValidator } from "@hono/valibot-validator";
 import * as runtime from "@prisma/client/runtime/client";
 import { Either } from "effect";
-import type { Context, Input } from "hono";
+import type { Context, MiddlewareHandler, TypedResponse } from "hono";
 import { Hono } from "hono";
 import * as v from "valibot";
 import { type Prisma, type PrismaClient } from "../generated/prisma/client";
@@ -67,18 +67,34 @@ function leftJson<const E extends ApiError>(c: Context, e: E) {
   return c.json(body, status);
 }
 
-// Either を返す handler をラップ。Left → leftJson、Right → c.json(right, 200) に畳む。
-// 201 / 204 / stream を返す handler は対象外 (200 JSON 専用)。
-// AuthContext を固定にしないと chain の `new Hono<AuthContext>()` からの contextual
-// typing が wrapper の generic E に乗らず、inner の c.var.user が型を失う
-function eitherHandler<P extends string, I extends Input, R, L extends ApiError>(
-  inner: (c: Context<AuthContext, P, I>) => Promise<Either.Either<R, L>>,
-) {
-  return async (c: Context<AuthContext, P, I>) => {
-    const r = await inner(c);
-    return Either.isLeft(r) ? leftJson(c, r.left) : c.json(r.right);
-  };
+// c に閉じた eitherJson を作る。c.var.eitherJson 経由で handler から使う。
+// handler 自体をラップする方式 (eitherHandler) だと validator 由来の Input が
+// HOF 越しに伝わらず c.req.valid が無力化されるので、middleware で c.var に
+// 関数を生やすことで handler を素のまま (Hono 標準形) に保つ。
+// overload を切らないと isLeft で narrow した Left<E, R> を渡したときも
+// R が phantom として残り、c.json(r.right) 経由で R が response 型に leak する
+type LeftRes<E extends ApiError> = TypedResponse<Omit<E, "status">, E["status"], "json">;
+type RightRes<R> = TypedResponse<R, 200, "json">;
+type EitherJsonFn = {
+  <const E extends ApiError>(r: Either.Left<E, unknown>): LeftRes<E>;
+  <const E extends ApiError, R>(r: Either.Either<R, E>): LeftRes<E> | RightRes<R>;
+};
+
+function makeEitherJson(c: Context): EitherJsonFn {
+  return <const E extends ApiError, R>(r: Either.Either<R, E>) =>
+    (Either.isLeft(r) ? leftJson(c, r.left) : c.json(r.right)) as LeftRes<E> | RightRes<R>;
 }
+
+type ProjectsContext = {
+  Variables: AuthContext["Variables"] & {
+    eitherJson: EitherJsonFn;
+  };
+};
+
+const provideEitherJson: MiddlewareHandler<ProjectsContext> = async (c, next) => {
+  c.set("eitherJson", makeEitherJson(c));
+  await next();
+};
 
 // tx 内で Left を返した場合に rollback したい。Prisma の $transaction は
 // throw でしか rollback できないので、内部で throw → 外で catch して Left に戻す
@@ -202,8 +218,9 @@ export async function findProjectDetail(userId: string, projectId: string) {
   });
 }
 
-export const projects = new Hono<AuthContext>()
+export const projects = new Hono<ProjectsContext>()
   .use("*", requireUser)
+  .use("*", provideEitherJson)
   .get("/", async (c) => {
     const user = c.var.user;
     const list = await prisma.project.findMany({
@@ -228,7 +245,7 @@ export const projects = new Hono<AuthContext>()
   .delete("/:id", vValidator("param", idParamSchema), async (c) => {
     const user = c.var.user;
     const projectR = await requireProject(user.id, c.req.valid("param").id);
-    if (Either.isLeft(projectR)) return leftJson(c, projectR.left);
+    if (Either.isLeft(projectR)) return c.var.eitherJson(projectR);
     const project = projectR.right;
     const prefix = projectPrefix(project.id);
     await prisma.$transaction([
@@ -252,7 +269,7 @@ export const projects = new Hono<AuthContext>()
     async (c) => {
       const user = c.var.user;
       const projectR = await requireProject(user.id, c.req.valid("param").id);
-      if (Either.isLeft(projectR)) return leftJson(c, projectR.left);
+      if (Either.isLeft(projectR)) return c.var.eitherJson(projectR);
       const project = projectR.right;
       const { tracks: newOrder } = c.req.valid("json");
 
@@ -314,7 +331,7 @@ export const projects = new Hono<AuthContext>()
           return Either.right(undefined);
         }),
       );
-      if (Either.isLeft(txResult)) return leftJson(c, txResult.left);
+      if (Either.isLeft(txResult)) return c.var.eitherJson(txResult);
 
       const updated = await findProjectDetail(user.id, project.id);
       if (!updated) return c.json({ error: "project not found" }, 404);
@@ -329,7 +346,7 @@ export const projects = new Hono<AuthContext>()
     async (c) => {
       const user = c.var.user;
       const projectR = await requireProject(user.id, c.req.valid("param").id);
-      if (Either.isLeft(projectR)) return leftJson(c, projectR.left);
+      if (Either.isLeft(projectR)) return c.var.eitherJson(projectR);
       const project = projectR.right;
       const {
         kind,
@@ -366,10 +383,10 @@ export const projects = new Hono<AuthContext>()
       const user = c.var.user;
       const { id, uploadId, index: indexStr } = c.req.valid("param");
       const projectR = await requireProject(user.id, id);
-      if (Either.isLeft(projectR)) return leftJson(c, projectR.left);
+      if (Either.isLeft(projectR)) return c.var.eitherJson(projectR);
       const project = projectR.right;
       const uploadR = await requirePendingUpload(uploadId, project.id);
-      if (Either.isLeft(uploadR)) return leftJson(c, uploadR.left);
+      if (Either.isLeft(uploadR)) return c.var.eitherJson(uploadR);
       const upload = uploadR.right;
       const index = Number(indexStr);
       if (!Number.isInteger(index) || index < 0 || index >= upload.totalChunks) {
@@ -466,7 +483,7 @@ export const projects = new Hono<AuthContext>()
     const user = c.var.user;
     const { id, uploadId } = c.req.valid("param");
     const projectR = await requireProject(user.id, id);
-    if (Either.isLeft(projectR)) return leftJson(c, projectR.left);
+    if (Either.isLeft(projectR)) return c.var.eitherJson(projectR);
     const project = projectR.right;
 
     // claim-first: 全 precondition を updateMany.where に畳んで原子化 (skill: prisma-claim-first)。
@@ -545,7 +562,7 @@ export const projects = new Hono<AuthContext>()
       });
       return Either.right({ task: toApiTask(task), enqueue: true });
     });
-    if (Either.isLeft(result)) return leftJson(c, result.left);
+    if (Either.isLeft(result)) return c.var.eitherJson(result);
     if (result.right.enqueue) enqueueTask(result.right.task.id);
     return c.json({ task: result.right.task satisfies ApiTask });
   })
@@ -555,7 +572,7 @@ export const projects = new Hono<AuthContext>()
     const user = c.var.user;
     const { id, uploadId } = c.req.valid("param");
     const projectR = await requireProject(user.id, id);
-    if (Either.isLeft(projectR)) return leftJson(c, projectR.left);
+    if (Either.isLeft(projectR)) return c.var.eitherJson(projectR);
     const project = projectR.right;
     const prefix = uploadPrefix(project.id, uploadId);
     // claim-first で pending → aborted に遷移 (skill: prisma-claim-first)。
@@ -577,57 +594,44 @@ export const projects = new Hono<AuthContext>()
       await tx.uploadChunk.deleteMany({ where: { uploadId } });
       return Either.right(undefined);
     });
-    if (Either.isLeft(result)) return leftJson(c, result.left);
+    if (Either.isLeft(result)) return c.var.eitherJson(result);
     await eagerCleanupAndUnmark(prefix);
     return c.body(null, 204);
   })
 
-  // eitherHandler 経由だと validator 由来の Input generic が伝わらず c.req.valid が
-  // 効かないので、path param は c.req.param で読む (P generic からは伝わる)
-  .get(
-    "/:id/tasks",
-    vValidator("param", idParamSchema),
-    eitherHandler(
-      async (c): Promise<Either.Either<{ tasks: ApiTask[] }, { status: 404; error: string }>> => {
-        const user = c.var.user;
-        const projectR = await requireProject(user.id, c.req.param("id"));
-        if (Either.isLeft(projectR)) return Either.left(projectR.left);
-        const project = projectR.right;
-        const tasks = await prisma.task.findMany({
-          where: { projectId: project.id },
-          orderBy: { createdAt: "desc" },
-          include: { upload: { select: { fileName: true, kind: true } } },
-        });
-        return Either.right({ tasks: tasks.map(toApiTask) satisfies ApiTask[] });
-      },
-    ),
-  )
+  .get("/:id/tasks", vValidator("param", idParamSchema), async (c) => {
+    const user = c.var.user;
+    const projectR = await requireProject(user.id, c.req.valid("param").id);
+    if (Either.isLeft(projectR)) return c.var.eitherJson(projectR);
+    const project = projectR.right;
+    const tasks = await prisma.task.findMany({
+      where: { projectId: project.id },
+      orderBy: { createdAt: "desc" },
+      include: { upload: { select: { fileName: true, kind: true } } },
+    });
+    return c.json({ tasks: tasks.map(toApiTask) satisfies ApiTask[] });
+  })
 
-  .get(
-    "/:id/tasks/:taskId",
-    vValidator("param", taskIdParamSchema),
-    eitherHandler(
-      async (c): Promise<Either.Either<{ task: ApiTask }, { status: 404; error: string }>> => {
-        const user = c.var.user;
-        const projectR = await requireProject(user.id, c.req.param("id"));
-        if (Either.isLeft(projectR)) return Either.left(projectR.left);
-        const project = projectR.right;
-        const task = await prisma.task.findFirst({
-          where: { id: c.req.param("taskId"), projectId: project.id },
-          include: { upload: { select: { fileName: true, kind: true } } },
-        });
-        if (!task) return leftErr({ status: 404, error: "task not found" });
-        return Either.right({ task: toApiTask(task) satisfies ApiTask });
-      },
-    ),
-  )
+  .get("/:id/tasks/:taskId", vValidator("param", taskIdParamSchema), async (c) => {
+    const user = c.var.user;
+    const { id, taskId } = c.req.valid("param");
+    const projectR = await requireProject(user.id, id);
+    if (Either.isLeft(projectR)) return c.var.eitherJson(projectR);
+    const project = projectR.right;
+    const task = await prisma.task.findFirst({
+      where: { id: taskId, projectId: project.id },
+      include: { upload: { select: { fileName: true, kind: true } } },
+    });
+    if (!task) return c.var.eitherJson(leftErr({ status: 404, error: "task not found" }));
+    return c.json({ task: toApiTask(task) satisfies ApiTask });
+  })
 
   .delete("/:id/videos/:videoId", vValidator("param", videoIdParamSchema), async (c) => {
     const user = c.var.user;
     const { id, videoId } = c.req.valid("param");
     const projectR = await requireProject(user.id, id);
 
-    if (Either.isLeft(projectR)) return leftJson(c, projectR.left);
+    if (Either.isLeft(projectR)) return c.var.eitherJson(projectR);
 
     const project = projectR.right;
     const video = await prisma.video.findFirst({
@@ -649,7 +653,7 @@ export const projects = new Hono<AuthContext>()
     const { id, videoId } = c.req.valid("param");
     const projectR = await requireProject(user.id, id);
 
-    if (Either.isLeft(projectR)) return leftJson(c, projectR.left);
+    if (Either.isLeft(projectR)) return c.var.eitherJson(projectR);
 
     const project = projectR.right;
     const video = await prisma.video.findFirst({
@@ -664,7 +668,7 @@ export const projects = new Hono<AuthContext>()
     const { id, videoId } = c.req.valid("param");
     const projectR = await requireProject(user.id, id);
 
-    if (Either.isLeft(projectR)) return leftJson(c, projectR.left);
+    if (Either.isLeft(projectR)) return c.var.eitherJson(projectR);
 
     const project = projectR.right;
     const video = await prisma.video.findFirst({
@@ -682,7 +686,7 @@ export const projects = new Hono<AuthContext>()
       const { id, thumbId } = c.req.valid("param");
       const projectR = await requireProject(user.id, id);
 
-      if (Either.isLeft(projectR)) return leftJson(c, projectR.left);
+      if (Either.isLeft(projectR)) return c.var.eitherJson(projectR);
 
       const project = projectR.right;
       const thumb = await prisma.thumbnail.findFirst({
@@ -698,7 +702,7 @@ export const projects = new Hono<AuthContext>()
     const { id, audioId } = c.req.valid("param");
     const projectR = await requireProject(user.id, id);
 
-    if (Either.isLeft(projectR)) return leftJson(c, projectR.left);
+    if (Either.isLeft(projectR)) return c.var.eitherJson(projectR);
 
     const project = projectR.right;
     const audio = await prisma.audio.findFirst({
@@ -719,7 +723,7 @@ export const projects = new Hono<AuthContext>()
     const { id, audioId } = c.req.valid("param");
     const projectR = await requireProject(user.id, id);
 
-    if (Either.isLeft(projectR)) return leftJson(c, projectR.left);
+    if (Either.isLeft(projectR)) return c.var.eitherJson(projectR);
 
     const project = projectR.right;
     const audio = await prisma.audio.findFirst({
@@ -734,7 +738,7 @@ export const projects = new Hono<AuthContext>()
     const { id, audioId } = c.req.valid("param");
     const projectR = await requireProject(user.id, id);
 
-    if (Either.isLeft(projectR)) return leftJson(c, projectR.left);
+    if (Either.isLeft(projectR)) return c.var.eitherJson(projectR);
 
     const project = projectR.right;
     const audio = await prisma.audio.findFirst({
