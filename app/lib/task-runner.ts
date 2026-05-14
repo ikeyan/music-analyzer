@@ -225,8 +225,11 @@ async function runVideoTask(taskId: string, upload: Upload): Promise<TaskResult>
         where: { id: taskId },
         data: { status: "succeeded", finishedAt: new Date(), videoId: v.id },
       });
-      // 同 tx で chunk 行も消す (terminal status 確定後の別 tick で消し損ねると永久残り)
+      // 同 tx で chunks と Upload も消す。Video/Audio が name 等の canonical data を持ち、
+      // succeeded task は UI から filter outed されるので Upload row 保持の意味がない。
+      // Task.uploadId は optional FK なので SetNull で抜ける
       await tx.uploadChunk.deleteMany({ where: { uploadId: upload.id } });
+      await tx.upload.delete({ where: { id: upload.id } });
       return v;
     }),
   );
@@ -321,8 +324,11 @@ async function runAudioTask(taskId: string, upload: Upload): Promise<TaskResult>
         where: { id: taskId },
         data: { status: "succeeded", finishedAt: new Date(), audioId: a.id },
       });
-      // 同 tx で chunk 行も消す (terminal status 確定後の別 tick で消し損ねると永久残り)
+      // 同 tx で chunks と Upload も消す。Video/Audio が name 等の canonical data を持ち、
+      // succeeded task は UI から filter outed されるので Upload row 保持の意味がない。
+      // Task.uploadId は optional FK なので SetNull で抜ける
       await tx.uploadChunk.deleteMany({ where: { uploadId: upload.id } });
+      await tx.upload.delete({ where: { id: upload.id } });
       return a;
     }),
   );
