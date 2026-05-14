@@ -99,9 +99,7 @@ export async function sweepPendingDeletions(): Promise<void> {
   }
 }
 
-// 期限切れ pending と aborted な Upload を DB から消す。
-// completed は task が responsible なので除外。pending+expired と aborted は task を
-// 持たない (task は /complete でしか作られない) ので Upload→Task FK 違反は起きない
+// completed は task が responsible なので除外
 export async function cleanupAbandonedUploads(now: () => Date = () => new Date()): Promise<void> {
   const targets = await prisma.upload.findMany({
     where: {

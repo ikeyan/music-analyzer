@@ -108,9 +108,7 @@ function requireUpload<L extends LogOpts, O extends OmitOpts, E extends ExtArgs>
 
 type UploadRow = NonNullable<Awaited<ReturnType<typeof prisma.upload.findFirst>>>;
 
-// pending + 未期限 check。Right が upload row なので requirePendingUpload と直接合成可能。
-// 返り値型を明示しないと leftErr 毎の Either<never, X> が union のまま残り、合成側で
-// 同じ Right 型に並べたとき variance が合わない
+// 戻り値型を明示しないと leftErr の Either<never, X> が union のまま残り variance が合わない
 function checkUploadPending<U extends UploadRow>(
   upload: U,
 ): Either.Either<U, { status: 409 | 410; error: string }> {
@@ -443,9 +441,7 @@ export const projects = new Hono()
           .catch(() => {});
         return c.json({ error: `chunk exceeds declared chunkSize ${upload.chunkSize}` }, 413);
       }
-      // delta 計算用に既存 chunk を read してから、upload の precondition を畳んだ
-      // updateMany で claim-first する (skill: prisma-claim-first)。
-      // stale (count===0) なら新規 S3 を消すために throw ではなく戻り値で stale を表す
+      // stale を throw で表すと外側で新規 S3 を掃除できないので戻り値で表す (skill: prisma-claim-first)
       const promoteResult = await prisma.$transaction(async (tx) => {
         const existing = await tx.uploadChunk.findUnique({
           where: { uploadId_index: { uploadId: upload.id, index } },
