@@ -1,8 +1,6 @@
 import type { Hono } from "hono";
 
-// Hono の `app.request(input, init)` は本番 fetch と違い body から Content-Length を
-// 自動付与しない。CL を必須化したエンドポイント (chunked upload PUT 等) を
-// テストするときは hc<AppType>(..., { fetch }) にこのラッパを渡す
+// app.request は body から Content-Length を自動付与しない
 export function withAutoContentLength<H extends Hono>(app: H): H["request"] {
   const wrapped: H["request"] = async (input, init) => {
     const headers = new Headers(init?.headers);

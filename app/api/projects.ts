@@ -500,9 +500,7 @@ export const projects = new Hono()
 
   .post("/:id/uploads/:uploadId/complete", vValidator("param", uploadIdParamSchema), (c) => {
     const { id, uploadId } = c.req.valid("param");
-    // claim-first: 全 precondition を updateMany.where に畳んで原子化 (skill: prisma-claim-first)。
-    // 失敗時 (count===0) だけ findFirst で診断し、既に completed なら冪等返却、それ以外は Left。
-    // claim 後の validate 失敗は txEither が内部 throw で rollback してくれる
+    // skill: prisma-claim-first。completed なら冪等返却、validate 失敗は txEither が rollback
     return pipe(
       requireProject(c.var.user.id, id),
       Effect.flatMap((project) =>

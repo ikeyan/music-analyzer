@@ -394,8 +394,7 @@ describe("chunked upload + media validation task", () => {
     expect(jr.task.id).toBe(ja.task.id);
 
     await waitForInflightTasks();
-    // succeeded 後は Upload row が消えて task.uploadId が null になるので projectId で数える
-    const tasks = await prisma.task.findMany({ where: { projectId: pid } });
+    const tasks = await prisma.task.findMany({ where: { uploadId: upload.id } });
     expect(tasks).toHaveLength(1);
   }, 120_000);
 
