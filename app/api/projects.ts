@@ -444,19 +444,17 @@ export const projects = new Hono()
           .catch(() => {});
         return c.json({ error: `chunk exceeds declared chunkSize ${upload.chunkSize}` }, 413);
       }
-      // stale を throw で表すと外側で新規 S3 を掃除できないので戻り値で表す (skill: prisma-claim-first)
+      // skill: prisma-claim-first。chunk の read/delta は claim 後でないと
+      // 並行 PUT が同じ古い sizeBytes を基に delta を計算し receivedBytes が ずれる。
+      // stale を throw で表すと外側で新規 S3 を掃除できないので戻り値で表す
       const promoteResult = await prisma.$transaction(async (tx) => {
-        const existing = await tx.uploadChunk.findUnique({
-          where: { uploadId_index: { uploadId: upload.id, index } },
-        });
-        const delta = existing ? BigInt(size) - existing.sizeBytes : BigInt(size);
         const claimed = await tx.upload.updateMany({
           where: {
             id: upload.id,
             status: "pending",
             expiresAt: { gt: new Date() },
           },
-          data: { receivedBytes: { increment: delta } },
+          data: { updatedAt: new Date() },
         });
         if (claimed.count === 0) {
           const fresh = await tx.upload.findUnique({
@@ -469,6 +467,14 @@ export const projects = new Hono()
           }
           return { stale: true as const, status: "expired" as const, oldS3Key: null };
         }
+        const existing = await tx.uploadChunk.findUnique({
+          where: { uploadId_index: { uploadId: upload.id, index } },
+        });
+        const delta = existing ? BigInt(size) - existing.sizeBytes : BigInt(size);
+        await tx.upload.update({
+          where: { id: upload.id },
+          data: { receivedBytes: { increment: delta } },
+        });
         if (existing) {
           await tx.uploadChunk.update({
             where: { uploadId_index: { uploadId: upload.id, index } },

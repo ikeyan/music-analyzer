@@ -446,6 +446,41 @@ describe("chunked upload + media validation task", () => {
     expect(keys).toEqual([dbChunk.s3Key]);
   });
 
+  // 性質: chunk PUT が並行・retry で交錯しても、最終的に upload.receivedBytes は
+  // 残った chunk 行の sizeBytes の合計と一致する (delta 計算と claim の race 回避)
+  it("並行/retry な chunk PUT 後も receivedBytes は chunks の sum と一致", async () => {
+    await fc.assert(
+      fc.asyncProperty(
+        fc.array(fc.tuple(fc.integer({ min: 0, max: 2 }), fc.integer({ min: 1, max: 64 })), {
+          minLength: 4,
+          maxLength: 8,
+        }),
+        async (puts) => {
+          const client = makeClient();
+          const pid = await createProject(client, `chunk-sum-${crypto.randomUUID()}`);
+          const upload = await createUploadOk(client, pid, {
+            kind: "audio",
+            fileName: "x.bin",
+            totalBytes: 256,
+            chunkSize: 1024,
+          });
+          await Promise.all(
+            puts.map(([idx, sz]) =>
+              putRawChunk(client, pid, upload.id, idx, new Uint8Array(sz)).catch(() => null),
+            ),
+          );
+          const reloaded = await prisma.upload.findUniqueOrThrow({ where: { id: upload.id } });
+          const agg = await prisma.uploadChunk.aggregate({
+            where: { uploadId: upload.id },
+            _sum: { sizeBytes: true },
+          });
+          expect(reloaded.receivedBytes).toBe(agg._sum.sizeBytes ?? 0n);
+        },
+      ),
+      { numRuns: 3 },
+    );
+  });
+
   it("task 成功時 media prefix の DeletionMark が消える (途中失敗時は残る)", async () => {
     const client = makeClient();
     const pid = await createProject(client, "media-mark-cleanup");
@@ -820,7 +855,17 @@ describe("requireProjectDetail", () => {
     const taskStatus = fc.constantFrom("pending", "running", "failed", "succeeded") as fc.Arbitrary<
       "pending" | "running" | "failed" | "succeeded"
     >;
-    const taskGen = fc.tuple(taskStatus, fc.option(fc.integer({ min: -60_000, max: 60_000 })));
+    // expireAt の offset は now 近傍 (±数 ms) を避ける。テスト内 `now` と SQL `new Date()` の
+    // 時刻差で boundary が前後し flaky になる
+    const taskGen = fc.tuple(
+      taskStatus,
+      fc.option(
+        fc.oneof(
+          fc.integer({ min: -60_000, max: -1_000 }),
+          fc.integer({ min: 1_000, max: 60_000 }),
+        ),
+      ),
+    );
     await fc.assert(
       fc.asyncProperty(fc.array(taskGen, { minLength: 1, maxLength: 6 }), async (tasks) => {
         const sub = `filter-${crypto.randomUUID()}`;

@@ -13,12 +13,33 @@ describe("describeError", () => {
     );
   });
 
-  // 性質: 非 Error は String(v).slice(0, 500)。プリミティブ/オブジェクト/null/undefined を網羅
-  it("非 Error は String(v).slice(0, 500)", () => {
+  // 性質: 非 Error でも throw せず string を返し 500 char 以下に収まる。
+  // (toString が壊れた値でも fallback で安全に文字列化することを担保)
+  it("非 Error でも throw せず string<=500 を返す", () => {
     fc.assert(
       fc.property(fc.anything(), (v) => {
         fc.pre(!(v instanceof Error));
-        expect(describeError(v)).toBe(String(v).slice(0, 500));
+        const got = describeError(v);
+        expect(typeof got).toBe("string");
+        expect(got.length).toBeLessThanOrEqual(500);
+      }),
+      { numRuns: 30 },
+    );
+  });
+
+  // 性質: 普通に String() できる値は String(v).slice(0, 500) と一致
+  it("String() が動く値は String(v).slice(0, 500) と一致", () => {
+    fc.assert(
+      fc.property(fc.anything(), (v) => {
+        fc.pre(!(v instanceof Error));
+        let expected: string;
+        try {
+          expected = String(v).slice(0, 500);
+        } catch {
+          fc.pre(false);
+          return;
+        }
+        expect(describeError(v)).toBe(expected);
       }),
       { numRuns: 30 },
     );
