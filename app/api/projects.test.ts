@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import * as fc from "fast-check";
 import { Hono } from "hono";
 import { hc } from "hono/client";
 import {
@@ -739,129 +740,117 @@ describe("requireProjectDetail", () => {
     if (Either.isLeft(r)) expect(r.left).toEqual({ status: 404, error: "project not found" });
   });
 
-  it("orders videos and audios by `order` ascending and thumbnails by atSec", async () => {
-    const pid = await makeProject("detail-order", "ordered");
-    await prisma.video.createMany({
-      data: [
-        {
-          id: "v1",
-          projectId: pid,
-          order: 1,
-          name: "v1",
-          videoKey: "k1",
-          durationSec: 1,
-          width: 1,
-          height: 1,
-          fps: 1,
-          sizeBytes: 1n,
-          srcStartSec: 0,
-          srcEndSec: 1,
-          projStartSec: 0,
-          projEndSec: 1,
-        },
-        {
-          id: "v0",
-          projectId: pid,
-          order: 0,
-          name: "v0",
-          videoKey: "k0",
-          durationSec: 1,
-          width: 1,
-          height: 1,
-          fps: 1,
-          sizeBytes: 1n,
-          srcStartSec: 0,
-          srcEndSec: 1,
-          projStartSec: 1,
-          projEndSec: 2,
-        },
-      ],
-    });
-    await prisma.thumbnail.createMany({
-      data: [
-        { id: "t1", videoId: "v0", atSec: 10, key: "tk1", width: 10, height: 10 },
-        { id: "t0", videoId: "v0", atSec: 0, key: "tk0", width: 10, height: 10 },
-      ],
-    });
-    await prisma.audio.createMany({
-      data: [
-        {
-          id: "a1",
-          projectId: pid,
-          order: 1,
-          name: "a1",
-          audioKey: "ak1",
-          durationSec: 1,
-          sizeBytes: 1n,
-          srcStartSec: 0,
-          srcEndSec: 1,
-          projStartSec: 2,
-          projEndSec: 3,
-        },
-        {
-          id: "a0",
-          projectId: pid,
-          order: 0,
-          name: "a0",
-          audioKey: "ak0",
-          durationSec: 1,
-          sizeBytes: 1n,
-          srcStartSec: 0,
-          srcEndSec: 1,
-          projStartSec: 3,
-          projEndSec: 4,
-        },
-      ],
-    });
-    const owner = await prisma.user.findFirstOrThrow({ where: { authentikSub: "detail-order" } });
-    const project = unwrapRight(
-      await Effect.runPromise(Effect.either(requireProjectDetail(owner.id, pid))),
-    );
-    expect(project.videos.map((v) => v.id)).toEqual(["v0", "v1"]);
-    expect(project.audios.map((a) => a.id)).toEqual(["a0", "a1"]);
-    expect(project.videos[0]!.thumbnails.map((t) => t.id)).toEqual(["t0", "t1"]);
+  // Video/Audio schema が wide なので test data はヘルパーで圧縮する。
+  // order だけ可変、その他は最小限の satisfy で詰める
+  const v = (pid: string, id: string, order: number) => ({
+    id,
+    projectId: pid,
+    order,
+    name: id,
+    videoKey: id,
+    durationSec: 1,
+    width: 1,
+    height: 1,
+    fps: 1,
+    sizeBytes: 1n,
+    srcStartSec: 0,
+    srcEndSec: 1,
+    projStartSec: order,
+    projEndSec: order + 1,
+  });
+  const a = (pid: string, id: string, order: number) => ({
+    id,
+    projectId: pid,
+    order,
+    name: id,
+    audioKey: id,
+    durationSec: 1,
+    sizeBytes: 1n,
+    srcStartSec: 0,
+    srcEndSec: 1,
+    projStartSec: order + 100,
+    projEndSec: order + 101,
+  });
+  const t = (videoId: string, atSec: number) => ({
+    id: `t${videoId}-${atSec}`,
+    videoId,
+    atSec,
+    key: `k${atSec}`,
+    width: 1,
+    height: 1,
   });
 
-  it("excludes succeeded tasks and expired failed tasks", async () => {
-    const pid = await makeProject("detail-task-filter", "tasks");
-    const past = new Date(Date.now() - 60_000);
-    const future = new Date(Date.now() + 60_000);
-    await prisma.task.createMany({
-      data: [
-        { id: "tp", projectId: pid, type: "audio_validation", fileName: "p", status: "pending" },
-        { id: "tr", projectId: pid, type: "audio_validation", fileName: "r", status: "running" },
-        {
-          id: "tf",
-          projectId: pid,
-          type: "audio_validation",
-          fileName: "f",
-          status: "failed",
-          expireAt: future,
+  // 性質: 入力順に関係なく order/atSec 昇順で返る。整数 orders / float atSec を任意配列で
+  it("videos/audios は order asc、thumbnails は atSec asc で返る", async () => {
+    await fc.assert(
+      fc.asyncProperty(
+        fc.uniqueArray(fc.integer({ min: 0, max: 99 }), { minLength: 2, maxLength: 4 }),
+        fc.uniqueArray(fc.integer({ min: 0, max: 99 }), { minLength: 2, maxLength: 4 }),
+        fc.uniqueArray(fc.double({ min: 0, max: 999, noNaN: true }), {
+          minLength: 2,
+          maxLength: 4,
+        }),
+        async (vOrders, aOrders, atSecs) => {
+          const sub = `order-${crypto.randomUUID()}`;
+          const pid = await makeProject(sub, "p");
+          await prisma.video.createMany({ data: vOrders.map((o) => v(pid, `${pid}v${o}`, o)) });
+          await prisma.audio.createMany({ data: aOrders.map((o) => a(pid, `${pid}a${o}`, o)) });
+          const vid = `${pid}v${vOrders[0]}`;
+          await prisma.thumbnail.createMany({ data: atSecs.map((s) => t(vid, s)) });
+          const owner = await prisma.user.findFirstOrThrow({ where: { authentikSub: sub } });
+          const project = unwrapRight(
+            await Effect.runPromise(Effect.either(requireProjectDetail(owner.id, pid))),
+          );
+          expect(project.videos.map((x) => x.order)).toEqual(
+            [...vOrders].toSorted((x, y) => x - y),
+          );
+          expect(project.audios.map((x) => x.order)).toEqual(
+            [...aOrders].toSorted((x, y) => x - y),
+          );
+          const thumbs = project.videos.find((x) => x.id === vid)?.thumbnails ?? [];
+          expect(thumbs.map((x) => x.atSec)).toEqual([...atSecs].toSorted((x, y) => x - y));
         },
-        {
-          id: "tfe",
-          projectId: pid,
-          type: "audio_validation",
-          fileName: "fe",
-          status: "failed",
-          expireAt: past,
-        },
-        {
-          id: "ts",
-          projectId: pid,
-          type: "audio_validation",
-          fileName: "s",
-          status: "succeeded",
-        },
-      ],
-    });
-    const owner = await prisma.user.findFirstOrThrow({
-      where: { authentikSub: "detail-task-filter" },
-    });
-    const project = unwrapRight(
-      await Effect.runPromise(Effect.either(requireProjectDetail(owner.id, pid))),
+      ),
+      { numRuns: 5 },
     );
-    const ids = project.tasks.map((t) => t.id).toSorted();
-    expect(ids).toEqual(["tf", "tp", "tr"]);
+  });
+
+  // 性質: pending/running は常に出る。failed は expireAt が null か未来なら出る。succeeded は出ない
+  it("task filter: pending/running は常に表示、failed は expireAt 未到来のみ、succeeded は除外", async () => {
+    const taskStatus = fc.constantFrom("pending", "running", "failed", "succeeded") as fc.Arbitrary<
+      "pending" | "running" | "failed" | "succeeded"
+    >;
+    const taskGen = fc.tuple(taskStatus, fc.option(fc.integer({ min: -60_000, max: 60_000 })));
+    await fc.assert(
+      fc.asyncProperty(fc.array(taskGen, { minLength: 1, maxLength: 6 }), async (tasks) => {
+        const sub = `filter-${crypto.randomUUID()}`;
+        const pid = await makeProject(sub, "p");
+        const now = Date.now();
+        const rows = tasks.map(([status, dt], i) => ({
+          id: `${pid}t${i}`,
+          projectId: pid,
+          type: "audio_validation",
+          fileName: `t${i}`,
+          status,
+          expireAt: dt === null ? null : new Date(now + dt),
+        }));
+        await prisma.task.createMany({ data: rows });
+        const owner = await prisma.user.findFirstOrThrow({ where: { authentikSub: sub } });
+        const project = unwrapRight(
+          await Effect.runPromise(Effect.either(requireProjectDetail(owner.id, pid))),
+        );
+        const expected = rows
+          .filter(
+            (r) =>
+              r.status === "pending" ||
+              r.status === "running" ||
+              (r.status === "failed" && (r.expireAt === null || r.expireAt.getTime() > now)),
+          )
+          .map((r) => r.id)
+          .toSorted();
+        expect(project.tasks.map((x) => x.id).toSorted()).toEqual(expected);
+      }),
+      { numRuns: 5 },
+    );
   });
 });

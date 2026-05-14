@@ -1,39 +1,26 @@
 import { describe, expect, it } from "bun:test";
+import * as fc from "fast-check";
 import { describeError } from "./error";
 
 describe("describeError", () => {
-  it("returns Error.message for Error instances", () => {
-    expect(describeError(new Error("boom"))).toBe("boom");
+  // 性質: Error 系 (subclass 含む) は message.slice(0, 500)。長短両方を踏むよう maxLength=2000
+  it("Error は message.slice(0, 500)", () => {
+    fc.assert(
+      fc.property(fc.string({ maxLength: 2000 }), (msg) => {
+        expect(describeError(new Error(msg))).toBe(msg.slice(0, 500));
+      }),
+      { numRuns: 30 },
+    );
   });
 
-  it("preserves messages shorter than 500 chars unchanged", () => {
-    expect(describeError(new Error("short"))).toBe("short");
-    expect(describeError("short")).toBe("short");
-  });
-
-  it("returns String(err) for non-Error throws", () => {
-    expect(describeError("string thrown")).toBe("string thrown");
-    expect(describeError(42)).toBe("42");
-    expect(describeError(null)).toBe("null");
-    expect(describeError(undefined)).toBe("undefined");
-    expect(describeError({ foo: "bar" })).toBe("[object Object]");
-  });
-
-  it("truncates Error.message to 500 chars", () => {
-    expect(describeError(new Error("x".repeat(2000)))).toBe("x".repeat(500));
-  });
-
-  it("truncates stringified non-Error values to 500 chars", () => {
-    expect(describeError("y".repeat(1000)).length).toBe(500);
-  });
-
-  it("handles Error subclasses", () => {
-    class CustomError extends Error {
-      constructor(message: string) {
-        super(message);
-        this.name = "CustomError";
-      }
-    }
-    expect(describeError(new CustomError("custom"))).toBe("custom");
+  // 性質: 非 Error は String(v).slice(0, 500)。プリミティブ/オブジェクト/null/undefined を網羅
+  it("非 Error は String(v).slice(0, 500)", () => {
+    fc.assert(
+      fc.property(fc.anything(), (v) => {
+        fc.pre(!(v instanceof Error));
+        expect(describeError(v)).toBe(String(v).slice(0, 500));
+      }),
+      { numRuns: 30 },
+    );
   });
 });

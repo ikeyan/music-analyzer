@@ -1,4 +1,5 @@
 import { describe, expect, it, mock, spyOn } from "bun:test";
+import * as fc from "fast-check";
 import { useDbFixture } from "../test-fixtures/db";
 import {
   BASE_RETRY_DELAY_MS,
@@ -16,32 +17,33 @@ import { prisma } from "./prisma";
 import * as storageModule from "./storage";
 
 describe("nextRetryDelayMs", () => {
-  it("returns base delay range for attempts=0", () => {
-    // 0.5..1.0 倍の jitter
-    const min = nextRetryDelayMs(0, () => 0);
-    const max = nextRetryDelayMs(0, () => 1);
-    expect(min).toBe(BASE_RETRY_DELAY_MS * 0.5);
-    expect(max).toBe(BASE_RETRY_DELAY_MS);
+  // jitter は base*2^n の 50–100% に必ず落ちる。指数とジッタを独立に振る
+  it("結果は base*2^max(0,floor(n)) の 50–100% に収まる", () => {
+    fc.assert(
+      fc.property(
+        fc.double({ min: -50, max: 30, noNaN: true }),
+        fc.double({ min: 0, max: 1, noNaN: true }),
+        (n, r) => {
+          const safe = Math.max(0, Math.floor(n));
+          const exp = Math.min(Number.MAX_SAFE_INTEGER, BASE_RETRY_DELAY_MS * 2 ** safe);
+          const got = nextRetryDelayMs(n, () => r);
+          expect(got).toBeCloseTo(exp * (0.5 + r * 0.5), 6);
+        },
+      ),
+      { numRuns: 30 },
+    );
   });
 
-  it("doubles per attempt", () => {
-    expect(nextRetryDelayMs(1, () => 1)).toBe(BASE_RETRY_DELAY_MS * 2);
-    expect(nextRetryDelayMs(2, () => 1)).toBe(BASE_RETRY_DELAY_MS * 4);
-    expect(nextRetryDelayMs(10, () => 1)).toBe(BASE_RETRY_DELAY_MS * 1024);
-  });
-
-  it("clamps to MAX_SAFE_INTEGER for very large attempts", () => {
-    const huge = nextRetryDelayMs(200, () => 1);
-    expect(Number.isFinite(huge)).toBe(true);
-    expect(huge).toBeLessThanOrEqual(Number.MAX_SAFE_INTEGER);
-  });
-
-  it("treats negative attempts as 0", () => {
-    expect(nextRetryDelayMs(-5, () => 1)).toBe(BASE_RETRY_DELAY_MS);
-  });
-
-  it("rounds non-integer attempts down", () => {
-    expect(nextRetryDelayMs(1.9, () => 1)).toBe(BASE_RETRY_DELAY_MS * 2);
+  // 巨大 attempts でも overflow せず Number.MAX_SAFE_INTEGER 以下に clamp される
+  it("巨大 attempts で MAX_SAFE_INTEGER を超えない", () => {
+    fc.assert(
+      fc.property(fc.integer({ min: 50, max: 10_000 }), (n) => {
+        const got = nextRetryDelayMs(n, () => 1);
+        expect(Number.isFinite(got)).toBe(true);
+        expect(got).toBeLessThanOrEqual(Number.MAX_SAFE_INTEGER);
+      }),
+      { numRuns: 20 },
+    );
   });
 });
 

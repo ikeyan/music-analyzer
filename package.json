@@ -39,6 +39,7 @@
     "@types/bun": "^1.1.14",
     "@types/react": "^18.3.17",
     "@types/react-dom": "^18.3.5",
+    "fast-check": "^4.8.0",
     "oxfmt": "^0.45.0",
     "oxlint": "^1.60.0",
     "p-map": "^7.0.4",
