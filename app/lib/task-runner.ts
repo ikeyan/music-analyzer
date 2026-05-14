@@ -28,8 +28,12 @@ import {
 } from "./storage";
 import { tempDir } from "./temp-dir";
 
-// /complete 後の task 走行中 sweep を防ぐ grace (1h transcode + 余裕)
+// /complete 後の task 走行中 sweep を防ぐ S3 prefix の grace (1h transcode + 余裕)
 export const TASK_GRACE_MS = 4 * 60 * 60 * 1000;
+
+// terminal task の DB row 回収猶予。sweeper が Task + Upload + uploadChunk を消す
+export const TASK_SUCCESS_GRACE_MS = 60 * 60 * 1000;
+export const TASK_FAILURE_GRACE_MS = 24 * 60 * 60 * 1000;
 
 type TxClient = Parameters<Parameters<typeof prisma.$transaction>[0]>[0];
 
@@ -221,12 +225,16 @@ async function runVideoTask(taskId: string, upload: Upload): Promise<TaskResult>
       });
       await tx.deletionMark.deleteMany({ where: { prefix: vPrefix } });
       // task→succeeded は Video.create と同 tx 必須 (中間状態で recovery が failed に倒す)
+      const finishedAt = new Date();
       await tx.task.update({
         where: { id: taskId },
-        data: { status: "succeeded", finishedAt: new Date(), videoId: v.id },
+        data: {
+          status: "succeeded",
+          finishedAt,
+          videoId: v.id,
+          expireAt: new Date(finishedAt.getTime() + TASK_SUCCESS_GRACE_MS),
+        },
       });
-      // 同 tx で chunk 行も消す (terminal status 確定後の別 tick で消し損ねると永久残り)。
-      // Upload row は /complete の idempotent retry が Upload + 既存 task を引くのに必要なので残す
       await tx.uploadChunk.deleteMany({ where: { uploadId: upload.id } });
       return v;
     }),
@@ -318,12 +326,16 @@ async function runAudioTask(taskId: string, upload: Upload): Promise<TaskResult>
       });
       await tx.deletionMark.deleteMany({ where: { prefix: aPrefix } });
       // task→succeeded は Audio.create と同 tx 必須 (中間状態で recovery が failed に倒す)
+      const finishedAt = new Date();
       await tx.task.update({
         where: { id: taskId },
-        data: { status: "succeeded", finishedAt: new Date(), audioId: a.id },
+        data: {
+          status: "succeeded",
+          finishedAt,
+          audioId: a.id,
+          expireAt: new Date(finishedAt.getTime() + TASK_SUCCESS_GRACE_MS),
+        },
       });
-      // 同 tx で chunk 行も消す (terminal status 確定後の別 tick で消し損ねると永久残り)。
-      // Upload row は /complete の idempotent retry が Upload + 既存 task を引くのに必要なので残す
       await tx.uploadChunk.deleteMany({ where: { uploadId: upload.id } });
       return a;
     }),
@@ -338,14 +350,20 @@ async function executeTask(taskId: string): Promise<void> {
   });
   if (claimed.count === 0) return;
 
-  const task = await prisma.task.findUnique({
-    where: { id: taskId },
-    include: { upload: true },
-  });
-  if (!task || !task.upload) {
+  const task = await prisma.task.findUnique({ where: { id: taskId } });
+  if (!task) return;
+  // Task.id === Upload.id 不変。Upload 不在は recovery 漏れか手動操作のみで実運用では起きない
+  const upload = await prisma.upload.findUnique({ where: { id: task.id } });
+  if (!upload) {
+    const finishedAt = new Date();
     await prisma.task.update({
       where: { id: taskId },
-      data: { status: "failed", error: "task has no upload", finishedAt: new Date() },
+      data: {
+        status: "failed",
+        error: "task has no upload",
+        finishedAt,
+        expireAt: new Date(finishedAt.getTime() + TASK_FAILURE_GRACE_MS),
+      },
     });
     return;
   }
@@ -354,25 +372,31 @@ async function executeTask(taskId: string): Promise<void> {
   try {
     result =
       task.type === "video_validation"
-        ? await runVideoTask(task.id, task.upload)
-        : await runAudioTask(task.id, task.upload);
+        ? await runVideoTask(task.id, upload)
+        : await runAudioTask(task.id, upload);
   } catch (err) {
     result = { kind: "failure", error: describeError(err) };
   }
 
   // success は run* 内で同 tx flip + chunk 削除済み。failure もここで同 tx にする
   if (result.kind === "failure") {
+    const finishedAt = new Date();
     await prisma.$transaction([
       prisma.task.update({
         where: { id: task.id },
-        data: { status: "failed", error: result.error, finishedAt: new Date() },
+        data: {
+          status: "failed",
+          error: result.error,
+          finishedAt,
+          expireAt: new Date(finishedAt.getTime() + TASK_FAILURE_GRACE_MS),
+        },
       }),
-      prisma.uploadChunk.deleteMany({ where: { uploadId: task.upload.id } }),
+      prisma.uploadChunk.deleteMany({ where: { uploadId: upload.id } }),
     ]);
   }
 
-  // Upload 行は task list の fileName 表示で使うので残す
-  await eagerCleanupAndUnmark(uploadPrefix(task.upload.projectId, task.upload.id));
+  // S3 prefix は eager に掃除。DB row は sweeper が expireAt で回収
+  await eagerCleanupAndUnmark(uploadPrefix(upload.projectId, upload.id));
 }
 
 // dev HMR / test 横断で重複起動しないよう inflight set を global に置く
@@ -393,10 +417,16 @@ export function enqueueTask(taskId: string): void {
     } catch (err) {
       // executeTask が claim 前 (pending のまま) でも claim 後 (running) でも
       // throw しうる。どちらも failed に倒さないと UI が永遠 polling する
+      const finishedAt = new Date();
       await prisma.task
         .updateMany({
           where: { id: taskId, status: { in: ["pending", "running"] } },
-          data: { status: "failed", error: describeError(err), finishedAt: new Date() },
+          data: {
+            status: "failed",
+            error: describeError(err),
+            finishedAt,
+            expireAt: new Date(finishedAt.getTime() + TASK_FAILURE_GRACE_MS),
+          },
         })
         .catch(() => {
           /* DB 自体が死亡なら recovery 任せ */
@@ -416,31 +446,35 @@ export async function waitForInflightTasks(): Promise<void> {
 export async function recoverTasksOnStartup(): Promise<void> {
   const orphaned = await prisma.task.findMany({
     where: { status: "running" },
-    select: { id: true, uploadId: true },
+    select: { id: true },
   });
   if (orphaned.length > 0) {
-    const orphanedUploadIds = orphaned.flatMap((t) => (t.uploadId ? [t.uploadId] : []));
+    const orphanedIds = orphaned.map((t) => t.id);
+    const finishedAt = new Date();
     await prisma.$transaction([
       prisma.task.updateMany({
-        where: { id: { in: orphaned.map((t) => t.id) } },
-        data: { status: "failed", error: "process restarted during task", finishedAt: new Date() },
+        where: { id: { in: orphanedIds } },
+        data: {
+          status: "failed",
+          error: "process restarted during task",
+          finishedAt,
+          expireAt: new Date(finishedAt.getTime() + TASK_FAILURE_GRACE_MS),
+        },
       }),
-      prisma.uploadChunk.deleteMany({ where: { uploadId: { in: orphanedUploadIds } } }),
+      prisma.uploadChunk.deleteMany({ where: { uploadId: { in: orphanedIds } } }),
     ]);
     console.error(`task-runner: marked ${orphaned.length} orphaned tasks as failed`);
   }
   const pending = await prisma.task.findMany({
     where: { status: "pending" },
-    select: { id: true, upload: { select: { id: true, projectId: true } } },
+    select: { id: true, projectId: true },
   });
   const refreshAt = new Date(Date.now() + TASK_GRACE_MS);
   for (const t of pending) {
-    if (t.upload) {
-      await prisma.deletionMark.updateMany({
-        where: { prefix: uploadPrefix(t.upload.projectId, t.upload.id) },
-        data: { nextRetryAt: refreshAt },
-      });
-    }
+    await prisma.deletionMark.updateMany({
+      where: { prefix: uploadPrefix(t.projectId, t.id) },
+      data: { nextRetryAt: refreshAt },
+    });
     enqueueTask(t.id);
   }
 }

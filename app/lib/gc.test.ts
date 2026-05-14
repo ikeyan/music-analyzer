@@ -3,6 +3,7 @@ import { useDbFixture } from "../test-fixtures/db";
 import {
   BASE_RETRY_DELAY_MS,
   cleanupAbandonedUploads,
+  cleanupExpiredTasks,
   eagerCleanupAndUnmark,
   markPrefixForDeletion,
   nextRetryDelayMs,
@@ -327,6 +328,65 @@ describe("cleanupAbandonedUploads", () => {
     expect(await prisma.uploadChunk.count({ where: { uploadId: expired.id } })).toBe(0);
     expect(await prisma.upload.findUnique({ where: { id: aborted.id } })).toBeNull();
     expect(await prisma.upload.findUnique({ where: { id: stillPending.id } })).not.toBeNull();
+  });
+});
+
+describe("cleanupExpiredTasks", () => {
+  useDbFixture();
+
+  async function makeProject(): Promise<string> {
+    const user = await prisma.user.create({
+      data: { authentikSub: `expired-task-test-${Math.random()}` },
+    });
+    const project = await prisma.project.create({ data: { userId: user.id, name: "p" } });
+    return project.id;
+  }
+
+  async function makeTaskWithUpload(pid: string, id: string, expireAt: Date | null): Promise<void> {
+    await prisma.upload.create({
+      data: {
+        id,
+        projectId: pid,
+        kind: "audio",
+        fileName: id,
+        totalBytes: 1n,
+        chunkSize: 1024,
+        totalChunks: 1,
+        expiresAt: new Date(Date.now() + 60_000),
+        status: "completed",
+      },
+    });
+    await prisma.uploadChunk.create({
+      data: { uploadId: id, index: 0, sizeBytes: 1n, s3Key: `${id}/0` },
+    });
+    await prisma.task.create({
+      data: {
+        id,
+        projectId: pid,
+        type: "audio_validation",
+        fileName: id,
+        status: expireAt ? "failed" : "running",
+        expireAt,
+      },
+    });
+  }
+
+  it("expireAt 過ぎた Task と shared id の Upload/chunk を消し、未来のものは残す", async () => {
+    const pid = await makeProject();
+    const past = new Date(Date.now() - 1000);
+    const future = new Date(Date.now() + 60_000);
+    await makeTaskWithUpload(pid, "expired", past);
+    await makeTaskWithUpload(pid, "alive", future);
+    await makeTaskWithUpload(pid, "running", null);
+
+    await cleanupExpiredTasks();
+
+    expect(await prisma.task.findUnique({ where: { id: "expired" } })).toBeNull();
+    expect(await prisma.upload.findUnique({ where: { id: "expired" } })).toBeNull();
+    expect(await prisma.uploadChunk.count({ where: { uploadId: "expired" } })).toBe(0);
+    expect(await prisma.task.findUnique({ where: { id: "alive" } })).not.toBeNull();
+    expect(await prisma.upload.findUnique({ where: { id: "alive" } })).not.toBeNull();
+    expect(await prisma.task.findUnique({ where: { id: "running" } })).not.toBeNull();
   });
 });
 

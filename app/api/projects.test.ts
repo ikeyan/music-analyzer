@@ -90,9 +90,7 @@ async function uploadOk(
     throw new Error(`uploadOk: chunkedUpload failed status=${result.status} err=${result.error}`);
   }
   const task = result.task;
-  const upload = await prisma.upload.findFirstOrThrow({
-    where: { id: task.uploadId ?? "", tasks: { some: { id: task.id } } },
-  });
+  const upload = await prisma.upload.findUniqueOrThrow({ where: { id: task.id } });
   return { task, upload };
 }
 
@@ -394,7 +392,7 @@ describe("chunked upload + media validation task", () => {
     expect(jr.task.id).toBe(ja.task.id);
 
     await waitForInflightTasks();
-    const tasks = await prisma.task.findMany({ where: { uploadId: upload.id } });
+    const tasks = await prisma.task.findMany({ where: { id: upload.id } });
     expect(tasks).toHaveLength(1);
   }, 120_000);
 
@@ -484,7 +482,13 @@ describe("chunked upload + media validation task", () => {
     const completeTx = await prisma.$transaction(async (tx) => {
       await tx.upload.update({ where: { id: upload.id }, data: { status: "completed" } });
       return await tx.task.create({
-        data: { projectId: pid, type: "audio_validation", uploadId: upload.id, status: "pending" },
+        data: {
+          id: upload.id,
+          projectId: pid,
+          type: "audio_validation",
+          fileName: upload.fileName,
+          status: "pending",
+        },
       });
     });
     const prefix = uploadPrefix(pid, upload.id);
@@ -622,6 +626,78 @@ describe("chunked upload + media validation task", () => {
   });
 });
 
+describe("POST /projects/:id/tasks/:taskId/dismiss", () => {
+  useS3Fixture();
+  useDbFixture();
+
+  async function setupFailedTask(): Promise<{
+    pid: string;
+    taskId: string;
+    client: ChunkedUploadClient;
+  }> {
+    const client = makeClient();
+    const pid = await createProject(client, "dismiss-test");
+    const taskId = `dismiss-${Math.random().toString(36).slice(2, 8)}`;
+    await prisma.upload.create({
+      data: {
+        id: taskId,
+        projectId: pid,
+        kind: "audio",
+        fileName: "x",
+        totalBytes: 1n,
+        chunkSize: 1024,
+        totalChunks: 1,
+        expiresAt: new Date(Date.now() + 60_000),
+        status: "completed",
+      },
+    });
+    await prisma.task.create({
+      data: {
+        id: taskId,
+        projectId: pid,
+        type: "audio_validation",
+        fileName: "x",
+        status: "failed",
+        finishedAt: new Date(),
+        expireAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
+      },
+    });
+    return { pid, taskId, client };
+  }
+
+  it("failed task の expireAt を now に倒し UI filter から外す", async () => {
+    const { pid, taskId, client } = await setupFailedTask();
+    const before = Date.now();
+    const res = await client.projects[":id"].tasks[":taskId"].dismiss.$post({
+      param: { id: pid, taskId },
+    });
+    expect(res.status).toBe(204);
+    const updated = await prisma.task.findUniqueOrThrow({ where: { id: taskId } });
+    expect(updated.expireAt).not.toBeNull();
+    expect(updated.expireAt!.getTime()).toBeLessThanOrEqual(Date.now());
+    expect(updated.expireAt!.getTime()).toBeGreaterThanOrEqual(before);
+  });
+
+  it("pending/running task の dismiss は 404", async () => {
+    const client = makeClient();
+    const pid = await createProject(client, "dismiss-pending");
+    const taskId = `pending-${Math.random().toString(36).slice(2, 8)}`;
+    await prisma.task.create({
+      data: {
+        id: taskId,
+        projectId: pid,
+        type: "audio_validation",
+        fileName: "p",
+        status: "pending",
+      },
+    });
+    const res = await client.projects[":id"].tasks[":taskId"].dismiss.$post({
+      param: { id: pid, taskId },
+    });
+    expect(res.status).toBe(404);
+  });
+});
+
 describe("requireProjectDetail", () => {
   async function makeProject(userSub: string, name: string): Promise<string> {
     const user = await prisma.user.create({ data: { authentikSub: userSub } });
@@ -746,14 +822,37 @@ describe("requireProjectDetail", () => {
     expect(project.videos[0]!.thumbnails.map((t) => t.id)).toEqual(["t0", "t1"]);
   });
 
-  it("excludes succeeded tasks (they have already become Video/Audio rows)", async () => {
+  it("excludes succeeded tasks and expired failed tasks", async () => {
     const pid = await makeProject("detail-task-filter", "tasks");
+    const past = new Date(Date.now() - 60_000);
+    const future = new Date(Date.now() + 60_000);
     await prisma.task.createMany({
       data: [
-        { id: "tp", projectId: pid, type: "audio_validation", status: "pending" },
-        { id: "tr", projectId: pid, type: "audio_validation", status: "running" },
-        { id: "tf", projectId: pid, type: "audio_validation", status: "failed" },
-        { id: "ts", projectId: pid, type: "audio_validation", status: "succeeded" },
+        { id: "tp", projectId: pid, type: "audio_validation", fileName: "p", status: "pending" },
+        { id: "tr", projectId: pid, type: "audio_validation", fileName: "r", status: "running" },
+        {
+          id: "tf",
+          projectId: pid,
+          type: "audio_validation",
+          fileName: "f",
+          status: "failed",
+          expireAt: future,
+        },
+        {
+          id: "tfe",
+          projectId: pid,
+          type: "audio_validation",
+          fileName: "fe",
+          status: "failed",
+          expireAt: past,
+        },
+        {
+          id: "ts",
+          projectId: pid,
+          type: "audio_validation",
+          fileName: "s",
+          status: "succeeded",
+        },
       ],
     });
     const owner = await prisma.user.findFirstOrThrow({

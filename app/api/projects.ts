@@ -149,8 +149,7 @@ function requireThumbnail(projectId: string, thumbId: string) {
 }
 
 // GET /:id, PATCH /:id/track-order, SSR route で共通する Project detail loader。
-// 戻り値の include shape は toApiProjectDetail への射影と合わせる。
-// succeeded task は Video/Audio として timeline に出るので除外
+// succeeded は Video/Audio に置き換わるため除外、failed は dismiss/24h で expireAt が過去になるまで表示
 export function requireProjectDetail(userId: string, projectId: string) {
   return pipe(
     Effect.promise(() =>
@@ -163,9 +162,13 @@ export function requireProjectDetail(userId: string, projectId: string) {
           },
           audios: { orderBy: { order: "asc" } },
           tasks: {
-            where: { status: { in: ["pending", "running", "failed"] } },
+            where: {
+              OR: [
+                { status: { in: ["pending", "running"] } },
+                { status: "failed", OR: [{ expireAt: null }, { expireAt: { gt: new Date() } }] },
+              ],
+            },
             orderBy: { createdAt: "desc" },
-            include: { upload: { select: { fileName: true, kind: true } } },
           },
         },
       }),
@@ -516,13 +519,9 @@ export const projects = new Hono()
             if (claimed.count === 0) {
               const upload = yield* requireUpload(tx, uploadId, project.id);
               if (upload.status === "completed") {
-                // 冪等: 既存 task を返す。並行 /complete の loser もここに来る
+                // 冪等: 既存 task を返す (Task.id === Upload.id)
                 const existing = yield* Effect.promise(() =>
-                  tx.task.findFirst({
-                    where: { uploadId: upload.id },
-                    orderBy: { createdAt: "desc" },
-                    include: { upload: { select: { fileName: true, kind: true } } },
-                  }),
+                  tx.task.findUnique({ where: { id: upload.id } }),
                 );
                 if (!existing) {
                   return yield* leftErr({ status: 500, error: "completed upload has no task" });
@@ -565,12 +564,12 @@ export const projects = new Hono()
             const task = yield* Effect.promise(() =>
               tx.task.create({
                 data: {
+                  id: upload.id,
                   projectId: project.id,
                   type: upload.kind === "video" ? "video_validation" : "audio_validation",
-                  uploadId: upload.id,
+                  fileName: upload.fileName,
                   status: "pending",
                 },
-                include: { upload: { select: { fileName: true, kind: true } } },
               }),
             );
             // task 走行中の sweep を防ぐ。完了時 executeTask が mark ごと回収
@@ -643,7 +642,6 @@ export const projects = new Hono()
           prisma.task.findMany({
             where: { projectId: project.id },
             orderBy: { createdAt: "desc" },
-            include: { upload: { select: { fileName: true, kind: true } } },
           }),
         ),
       ),
@@ -660,16 +658,40 @@ export const projects = new Hono()
       requireProject(c.var.user.id, id),
       Effect.flatMap((project) =>
         Effect.promise(() =>
-          prisma.task.findFirst({
-            where: { id: taskId, projectId: project.id },
-            include: { upload: { select: { fileName: true, kind: true } } },
-          }),
+          prisma.task.findFirst({ where: { id: taskId, projectId: project.id } }),
         ),
       ),
       Effect.flatMap(found({ status: 404, error: "task not found" })),
       Effect.map((task) => ({ task: toApiTask(task) satisfies ApiTask })),
       Effect.either,
       Effect.map((r) => c.var.eitherJson(r)),
+      Effect.runPromise,
+    );
+  })
+
+  // failed task の dismiss。expireAt を now に倒すと UI から消え、sweeper が同 id の Upload も回収
+  .post("/:id/tasks/:taskId/dismiss", vValidator("param", taskIdParamSchema), (c) => {
+    const { id, taskId } = c.req.valid("param");
+    return pipe(
+      requireProject(c.var.user.id, id),
+      Effect.flatMap((project) =>
+        Effect.promise(() =>
+          prisma.task.updateMany({
+            where: { id: taskId, projectId: project.id, status: "failed" },
+            data: { expireAt: new Date() },
+          }),
+        ),
+      ),
+      Effect.flatMap((res) =>
+        res.count === 0
+          ? leftErr({ status: 404, error: "failed task not found" })
+          : Either.right(null),
+      ),
+      Effect.mapBoth({
+        onSuccess: () => c.body(null, 204),
+        onFailure: (err) => c.var.eitherJson(leftErr(err)),
+      }),
+      Effect.merge,
       Effect.runPromise,
     );
   })
