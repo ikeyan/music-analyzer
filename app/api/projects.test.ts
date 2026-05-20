@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import * as fc from "fast-check";
 import { Hono } from "hono";
 import { hc } from "hono/client";
 import {
@@ -10,11 +11,13 @@ import { prisma } from "../lib/prisma";
 import { getS3 } from "../lib/s3";
 import { projectKey, uploadPrefix } from "../lib/storage";
 import { TASK_GRACE_MS, recoverTasksOnStartup, waitForInflightTasks } from "../lib/task-runner";
+import { withAutoContentLength } from "../test-fixtures/app-request";
 import { useDbFixture } from "../test-fixtures/db";
 import { useMediaFixture } from "../test-fixtures/media";
 import { useS3Fixture } from "../test-fixtures/s3";
 import { type AppType, api } from "./index";
-import { UPLOAD_EXPIRY_MS } from "./projects";
+import { Effect, Either } from "effect";
+import { UPLOAD_EXPIRY_MS, requireProjectDetail } from "./projects";
 import type { ApiTask, ApiUpload } from "./types";
 
 useDbFixture();
@@ -27,26 +30,10 @@ const DEV_HEADERS = { "x-authentik-uid": "dev:test" };
 function makeClient(): ChunkedUploadClient {
   process.env.NODE_ENV = "development";
   const app = new Hono().route("/api", api);
-  // app.request は body から CL を自動付与しない (本番 fetch は付ける) ので
-  // テスト経路でだけ補う
-  const customFetch: typeof app.request = async (input, init) => {
-    const headers = new Headers(init?.headers);
-    const body = init?.body;
-    if (body != null && !headers.has("content-length")) {
-      const size = bodyByteLength(body);
-      if (size !== undefined) headers.set("content-length", String(size));
-    }
-    return await app.request(input, { ...init, headers });
-  };
-  return hc<AppType>("http://test/api", { fetch: customFetch, headers: DEV_HEADERS });
-}
-
-function bodyByteLength(body: BodyInit): number | undefined {
-  if (body instanceof Uint8Array) return body.byteLength;
-  if (body instanceof ArrayBuffer) return body.byteLength;
-  if (body instanceof Blob) return body.size;
-  if (typeof body === "string") return new TextEncoder().encode(body).byteLength;
-  return undefined;
+  return hc<AppType>("http://test/api", {
+    fetch: withAutoContentLength(app),
+    headers: DEV_HEADERS,
+  });
 }
 
 async function createProject(client: ChunkedUploadClient, name: string): Promise<string> {
@@ -104,9 +91,7 @@ async function uploadOk(
     throw new Error(`uploadOk: chunkedUpload failed status=${result.status} err=${result.error}`);
   }
   const task = result.task;
-  const upload = await prisma.upload.findFirstOrThrow({
-    where: { id: task.uploadId ?? "", tasks: { some: { id: task.id } } },
-  });
+  const upload = await prisma.upload.findUniqueOrThrow({ where: { id: task.id } });
   return { task, upload };
 }
 
@@ -321,7 +306,7 @@ describe("chunked upload + media validation task", () => {
     const complete = await client.projects[":id"].uploads[":uploadId"].complete.$post({
       param: { id: pid, uploadId: upload.id },
     });
-    expect(complete.status).toBe(201);
+    expect(complete.status).toBe(200);
     const retry = await putRawChunk(client, pid, upload.id, 0, new Uint8Array([9, 9, 9, 9]));
     expect(retry.status).toBe(409);
     await waitForInflightTasks();
@@ -372,9 +357,9 @@ describe("chunked upload + media validation task", () => {
     await waitForInflightTasks();
   }, 120_000);
 
-  it("並行 /complete は片方が race_lost で 200 を返し task は 1 つだけ", async () => {
+  it("/complete は冪等。並行呼び出しも逐次リトライも同じ task を 200 で返す", async () => {
     const client = makeClient();
-    const pid = await createProject(client, "chunk-race-complete");
+    const pid = await createProject(client, "chunk-complete-idempotent");
     const bytes = new Uint8Array(await Bun.file(getMedia().audioMp3).arrayBuffer());
     const upload = await createUploadOk(client, pid, {
       kind: "audio",
@@ -392,14 +377,23 @@ describe("chunked upload + media validation task", () => {
         param: { id: pid, uploadId: upload.id },
       }),
     ]);
-    const statuses = [a.status, b.status].toSorted();
-    expect(statuses).toEqual([200, 201]);
+    expect([a.status, b.status]).toEqual([200, 200]);
     if (!a.ok || !b.ok) throw new Error("both should be 2xx");
     const ja = await a.json();
     const jb = await b.json();
     expect(ja.task.id).toBe(jb.task.id);
+
+    // 逐次リトライも同じ task を返し、task は 1 つのまま
+    const retry = await client.projects[":id"].uploads[":uploadId"].complete.$post({
+      param: { id: pid, uploadId: upload.id },
+    });
+    expect(retry.status).toBe(200);
+    if (!retry.ok) throw new Error("retry should be 2xx");
+    const jr = await retry.json();
+    expect(jr.task.id).toBe(ja.task.id);
+
     await waitForInflightTasks();
-    const tasks = await prisma.task.findMany({ where: { uploadId: upload.id } });
+    const tasks = await prisma.task.findMany({ where: { id: upload.id } });
     expect(tasks).toHaveLength(1);
   }, 120_000);
 
@@ -452,6 +446,41 @@ describe("chunked upload + media validation task", () => {
     expect(keys).toEqual([dbChunk.s3Key]);
   });
 
+  // 性質: chunk PUT が並行・retry で交錯しても、最終的に upload.receivedBytes は
+  // 残った chunk 行の sizeBytes の合計と一致する (delta 計算と claim の race 回避)
+  it("並行/retry な chunk PUT 後も receivedBytes は chunks の sum と一致", async () => {
+    await fc.assert(
+      fc.asyncProperty(
+        fc.array(fc.tuple(fc.integer({ min: 0, max: 2 }), fc.integer({ min: 1, max: 64 })), {
+          minLength: 4,
+          maxLength: 8,
+        }),
+        async (puts) => {
+          const client = makeClient();
+          const pid = await createProject(client, `chunk-sum-${crypto.randomUUID()}`);
+          const upload = await createUploadOk(client, pid, {
+            kind: "audio",
+            fileName: "x.bin",
+            totalBytes: 256,
+            chunkSize: 1024,
+          });
+          await Promise.all(
+            puts.map(([idx, sz]) =>
+              putRawChunk(client, pid, upload.id, idx, new Uint8Array(sz)).catch(() => null),
+            ),
+          );
+          const reloaded = await prisma.upload.findUniqueOrThrow({ where: { id: upload.id } });
+          const agg = await prisma.uploadChunk.aggregate({
+            where: { uploadId: upload.id },
+            _sum: { sizeBytes: true },
+          });
+          expect(reloaded.receivedBytes).toBe(agg._sum.sizeBytes ?? 0n);
+        },
+      ),
+      { numRuns: 3 },
+    );
+  });
+
   it("task 成功時 media prefix の DeletionMark が消える (途中失敗時は残る)", async () => {
     const client = makeClient();
     const pid = await createProject(client, "media-mark-cleanup");
@@ -489,7 +518,13 @@ describe("chunked upload + media validation task", () => {
     const completeTx = await prisma.$transaction(async (tx) => {
       await tx.upload.update({ where: { id: upload.id }, data: { status: "completed" } });
       return await tx.task.create({
-        data: { projectId: pid, type: "audio_validation", uploadId: upload.id, status: "pending" },
+        data: {
+          id: upload.id,
+          projectId: pid,
+          type: "audio_validation",
+          fileName: upload.fileName,
+          status: "pending",
+        },
       });
     });
     const prefix = uploadPrefix(pid, upload.id);
@@ -624,5 +659,243 @@ describe("chunked upload + media validation task", () => {
       1024,
     );
     expectError(result, 400);
+  });
+});
+
+describe("POST /projects/:id/tasks/:taskId/dismiss", () => {
+  useS3Fixture();
+  useDbFixture();
+
+  async function setupFailedTask(): Promise<{
+    pid: string;
+    taskId: string;
+    client: ChunkedUploadClient;
+  }> {
+    const client = makeClient();
+    const pid = await createProject(client, "dismiss-test");
+    const taskId = `dismiss-${Math.random().toString(36).slice(2, 8)}`;
+    await prisma.upload.create({
+      data: {
+        id: taskId,
+        projectId: pid,
+        kind: "audio",
+        fileName: "x",
+        totalBytes: 1n,
+        chunkSize: 1024,
+        totalChunks: 1,
+        expiresAt: new Date(Date.now() + 60_000),
+        status: "completed",
+      },
+    });
+    await prisma.task.create({
+      data: {
+        id: taskId,
+        projectId: pid,
+        type: "audio_validation",
+        fileName: "x",
+        status: "failed",
+        finishedAt: new Date(),
+        expireAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
+      },
+    });
+    return { pid, taskId, client };
+  }
+
+  it("failed task の expireAt を now に倒し UI filter から外す", async () => {
+    const { pid, taskId, client } = await setupFailedTask();
+    const before = Date.now();
+    const res = await client.projects[":id"].tasks[":taskId"].dismiss.$post({
+      param: { id: pid, taskId },
+    });
+    expect(res.status).toBe(204);
+    const updated = await prisma.task.findUniqueOrThrow({ where: { id: taskId } });
+    expect(updated.expireAt).not.toBeNull();
+    expect(updated.expireAt!.getTime()).toBeLessThanOrEqual(Date.now());
+    expect(updated.expireAt!.getTime()).toBeGreaterThanOrEqual(before);
+  });
+
+  it("pending/running task の dismiss は 404", async () => {
+    const client = makeClient();
+    const pid = await createProject(client, "dismiss-pending");
+    const taskId = `pending-${Math.random().toString(36).slice(2, 8)}`;
+    await prisma.task.create({
+      data: {
+        id: taskId,
+        projectId: pid,
+        type: "audio_validation",
+        fileName: "p",
+        status: "pending",
+      },
+    });
+    const res = await client.projects[":id"].tasks[":taskId"].dismiss.$post({
+      param: { id: pid, taskId },
+    });
+    expect(res.status).toBe(404);
+  });
+});
+
+describe("requireProjectDetail", () => {
+  async function makeProject(userSub: string, name: string): Promise<string> {
+    const user = await prisma.user.create({ data: { authentikSub: userSub } });
+    const project = await prisma.project.create({ data: { userId: user.id, name } });
+    return project.id;
+  }
+
+  function unwrapRight<R, E>(r: Either.Either<R, E>): R {
+    if (Either.isLeft(r)) throw new Error(`expected Right, got Left: ${JSON.stringify(r.left)}`);
+    return r.right;
+  }
+
+  it("returns Right with empty videos/audios/tasks arrays when none exist", async () => {
+    const pid = await makeProject("detail-empty", "empty");
+    const owner = await prisma.user.findFirstOrThrow({ where: { authentikSub: "detail-empty" } });
+    const project = unwrapRight(
+      await Effect.runPromise(Effect.either(requireProjectDetail(owner.id, pid))),
+    );
+    expect(project.id).toBe(pid);
+    expect(project.videos).toEqual([]);
+    expect(project.audios).toEqual([]);
+    expect(project.tasks).toEqual([]);
+  });
+
+  it("returns Left 404 when the project belongs to another user", async () => {
+    const pidA = await makeProject("detail-owner-a", "a");
+    const userB = await prisma.user.create({ data: { authentikSub: "detail-owner-b" } });
+    const r = await Effect.runPromise(Effect.either(requireProjectDetail(userB.id, pidA)));
+    expect(Either.isLeft(r)).toBe(true);
+    if (Either.isLeft(r)) expect(r.left).toEqual({ status: 404, error: "project not found" });
+  });
+
+  it("returns Left 404 for missing project id", async () => {
+    const user = await prisma.user.create({ data: { authentikSub: "detail-missing" } });
+    const r = await Effect.runPromise(
+      Effect.either(requireProjectDetail(user.id, "no-such-project")),
+    );
+    expect(Either.isLeft(r)).toBe(true);
+    if (Either.isLeft(r)) expect(r.left).toEqual({ status: 404, error: "project not found" });
+  });
+
+  // Video/Audio schema が wide なので test data はヘルパーで圧縮する。
+  // order だけ可変、その他は最小限の satisfy で詰める
+  const v = (pid: string, id: string, order: number) => ({
+    id,
+    projectId: pid,
+    order,
+    name: id,
+    videoKey: id,
+    durationSec: 1,
+    width: 1,
+    height: 1,
+    fps: 1,
+    sizeBytes: 1n,
+    srcStartSec: 0,
+    srcEndSec: 1,
+    projStartSec: order,
+    projEndSec: order + 1,
+  });
+  const a = (pid: string, id: string, order: number) => ({
+    id,
+    projectId: pid,
+    order,
+    name: id,
+    audioKey: id,
+    durationSec: 1,
+    sizeBytes: 1n,
+    srcStartSec: 0,
+    srcEndSec: 1,
+    projStartSec: order + 100,
+    projEndSec: order + 101,
+  });
+  const t = (videoId: string, atSec: number) => ({
+    id: `t${videoId}-${atSec}`,
+    videoId,
+    atSec,
+    key: `k${atSec}`,
+    width: 1,
+    height: 1,
+  });
+
+  // 性質: 入力順に関係なく order/atSec 昇順で返る。整数 orders / float atSec を任意配列で
+  it("videos/audios は order asc、thumbnails は atSec asc で返る", async () => {
+    await fc.assert(
+      fc.asyncProperty(
+        fc.uniqueArray(fc.integer({ min: 0, max: 99 }), { minLength: 2, maxLength: 4 }),
+        fc.uniqueArray(fc.integer({ min: 0, max: 99 }), { minLength: 2, maxLength: 4 }),
+        fc.uniqueArray(fc.double({ min: 0, max: 999, noNaN: true }), {
+          minLength: 2,
+          maxLength: 4,
+        }),
+        async (vOrders, aOrders, atSecs) => {
+          const sub = `order-${crypto.randomUUID()}`;
+          const pid = await makeProject(sub, "p");
+          await prisma.video.createMany({ data: vOrders.map((o) => v(pid, `${pid}v${o}`, o)) });
+          await prisma.audio.createMany({ data: aOrders.map((o) => a(pid, `${pid}a${o}`, o)) });
+          const vid = `${pid}v${vOrders[0]}`;
+          await prisma.thumbnail.createMany({ data: atSecs.map((s) => t(vid, s)) });
+          const owner = await prisma.user.findFirstOrThrow({ where: { authentikSub: sub } });
+          const project = unwrapRight(
+            await Effect.runPromise(Effect.either(requireProjectDetail(owner.id, pid))),
+          );
+          expect(project.videos.map((x) => x.order)).toEqual(
+            [...vOrders].toSorted((x, y) => x - y),
+          );
+          expect(project.audios.map((x) => x.order)).toEqual(
+            [...aOrders].toSorted((x, y) => x - y),
+          );
+          const thumbs = project.videos.find((x) => x.id === vid)?.thumbnails ?? [];
+          expect(thumbs.map((x) => x.atSec)).toEqual([...atSecs].toSorted((x, y) => x - y));
+        },
+      ),
+      { numRuns: 5 },
+    );
+  });
+
+  // 性質: pending/running は常に出る。failed は expireAt が null か未来なら出る。succeeded は出ない
+  it("task filter: pending/running は常に表示、failed は expireAt 未到来のみ、succeeded は除外", async () => {
+    const taskStatus = fc.constantFrom("pending", "running", "failed", "succeeded") as fc.Arbitrary<
+      "pending" | "running" | "failed" | "succeeded"
+    >;
+    // expireAt の offset は now 近傍 (±数 ms) を避ける。テスト内 `now` と SQL `new Date()` の
+    // 時刻差で boundary が前後し flaky になる
+    const taskGen = fc.tuple(
+      taskStatus,
+      fc.option(
+        fc.oneof(
+          fc.integer({ min: -60_000, max: -1_000 }),
+          fc.integer({ min: 1_000, max: 60_000 }),
+        ),
+      ),
+    );
+    await fc.assert(
+      fc.asyncProperty(fc.array(taskGen, { minLength: 1, maxLength: 6 }), async (tasks) => {
+        const sub = `filter-${crypto.randomUUID()}`;
+        const pid = await makeProject(sub, "p");
+        const now = Date.now();
+        const rows = tasks.map(([status, dt], i) => ({
+          id: `${pid}t${i}`,
+          projectId: pid,
+          type: "audio_validation",
+          fileName: `t${i}`,
+          status,
+          expireAt: dt === null ? null : new Date(now + dt),
+        }));
+        await prisma.task.createMany({ data: rows });
+        const owner = await prisma.user.findFirstOrThrow({ where: { authentikSub: sub } });
+        const project = unwrapRight(
+          await Effect.runPromise(Effect.either(requireProjectDetail(owner.id, pid))),
+        );
+        const expected = rows
+          .filter(
+            (r) =>
+              r.status === "pending" ||
+              r.status === "running" ||
+              (r.status === "failed" && (r.expireAt === null || r.expireAt.getTime() > now)),
+          )
+          .map((r) => r.id)
+          .toSorted();
+        expect(project.tasks.map((x) => x.id).toSorted()).toEqual(expected);
+      }),
+      { numRuns: 5 },
+    );
   });
 });

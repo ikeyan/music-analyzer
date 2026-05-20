@@ -113,18 +113,17 @@ export type ApiTask = {
   id: string;
   projectId: string;
   type: "video_validation" | "audio_validation";
+  kind: "video" | "audio";
   status: "pending" | "running" | "succeeded" | "failed";
   error: string | null;
-  uploadId: string | null;
-  // 何のファイルを処理中か UI で表示するため upload を inline する。
-  // upload は Task ライフタイムを超えて消えうるので nullable
-  upload: { fileName: string; kind: "video" | "audio" } | null;
+  fileName: string;
   videoId: string | null;
   audioId: string | null;
   createdAt: string;
   updatedAt: string;
   startedAt: string | null;
   finishedAt: string | null;
+  expireAt: string | null;
 };
 
 export function toApiThumbnail(projectId: string, videoId: string, t: Thumbnail): ApiThumbnail {
@@ -203,7 +202,7 @@ export function toApiProjectDetail(
   p: Project & {
     videos: (Video & { thumbnails: Thumbnail[] })[];
     audios: Audio[];
-    tasks: (Task & { upload: { fileName: string; kind: string } | null })[];
+    tasks: Task[];
   },
 ): ApiProjectDetail {
   return {
@@ -244,29 +243,23 @@ export function toApiUpload(u: Upload): ApiUpload {
   };
 }
 
-export function toApiTask(
-  t: Task & { upload?: { fileName: string; kind: string } | null },
-): ApiTask {
+export function toApiTask(t: Task): ApiTask {
   assertIn(t.type, TASK_TYPES, "Task.type");
   assertIn(t.status, TASK_STATUSES, "Task.status");
-  let upload: ApiTask["upload"] = null;
-  if (t.upload) {
-    assertIn(t.upload.kind, UPLOAD_KINDS, "Task.upload.kind");
-    upload = { fileName: t.upload.fileName, kind: t.upload.kind };
-  }
   return {
     id: t.id,
     projectId: t.projectId,
     type: t.type,
+    kind: t.type === "video_validation" ? "video" : "audio",
     status: t.status,
     error: t.error,
-    uploadId: t.uploadId,
-    upload,
+    fileName: t.fileName,
     videoId: t.videoId,
     audioId: t.audioId,
     createdAt: t.createdAt.toISOString(),
     updatedAt: t.updatedAt.toISOString(),
     startedAt: t.startedAt?.toISOString() ?? null,
     finishedAt: t.finishedAt?.toISOString() ?? null,
+    expireAt: t.expireAt?.toISOString() ?? null,
   };
 }

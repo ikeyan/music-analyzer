@@ -124,7 +124,6 @@ model Upload {
   createdAt     DateTime      @default(now())
   updatedAt     DateTime      @updatedAt
   chunks        UploadChunk[]
-  tasks         Task[]
 
   @@index([projectId])
   @@index([expiresAt])
@@ -148,25 +147,28 @@ model UploadChunk {
 }
 
 // プロジェクトに属する非同期タスクの汎用エンティティ。
-// 現状は media validation (ffmpeg probe + transcode) でのみ使う
+// 現状は media validation (ffmpeg probe + transcode) でのみ使い、id は対応する Upload.id と共有する。
+// fileName は Upload が sweep されても UI 表示できるよう denormalize する。
+// expireAt は terminal 化時に sweeper への回収期限を埋める (succeeded: +1h, failed: +24h, dismiss: now)
 model Task {
-  id         String    @id @default(cuid())
+  id         String    @id
   projectId  String
   project    Project   @relation(fields: [projectId], references: [id])
   type       String // "video_validation" | "audio_validation"
   status     String    @default("pending") // "pending" | "running" | "succeeded" | "failed"
   error      String?
-  uploadId   String?
-  upload     Upload?   @relation(fields: [uploadId], references: [id])
+  fileName   String
   videoId    String?
   audioId    String?
   createdAt  DateTime  @default(now())
   updatedAt  DateTime  @updatedAt
   startedAt  DateTime?
   finishedAt DateTime?
+  expireAt   DateTime?
 
   @@index([projectId])
   @@index([status])
+  @@index([expireAt])
 }
 
 // DBのrow deleteと同じトランザクションで挿入する S3 prefix の墓標。

@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { Hono } from "hono";
 import { useDbFixture } from "../test-fixtures/db";
 import { useEnvSandbox } from "../test-fixtures/env-sandbox";
-import { type AuthContext, constantTimeEqual, requireUser } from "./auth";
+import { constantTimeEqual, requireUser } from "./auth";
 import { prisma } from "./prisma";
 import { tempDir } from "./temp-dir";
 
@@ -37,7 +37,7 @@ useEnvSandbox(["AUTH_PROXY_SECRET", "NODE_ENV"]);
 const SECRET = "test-secret-aaaaaaaaaaaaaaaaaaaaaaaaa";
 
 function makeApp() {
-  return new Hono<AuthContext>().use("*", requireUser).get("/whoami", (c) => {
+  return new Hono().use("*", requireUser).get("/whoami", (c) => {
     const u = c.var.user;
     return c.json({
       id: u.id,

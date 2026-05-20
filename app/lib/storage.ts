@@ -1,19 +1,27 @@
 import type { Context } from "hono";
+import { parseRange } from "./range";
 import { getS3 } from "./s3";
 
 export const projectKey = (projectId: string) => `projects/${projectId}`;
-export const videoSourceKey = (projectId: string, videoId: string) =>
-  `${projectKey(projectId)}/videos/${videoId}/source.mp4`;
-export const videoAudioKey = (projectId: string, videoId: string) =>
-  `${projectKey(projectId)}/videos/${videoId}/audio.m4a`;
-export const videoThumbKey = (projectId: string, videoId: string, atSec: number) =>
-  `${projectKey(projectId)}/videos/${videoId}/thumbs/${String(Math.round(atSec)).padStart(6, "0")}.jpg`;
-export const audioRawKey = (projectId: string, audioId: string, ext: string) =>
-  `${projectKey(projectId)}/audios/${audioId}/raw.${ext.replace(/^\./, "")}`;
-export const audioTranscodedKey = (projectId: string, audioId: string) =>
-  `${projectKey(projectId)}/audios/${audioId}/transcoded.m4a`;
+// trailing slash 付きの prefix。deletePrefix / list の prefix 引数や DeletionMark.prefix で使う
+export const projectPrefix = (projectId: string) => `${projectKey(projectId)}/`;
+export const videoPrefix = (projectId: string, videoId: string) =>
+  `${projectKey(projectId)}/videos/${videoId}/`;
+export const audioPrefix = (projectId: string, audioId: string) =>
+  `${projectKey(projectId)}/audios/${audioId}/`;
 export const uploadPrefix = (projectId: string, uploadId: string) =>
   `${projectKey(projectId)}/uploads/${uploadId}/`;
+
+export const videoSourceKey = (projectId: string, videoId: string) =>
+  `${videoPrefix(projectId, videoId)}source.mp4`;
+export const videoAudioKey = (projectId: string, videoId: string) =>
+  `${videoPrefix(projectId, videoId)}audio.m4a`;
+export const videoThumbKey = (projectId: string, videoId: string, atSec: number) =>
+  `${videoPrefix(projectId, videoId)}thumbs/${String(Math.round(atSec)).padStart(6, "0")}.jpg`;
+export const audioRawKey = (projectId: string, audioId: string, ext: string) =>
+  `${audioPrefix(projectId, audioId)}raw.${ext.replace(/^\./, "")}`;
+export const audioTranscodedKey = (projectId: string, audioId: string) =>
+  `${audioPrefix(projectId, audioId)}transcoded.m4a`;
 // retry は別 key を書いて DB tx で promote するため writeId で unique 化
 export const uploadChunkKey = (
   projectId: string,
@@ -54,27 +62,6 @@ export async function deletePrefix(prefix: string): Promise<void> {
     }
     continuationToken = result.isTruncated ? result.nextContinuationToken : undefined;
   } while (continuationToken);
-}
-
-// HTTP Range の解析。RFC 7233 §2.1 に準拠して end >= total は EOF にクランプ。
-// suffix range (`bytes=-N`) は末尾Nバイトを返す
-export type RangeResolved = { start: number; end: number };
-export function parseRange(
-  rangeHeader: string | null | undefined,
-  total: number,
-): RangeResolved | "invalid" | null {
-  if (!rangeHeader) return null;
-  const m = /^bytes=(\d*)-(\d*)$/.exec(rangeHeader);
-  if (!m) return "invalid";
-  const startStr = m[1];
-  const endStr = m[2];
-  if (startStr === "" && endStr === "") return "invalid";
-  const start = startStr === "" ? Math.max(0, total - Number(endStr)) : Number(startStr);
-  const rawEnd = startStr === "" || endStr === "" ? total - 1 : Number(endStr);
-  const end = Math.min(rawEnd, total - 1);
-  if (Number.isNaN(start) || Number.isNaN(rawEnd) || start > end || start >= total)
-    return "invalid";
-  return { start, end };
 }
 
 export async function streamS3(

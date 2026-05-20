@@ -1,3 +1,4 @@
+import { describeError } from "./error";
 import { prisma } from "./prisma";
 import { deletePrefix } from "./storage";
 
@@ -7,17 +8,30 @@ export const BASE_RETRY_DELAY_MS = 30_000;
 let sweeperHandle: ReturnType<typeof setInterval> | null = null;
 let running = false;
 
-function describeError(err: unknown): string {
-  if (err instanceof Error) return err.message.slice(0, 500);
-  return String(err).slice(0, 500);
-}
-
 // 指数バックオフ + 半量jitter。上限なし (Number.MAX_SAFE_INTEGER でクランプ)。
 // attempts は失敗回数 (0 = まだ失敗していない) で次の delay を計算する
 export function nextRetryDelayMs(attempts: number, rand: () => number = Math.random): number {
   const safe = Math.max(0, Math.floor(attempts));
   const exp = Math.min(Number.MAX_SAFE_INTEGER, BASE_RETRY_DELAY_MS * 2 ** safe);
   return exp * (0.5 + rand() * 0.5);
+}
+
+// graceMs 経過後にだけ sweep されるよう DeletionMark を立てる。
+// 失敗時 (Upload pending の expiresAt 切れなど) は sweeper が deletePrefix で回収する
+export async function markPrefixForDeletion(prefix: string, graceMs: number): Promise<void> {
+  await prisma.deletionMark.create({
+    data: { prefix, nextRetryAt: new Date(Date.now() + graceMs) },
+  });
+}
+
+// commit 後の eager cleanup。失敗時は sweeper の retry に任せる
+export async function eagerCleanupAndUnmark(prefix: string): Promise<void> {
+  try {
+    await deletePrefix(prefix);
+    await prisma.deletionMark.deleteMany({ where: { prefix } });
+  } catch {
+    /* sweeperに任せる */
+  }
 }
 
 // テストから fake の prisma / deletePrefix / now / rand を差し込めるよう、
@@ -85,9 +99,7 @@ export async function sweepPendingDeletions(): Promise<void> {
   }
 }
 
-// 期限切れ pending と aborted な Upload を DB から消す。
-// completed は task が responsible なので除外。pending+expired と aborted は task を
-// 持たない (task は /complete でしか作られない) ので Upload→Task FK 違反は起きない
+// completed は task が responsible なので除外 (cleanupExpiredTasks 側で回収)
 export async function cleanupAbandonedUploads(now: () => Date = () => new Date()): Promise<void> {
   const targets = await prisma.upload.findMany({
     where: {
@@ -108,6 +120,26 @@ export async function cleanupAbandonedUploads(now: () => Date = () => new Date()
   }
 }
 
+// expireAt 過ぎた terminal task と shared id の Upload/uploadChunk を回収
+export async function cleanupExpiredTasks(now: () => Date = () => new Date()): Promise<void> {
+  const targets = await prisma.task.findMany({
+    where: { expireAt: { lte: now() } },
+    select: { id: true },
+    take: BATCH_SIZE,
+  });
+  for (const t of targets) {
+    try {
+      await prisma.$transaction([
+        prisma.uploadChunk.deleteMany({ where: { uploadId: t.id } }),
+        prisma.upload.deleteMany({ where: { id: t.id } }),
+        prisma.task.delete({ where: { id: t.id } }),
+      ]);
+    } catch {
+      /* 次の tick で retry */
+    }
+  }
+}
+
 let sweeperReady: Promise<unknown> | null = null;
 
 async function runGatedSweep(): Promise<void> {
@@ -121,6 +153,7 @@ async function runGatedSweep(): Promise<void> {
   }
   await sweepPendingDeletions();
   await cleanupAbandonedUploads();
+  await cleanupExpiredTasks();
 }
 
 // 既に走っていれば no-op。`ready` が渡れば全 sweep (初回 + 各 tick) がそれを待つ

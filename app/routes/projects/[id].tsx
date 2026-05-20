@@ -1,25 +1,17 @@
+import { Effect, Either } from "effect";
 import { createRoute } from "honox/factory";
+import { requireProjectDetail } from "../../api/projects";
 import { toApiProjectDetail } from "../../api/types";
-import { requireUser } from "../../lib/auth";
-import { prisma } from "../../lib/prisma";
 import ProjectDetail from "../../islands/project-detail";
+import { requireUser } from "../../lib/auth";
 
 export default createRoute(requireUser, async (c) => {
   const user = c.var.user;
   const id = c.req.param("id");
-  const project = await prisma.project.findFirst({
-    where: { id, userId: user.id },
-    include: {
-      videos: { orderBy: { order: "asc" }, include: { thumbnails: { orderBy: { atSec: "asc" } } } },
-      audios: { orderBy: { order: "asc" } },
-      tasks: {
-        where: { status: { in: ["pending", "running", "failed"] } },
-        orderBy: { createdAt: "desc" },
-        include: { upload: { select: { fileName: true, kind: true } } },
-      },
-    },
-  });
-  if (!project) return c.notFound();
+  if (!id) return c.notFound();
+  const r = await Effect.runPromise(Effect.either(requireProjectDetail(user.id, id)));
+  if (Either.isLeft(r)) return c.notFound();
+  const project = r.right;
 
   return c.render(
     <main style={{ fontFamily: "system-ui, sans-serif", padding: "1.5rem" }}>
