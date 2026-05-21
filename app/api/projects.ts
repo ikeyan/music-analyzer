@@ -5,7 +5,7 @@ import * as v from "valibot";
 import { requireUser } from "../lib/auth";
 import { leftErr, provideEitherJson } from "../lib/either-json";
 import { describeError } from "../lib/error";
-import { MAX_UPLOAD_BYTES } from "../lib/ffmpeg";
+import { MAX_PROJECT_TIMING_SEC, MAX_UPLOAD_BYTES } from "../lib/ffmpeg";
 import { eagerCleanupAndUnmark, markPrefixForDeletion } from "../lib/gc";
 import { prisma } from "../lib/prisma";
 import { withSlotRetry } from "../lib/prisma-retry";
@@ -28,16 +28,20 @@ import {
 } from "../lib/storage";
 import { TASK_GRACE_MS, enqueueTask } from "../lib/task-runner";
 import {
+  type ApiAudio,
   type ApiProject,
   type ApiProjectDetail,
   type ApiProjectSummary,
   type ApiTask,
   type ApiUpload,
+  type ApiVideo,
+  toApiAudio,
   toApiProject,
   toApiProjectDetail,
   toApiProjectSummary,
   toApiTask,
   toApiUpload,
+  toApiVideo,
 } from "./types";
 
 // upload 完了前に死んだチャンクは 1h grace の DeletionMark + sweeper で回収する
@@ -80,6 +84,19 @@ const createUploadSchema = v.object({
     v.pipe(v.number(), v.integer(), v.minValue(MIN_CHUNK_SIZE), v.maxValue(MAX_CHUNK_SIZE)),
   ),
 });
+
+// 反転は projStart > projEnd で表現するため proj 側に大小制約は置かない。
+// src は正方向のみで、durationSec 超過は row 取得後に handler 側で検証する
+const timingSchema = v.pipe(
+  v.object({
+    srcStartSec: v.pipe(v.number(), v.finite(), v.minValue(0)),
+    srcEndSec: v.pipe(v.number(), v.finite(), v.minValue(0)),
+    projStartSec: v.pipe(v.number(), v.finite(), v.minValue(0), v.maxValue(MAX_PROJECT_TIMING_SEC)),
+    projEndSec: v.pipe(v.number(), v.finite(), v.minValue(0), v.maxValue(MAX_PROJECT_TIMING_SEC)),
+  }),
+  v.check((d) => d.srcEndSec > d.srcStartSec, "srcEndSec must be > srcStartSec"),
+  v.check((d) => d.projEndSec !== d.projStartSec, "projEndSec must differ from projStartSec"),
+);
 
 // findFirst の結果を Either に持ち上げる小道具。null なら指定の Left、それ以外は Right
 function found<R>(notFound: { status: 404; error: string }) {
@@ -298,6 +315,16 @@ export const projects = new Hono()
                           }
                           seen.add(key);
                         }
+                        // 単体 timing edit と整合するよう reorder 後の合計でも cap を保証
+                        const totalAbsDur =
+                          videos.reduce((s, r) => s + Math.abs(r.projEndSec - r.projStartSec), 0) +
+                          audios.reduce((s, r) => s + Math.abs(r.projEndSec - r.projStartSec), 0);
+                        if (totalAbsDur > MAX_PROJECT_TIMING_SEC) {
+                          return yield* leftErr({
+                            status: 400,
+                            error: `track-order: total duration ${totalAbsDur} exceeds ${MAX_PROJECT_TIMING_SEC}`,
+                          });
+                        }
                         for (const [i, t] of newOrder.entries()) {
                           const data = { order: -(i + 1) };
                           if (t.kind === "video")
@@ -313,11 +340,13 @@ export const projects = new Hono()
                         for (const [i, t] of newOrder.entries()) {
                           const row = (t.kind === "video" ? videoMap : audioMap).get(t.id);
                           if (!row) throw new Error("unreachable");
-                          const duration = row.projEndSec - row.projStartSec;
+                          // 反転 (projEnd < projStart) は absDur で詰めて向きだけ保つ
+                          const absDur = Math.abs(row.projEndSec - row.projStartSec);
+                          const reversed = row.projEndSec < row.projStartSec;
                           const data = {
                             order: i,
-                            projStartSec: cursor,
-                            projEndSec: cursor + duration,
+                            projStartSec: reversed ? cursor + absDur : cursor,
+                            projEndSec: reversed ? cursor : cursor + absDur,
                           };
                           if (t.kind === "video")
                             yield* Effect.promise(() =>
@@ -327,7 +356,7 @@ export const projects = new Hono()
                             yield* Effect.promise(() =>
                               tx.audio.update({ where: { id: t.id }, data }),
                             );
-                          cursor += duration;
+                          cursor += absDur;
                         }
                       }),
                     ),
@@ -731,6 +760,74 @@ export const projects = new Hono()
     );
   })
 
+  .patch(
+    "/:id/videos/:videoId/timing",
+    vValidator("param", videoIdParamSchema),
+    vValidator("json", timingSchema),
+    (c) => {
+      const { id, videoId } = c.req.valid("param");
+      const body = c.req.valid("json");
+      return pipe(
+        requireProject(c.var.user.id, id),
+        Effect.flatMap((project) =>
+          pipe(
+            // task-runner.allocSlot と同じ project-row lock を取り、新規 upload の
+            // slot 計算と timing 変更が interleave しないよう serialize する
+            Effect.promise(() =>
+              withSlotRetry(() =>
+                Effect.runPromise(
+                  Effect.either(
+                    txEither((tx) =>
+                      Effect.gen(function* () {
+                        yield* Effect.promise(() =>
+                          tx.project.update({
+                            where: { id: project.id },
+                            data: { updatedAt: new Date() },
+                          }),
+                        );
+                        const video = yield* pipe(
+                          Effect.promise(() =>
+                            tx.video.findFirst({
+                              where: { id: videoId, projectId: project.id },
+                            }),
+                          ),
+                          Effect.flatMap(found({ status: 404, error: "video not found" })),
+                        );
+                        if (body.srcEndSec > video.durationSec) {
+                          return yield* leftErr({
+                            status: 400,
+                            error: `srcEndSec must be <= durationSec (${video.durationSec})`,
+                          });
+                        }
+                        return yield* Effect.promise(() =>
+                          tx.video.update({
+                            where: { id: video.id },
+                            data: {
+                              srcStartSec: body.srcStartSec,
+                              srcEndSec: body.srcEndSec,
+                              projStartSec: body.projStartSec,
+                              projEndSec: body.projEndSec,
+                            },
+                            include: { thumbnails: { orderBy: { atSec: "asc" } } },
+                          }),
+                        );
+                      }),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+            Effect.flatMap((r) => r),
+          ),
+        ),
+        Effect.map((video): { video: ApiVideo } => ({ video: toApiVideo(video) })),
+        Effect.either,
+        Effect.map((r) => c.var.eitherJson(r)),
+        Effect.runPromise,
+      );
+    },
+  )
+
   .get("/:id/videos/:videoId/stream", vValidator("param", videoIdParamSchema), (c) => {
     const { id, videoId } = c.req.valid("param");
     return pipe(
@@ -808,6 +905,73 @@ export const projects = new Hono()
       Effect.runPromise,
     );
   })
+
+  .patch(
+    "/:id/audios/:audioId/timing",
+    vValidator("param", audioIdParamSchema),
+    vValidator("json", timingSchema),
+    (c) => {
+      const { id, audioId } = c.req.valid("param");
+      const body = c.req.valid("json");
+      return pipe(
+        requireProject(c.var.user.id, id),
+        Effect.flatMap((project) =>
+          pipe(
+            // task-runner.allocSlot と同じ project-row lock を取り、新規 upload の
+            // slot 計算と timing 変更が interleave しないよう serialize する
+            Effect.promise(() =>
+              withSlotRetry(() =>
+                Effect.runPromise(
+                  Effect.either(
+                    txEither((tx) =>
+                      Effect.gen(function* () {
+                        yield* Effect.promise(() =>
+                          tx.project.update({
+                            where: { id: project.id },
+                            data: { updatedAt: new Date() },
+                          }),
+                        );
+                        const audio = yield* pipe(
+                          Effect.promise(() =>
+                            tx.audio.findFirst({
+                              where: { id: audioId, projectId: project.id },
+                            }),
+                          ),
+                          Effect.flatMap(found({ status: 404, error: "audio not found" })),
+                        );
+                        if (body.srcEndSec > audio.durationSec) {
+                          return yield* leftErr({
+                            status: 400,
+                            error: `srcEndSec must be <= durationSec (${audio.durationSec})`,
+                          });
+                        }
+                        return yield* Effect.promise(() =>
+                          tx.audio.update({
+                            where: { id: audio.id },
+                            data: {
+                              srcStartSec: body.srcStartSec,
+                              srcEndSec: body.srcEndSec,
+                              projStartSec: body.projStartSec,
+                              projEndSec: body.projEndSec,
+                            },
+                          }),
+                        );
+                      }),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+            Effect.flatMap((r) => r),
+          ),
+        ),
+        Effect.map((audio): { audio: ApiAudio } => ({ audio: toApiAudio(audio) })),
+        Effect.either,
+        Effect.map((r) => c.var.eitherJson(r)),
+        Effect.runPromise,
+      );
+    },
+  )
 
   .get("/:id/audios/:audioId/stream", vValidator("param", audioIdParamSchema), (c) => {
     const { id, audioId } = c.req.valid("param");
