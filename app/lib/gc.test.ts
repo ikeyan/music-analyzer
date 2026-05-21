@@ -1,8 +1,12 @@
-import { describe, expect, it, mock } from "bun:test";
+import { describe, expect, it, mock, spyOn } from "bun:test";
+import * as fc from "fast-check";
 import { useDbFixture } from "../test-fixtures/db";
 import {
   BASE_RETRY_DELAY_MS,
   cleanupAbandonedUploads,
+  cleanupExpiredTasks,
+  eagerCleanupAndUnmark,
+  markPrefixForDeletion,
   nextRetryDelayMs,
   runSweepOnce,
   startDeletionSweeper,
@@ -10,34 +14,36 @@ import {
   type SweeperDeps,
 } from "./gc";
 import { prisma } from "./prisma";
+import * as storageModule from "./storage";
 
 describe("nextRetryDelayMs", () => {
-  it("returns base delay range for attempts=0", () => {
-    // 0.5..1.0 倍の jitter
-    const min = nextRetryDelayMs(0, () => 0);
-    const max = nextRetryDelayMs(0, () => 1);
-    expect(min).toBe(BASE_RETRY_DELAY_MS * 0.5);
-    expect(max).toBe(BASE_RETRY_DELAY_MS);
+  // jitter は base*2^n の 50–100% に必ず落ちる。指数とジッタを独立に振る
+  it("結果は base*2^max(0,floor(n)) の 50–100% に収まる", () => {
+    fc.assert(
+      fc.property(
+        fc.double({ min: -50, max: 30, noNaN: true }),
+        fc.double({ min: 0, max: 1, noNaN: true }),
+        (n, r) => {
+          const safe = Math.max(0, Math.floor(n));
+          const exp = Math.min(Number.MAX_SAFE_INTEGER, BASE_RETRY_DELAY_MS * 2 ** safe);
+          const got = nextRetryDelayMs(n, () => r);
+          expect(got).toBeCloseTo(exp * (0.5 + r * 0.5), 6);
+        },
+      ),
+      { numRuns: 30 },
+    );
   });
 
-  it("doubles per attempt", () => {
-    expect(nextRetryDelayMs(1, () => 1)).toBe(BASE_RETRY_DELAY_MS * 2);
-    expect(nextRetryDelayMs(2, () => 1)).toBe(BASE_RETRY_DELAY_MS * 4);
-    expect(nextRetryDelayMs(10, () => 1)).toBe(BASE_RETRY_DELAY_MS * 1024);
-  });
-
-  it("clamps to MAX_SAFE_INTEGER for very large attempts", () => {
-    const huge = nextRetryDelayMs(200, () => 1);
-    expect(Number.isFinite(huge)).toBe(true);
-    expect(huge).toBeLessThanOrEqual(Number.MAX_SAFE_INTEGER);
-  });
-
-  it("treats negative attempts as 0", () => {
-    expect(nextRetryDelayMs(-5, () => 1)).toBe(BASE_RETRY_DELAY_MS);
-  });
-
-  it("rounds non-integer attempts down", () => {
-    expect(nextRetryDelayMs(1.9, () => 1)).toBe(BASE_RETRY_DELAY_MS * 2);
+  // 巨大 attempts でも overflow せず Number.MAX_SAFE_INTEGER 以下に clamp される
+  it("巨大 attempts で MAX_SAFE_INTEGER を超えない", () => {
+    fc.assert(
+      fc.property(fc.integer({ min: 50, max: 10_000 }), (n) => {
+        const got = nextRetryDelayMs(n, () => 1);
+        expect(Number.isFinite(got)).toBe(true);
+        expect(got).toBeLessThanOrEqual(Number.MAX_SAFE_INTEGER);
+      }),
+      { numRuns: 20 },
+    );
   });
 });
 
@@ -197,6 +203,74 @@ describe("startDeletionSweeper / stopDeletionSweeper", () => {
   });
 });
 
+describe("markPrefixForDeletion", () => {
+  useDbFixture();
+
+  it("creates a DeletionMark with nextRetryAt = now + graceMs", async () => {
+    const prefix = "mark-test/";
+    const before = Date.now();
+    await markPrefixForDeletion(prefix, 60_000);
+    const mark = await prisma.deletionMark.findFirst({ where: { prefix } });
+    expect(mark).not.toBeNull();
+    const delta = mark!.nextRetryAt.getTime() - before;
+    expect(delta).toBeGreaterThanOrEqual(60_000 - 500);
+    expect(delta).toBeLessThanOrEqual(60_000 + 500);
+    expect(mark!.attempts).toBe(0);
+  });
+
+  it("creates a new row per call so the same prefix can be marked twice", async () => {
+    const prefix = "mark-dup/";
+    await markPrefixForDeletion(prefix, 1000);
+    await markPrefixForDeletion(prefix, 1000);
+    const count = await prisma.deletionMark.count({ where: { prefix } });
+    expect(count).toBe(2);
+  });
+});
+
+describe("eagerCleanupAndUnmark", () => {
+  useDbFixture();
+
+  it("deletes the S3 prefix then removes the matching DeletionMark rows", async () => {
+    const prefix = "eager/p1/";
+    await prisma.deletionMark.create({ data: { prefix } });
+    const calls: string[] = [];
+    const spy = spyOn(storageModule, "deletePrefix").mockImplementation(async (p: string) => {
+      calls.push(p);
+    });
+    try {
+      await eagerCleanupAndUnmark(prefix);
+    } finally {
+      spy.mockRestore();
+    }
+    expect(calls).toEqual([prefix]);
+    expect(await prisma.deletionMark.count({ where: { prefix } })).toBe(0);
+  });
+
+  it("swallows deletePrefix errors and leaves the mark for the sweeper", async () => {
+    const prefix = "eager/p2/";
+    await prisma.deletionMark.create({ data: { prefix } });
+    const spy = spyOn(storageModule, "deletePrefix").mockImplementation(async () => {
+      throw new Error("S3 down");
+    });
+    try {
+      await expect(eagerCleanupAndUnmark(prefix)).resolves.toBeUndefined();
+    } finally {
+      spy.mockRestore();
+    }
+    // delete 失敗時は mark を残して sweeper の retry に委ねる
+    expect(await prisma.deletionMark.count({ where: { prefix } })).toBe(1);
+  });
+
+  it("is safe to call when no DeletionMark exists for the prefix", async () => {
+    const spy = spyOn(storageModule, "deletePrefix").mockImplementation(async () => {});
+    try {
+      await expect(eagerCleanupAndUnmark("no-mark/")).resolves.toBeUndefined();
+    } finally {
+      spy.mockRestore();
+    }
+  });
+});
+
 describe("cleanupAbandonedUploads", () => {
   useDbFixture();
 
@@ -256,6 +330,65 @@ describe("cleanupAbandonedUploads", () => {
     expect(await prisma.uploadChunk.count({ where: { uploadId: expired.id } })).toBe(0);
     expect(await prisma.upload.findUnique({ where: { id: aborted.id } })).toBeNull();
     expect(await prisma.upload.findUnique({ where: { id: stillPending.id } })).not.toBeNull();
+  });
+});
+
+describe("cleanupExpiredTasks", () => {
+  useDbFixture();
+
+  async function makeProject(): Promise<string> {
+    const user = await prisma.user.create({
+      data: { authentikSub: `expired-task-test-${Math.random()}` },
+    });
+    const project = await prisma.project.create({ data: { userId: user.id, name: "p" } });
+    return project.id;
+  }
+
+  async function makeTaskWithUpload(pid: string, id: string, expireAt: Date | null): Promise<void> {
+    await prisma.upload.create({
+      data: {
+        id,
+        projectId: pid,
+        kind: "audio",
+        fileName: id,
+        totalBytes: 1n,
+        chunkSize: 1024,
+        totalChunks: 1,
+        expiresAt: new Date(Date.now() + 60_000),
+        status: "completed",
+      },
+    });
+    await prisma.uploadChunk.create({
+      data: { uploadId: id, index: 0, sizeBytes: 1n, s3Key: `${id}/0` },
+    });
+    await prisma.task.create({
+      data: {
+        id,
+        projectId: pid,
+        type: "audio_validation",
+        fileName: id,
+        status: expireAt ? "failed" : "running",
+        expireAt,
+      },
+    });
+  }
+
+  it("expireAt 過ぎた Task と shared id の Upload/chunk を消し、未来のものは残す", async () => {
+    const pid = await makeProject();
+    const past = new Date(Date.now() - 1000);
+    const future = new Date(Date.now() + 60_000);
+    await makeTaskWithUpload(pid, "expired", past);
+    await makeTaskWithUpload(pid, "alive", future);
+    await makeTaskWithUpload(pid, "running", null);
+
+    await cleanupExpiredTasks();
+
+    expect(await prisma.task.findUnique({ where: { id: "expired" } })).toBeNull();
+    expect(await prisma.upload.findUnique({ where: { id: "expired" } })).toBeNull();
+    expect(await prisma.uploadChunk.count({ where: { uploadId: "expired" } })).toBe(0);
+    expect(await prisma.task.findUnique({ where: { id: "alive" } })).not.toBeNull();
+    expect(await prisma.upload.findUnique({ where: { id: "alive" } })).not.toBeNull();
+    expect(await prisma.task.findUnique({ where: { id: "running" } })).not.toBeNull();
   });
 });
 

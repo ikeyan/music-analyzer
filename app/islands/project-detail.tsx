@@ -837,8 +837,7 @@ function TaskList({ tasks }: { tasks: ApiTask[] }) {
 }
 
 function TaskRow({ task }: { task: ApiTask }) {
-  const kindLabel =
-    task.upload?.kind === "video" ? "動画" : task.upload?.kind === "audio" ? "音声" : "ファイル";
+  const kindLabel = task.kind === "video" ? "動画" : "音声";
   const statusLabel = (() => {
     switch (task.status) {
       case "pending":
@@ -863,7 +862,7 @@ function TaskRow({ task }: { task: ApiTask }) {
         return "#1a7f37";
     }
   })();
-  const fileName = task.upload?.fileName ?? "(削除済み upload)";
+  const fileName = task.fileName;
   return (
     <li
       style={{
@@ -879,7 +878,7 @@ function TaskRow({ task }: { task: ApiTask }) {
           display: "inline-block",
           minWidth: "2.5rem",
           padding: "0 0.4rem",
-          background: task.upload?.kind === "video" ? "#3b82f6" : "#10b981",
+          background: task.kind === "video" ? "#3b82f6" : "#10b981",
           color: "white",
           borderRadius: 3,
           fontSize: "0.75rem",

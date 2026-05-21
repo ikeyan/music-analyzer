@@ -1,35 +1,43 @@
 import { vValidator } from "@hono/valibot-validator";
+import { Effect, Either, pipe } from "effect";
 import { Hono } from "hono";
-import { HTTPException } from "hono/http-exception";
 import * as v from "valibot";
-import { type AuthContext, requireUser } from "../lib/auth";
-import { MAX_PROJECT_TIMING_SEC, MAX_UPLOAD_BYTES } from "../lib/ffmpeg";
+import { requireUser } from "../lib/auth";
+import { leftErr, provideEitherJson } from "../lib/either-json";
+import { describeError } from "../lib/error";
+import { MAX_UPLOAD_BYTES } from "../lib/ffmpeg";
+import { eagerCleanupAndUnmark, markPrefixForDeletion } from "../lib/gc";
 import { prisma } from "../lib/prisma";
+import { withSlotRetry } from "../lib/prisma-retry";
+import {
+  type ExtArgs,
+  type LogOpts,
+  type OmitOpts,
+  type PrismaClientLike,
+  txEither,
+} from "../lib/prisma-tx";
 import { getS3 } from "../lib/s3";
 import {
-  projectKey,
+  audioPrefix,
+  projectPrefix,
   streamS3,
+  uploadChunkKey,
   uploadPrefix,
   uploadRawRequest,
-  uploadChunkKey,
-  deletePrefix,
+  videoPrefix,
 } from "../lib/storage";
 import { TASK_GRACE_MS, enqueueTask } from "../lib/task-runner";
 import {
-  type ApiAudio,
   type ApiProject,
   type ApiProjectDetail,
   type ApiProjectSummary,
   type ApiTask,
   type ApiUpload,
-  type ApiVideo,
-  toApiAudio,
   toApiProject,
   toApiProjectDetail,
   toApiProjectSummary,
   toApiTask,
   toApiUpload,
-  toApiVideo,
 } from "./types";
 
 // upload 完了前に死んだチャンクは 1h grace の DeletionMark + sweeper で回収する
@@ -39,7 +47,6 @@ const DEFAULT_CHUNK_SIZE = 8 * 1024 * 1024;
 // 極小チャンク DoS 防止
 const MIN_CHUNK_SIZE = 1024;
 const MAX_CHUNK_SIZE = 64 * 1024 * 1024;
-const MAX_SINGLE_CHUNK_BYTES = MAX_CHUNK_SIZE;
 
 const idParamSchema = v.object({ id: v.string() });
 const videoIdParamSchema = v.object({ id: v.string(), videoId: v.string() });
@@ -74,41 +81,105 @@ const createUploadSchema = v.object({
   ),
 });
 
-// 反転は projStart > projEnd で表現するため proj 側に大小制約は置かない。
-// src は正方向のみで、durationSec 超過は row 取得後に handler 側で検証する
-const timingSchema = v.pipe(
-  v.object({
-    srcStartSec: v.pipe(v.number(), v.finite(), v.minValue(0)),
-    srcEndSec: v.pipe(v.number(), v.finite(), v.minValue(0)),
-    projStartSec: v.pipe(v.number(), v.finite(), v.minValue(0), v.maxValue(MAX_PROJECT_TIMING_SEC)),
-    projEndSec: v.pipe(v.number(), v.finite(), v.minValue(0), v.maxValue(MAX_PROJECT_TIMING_SEC)),
-  }),
-  v.check((d) => d.srcEndSec > d.srcStartSec, "srcEndSec must be > srcStartSec"),
-  v.check((d) => d.projEndSec !== d.projStartSec, "projEndSec must differ from projStartSec"),
-);
-
-async function findProjectOr404(userId: string, projectId: string) {
-  const p = await prisma.project.findFirst({ where: { id: projectId, userId } });
-  return p;
+// findFirst の結果を Either に持ち上げる小道具。null なら指定の Left、それ以外は Right
+function found<R>(notFound: { status: 404; error: string }) {
+  return (r: R | null): Either.Either<R, { status: 404; error: string }> =>
+    r === null ? leftErr(notFound) : Either.right(r);
 }
 
-async function markPrefixForDeletion(prefix: string, graceMs: number): Promise<void> {
-  await prisma.deletionMark.create({
-    data: { prefix, nextRetryAt: new Date(Date.now() + graceMs) },
-  });
+function requireProject(userId: string, projectId: string) {
+  return pipe(
+    Effect.promise(() => prisma.project.findFirst({ where: { id: projectId, userId } })),
+    Effect.flatMap(found({ status: 404, error: "project not found" })),
+  );
 }
 
-async function eagerCleanupAndUnmark(prefix: string): Promise<void> {
-  try {
-    await deletePrefix(prefix);
-    await prisma.deletionMark.deleteMany({ where: { prefix } });
-  } catch {
-    /* sweeperに任せる */
+// prisma / tx のどちらでも呼べる。generics は呼び出し側から素通し
+function requireUpload<L extends LogOpts, O extends OmitOpts, E extends ExtArgs>(
+  client: PrismaClientLike<L, O, E>,
+  uploadId: string,
+  projectId: string,
+) {
+  return pipe(
+    Effect.promise(() => client.upload.findFirst({ where: { id: uploadId, projectId } })),
+    Effect.flatMap(found({ status: 404, error: "upload not found" })),
+  );
+}
+
+type UploadRow = NonNullable<Awaited<ReturnType<typeof prisma.upload.findFirst>>>;
+
+// 戻り値型を明示しないと leftErr の Either<never, X> が union のまま残り variance が合わない
+function checkUploadPending<U extends UploadRow>(
+  upload: U,
+): Either.Either<U, { status: 409 | 410; error: string }> {
+  if (upload.status !== "pending") {
+    return Either.left({ status: 409, error: `upload is ${upload.status}` });
   }
+  if (upload.expiresAt.getTime() <= Date.now()) {
+    return Either.left({ status: 410, error: "upload expired" });
+  }
+  return Either.right(upload);
 }
 
-export const projects = new Hono<AuthContext>()
+function requirePendingUpload(uploadId: string, projectId: string) {
+  return pipe(requireUpload(prisma, uploadId, projectId), Effect.flatMap(checkUploadPending));
+}
+
+function requireVideo(projectId: string, videoId: string) {
+  return pipe(
+    Effect.promise(() => prisma.video.findFirst({ where: { id: videoId, projectId } })),
+    Effect.flatMap(found({ status: 404, error: "video not found" })),
+  );
+}
+
+function requireAudio(projectId: string, audioId: string) {
+  return pipe(
+    Effect.promise(() => prisma.audio.findFirst({ where: { id: audioId, projectId } })),
+    Effect.flatMap(found({ status: 404, error: "audio not found" })),
+  );
+}
+
+function requireThumbnail(projectId: string, thumbId: string) {
+  return pipe(
+    Effect.promise(() =>
+      prisma.thumbnail.findFirst({ where: { id: thumbId, video: { projectId } } }),
+    ),
+    Effect.flatMap(found({ status: 404, error: "thumbnail not found" })),
+  );
+}
+
+// GET /:id, PATCH /:id/track-order, SSR route で共通する Project detail loader。
+// succeeded は Video/Audio に置き換わるため除外、failed は dismiss/24h で expireAt が過去になるまで表示
+export function requireProjectDetail(userId: string, projectId: string) {
+  return pipe(
+    Effect.promise(() =>
+      prisma.project.findFirst({
+        where: { id: projectId, userId },
+        include: {
+          videos: {
+            orderBy: { order: "asc" },
+            include: { thumbnails: { orderBy: { atSec: "asc" } } },
+          },
+          audios: { orderBy: { order: "asc" } },
+          tasks: {
+            where: {
+              OR: [
+                { status: { in: ["pending", "running"] } },
+                { status: "failed", OR: [{ expireAt: null }, { expireAt: { gt: new Date() } }] },
+              ],
+            },
+            orderBy: { createdAt: "desc" },
+          },
+        },
+      }),
+    ),
+    Effect.flatMap(found({ status: 404, error: "project not found" })),
+  );
+}
+
+export const projects = new Hono()
   .use("*", requireUser)
+  .use("*", provideEitherJson)
   .get("/", async (c) => {
     const user = c.var.user;
     const list = await prisma.project.findMany({
@@ -124,140 +195,157 @@ export const projects = new Hono<AuthContext>()
     const project = await prisma.project.create({ data: { userId: user.id, name } });
     return c.json({ project: toApiProject(project) satisfies ApiProject }, 201);
   })
-  .get("/:id", vValidator("param", idParamSchema), async (c) => {
-    const user = c.var.user;
-    const project = await prisma.project.findFirst({
-      where: { id: c.req.valid("param").id, userId: user.id },
-      include: {
-        videos: {
-          orderBy: { order: "asc" },
-          include: { thumbnails: { orderBy: { atSec: "asc" } } },
-        },
-        audios: { orderBy: { order: "asc" } },
-        // succeeded は Video/Audio として timeline に出るので除外
-        tasks: {
-          where: { status: { in: ["pending", "running", "failed"] } },
-          orderBy: { createdAt: "desc" },
-          include: { upload: { select: { fileName: true, kind: true } } },
-        },
-      },
-    });
-    if (!project) return c.json({ error: "project not found" }, 404);
-    return c.json({ project: toApiProjectDetail(project) satisfies ApiProjectDetail });
-  })
-  .delete("/:id", vValidator("param", idParamSchema), async (c) => {
-    const user = c.var.user;
-    const project = await findProjectOr404(user.id, c.req.valid("param").id);
-    if (!project) return c.json({ error: "project not found" }, 404);
-    const prefix = `${projectKey(project.id)}/`;
-    await prisma.$transaction(async (tx) => {
-      await tx.deletionMark.create({ data: { prefix } });
-      await tx.task.deleteMany({ where: { projectId: project.id } });
-      await tx.uploadChunk.deleteMany({ where: { upload: { projectId: project.id } } });
-      await tx.upload.deleteMany({ where: { projectId: project.id } });
-      await tx.thumbnail.deleteMany({ where: { video: { projectId: project.id } } });
-      await tx.video.deleteMany({ where: { projectId: project.id } });
-      await tx.audio.deleteMany({ where: { projectId: project.id } });
-      await tx.project.delete({ where: { id: project.id } });
-    });
-    await eagerCleanupAndUnmark(prefix);
-    return c.body(null, 204);
-  })
+  .get("/:id", vValidator("param", idParamSchema), (c) =>
+    pipe(
+      requireProjectDetail(c.var.user.id, c.req.valid("param").id),
+      Effect.map((project): { project: ApiProjectDetail } => ({
+        project: toApiProjectDetail(project),
+      })),
+      Effect.either,
+      Effect.map((r) => c.var.eitherJson(r)),
+      Effect.runPromise,
+    ),
+  )
+  .delete("/:id", vValidator("param", idParamSchema), (c) =>
+    pipe(
+      requireProject(c.var.user.id, c.req.valid("param").id),
+      Effect.flatMap((project) =>
+        Effect.promise(async () => {
+          const prefix = projectPrefix(project.id);
+          await prisma.$transaction([
+            prisma.deletionMark.create({ data: { prefix } }),
+            prisma.task.deleteMany({ where: { projectId: project.id } }),
+            prisma.uploadChunk.deleteMany({ where: { upload: { projectId: project.id } } }),
+            prisma.upload.deleteMany({ where: { projectId: project.id } }),
+            prisma.thumbnail.deleteMany({ where: { video: { projectId: project.id } } }),
+            prisma.video.deleteMany({ where: { projectId: project.id } }),
+            prisma.audio.deleteMany({ where: { projectId: project.id } }),
+            prisma.project.delete({ where: { id: project.id } }),
+          ]);
+          await eagerCleanupAndUnmark(prefix);
+        }),
+      ),
+      Effect.mapBoth({
+        onSuccess: () => c.body(null, 204),
+        onFailure: (err) => c.var.eitherJson(leftErr(err)),
+      }),
+      Effect.merge,
+      Effect.runPromise,
+    ),
+  )
 
   .patch(
     "/:id/track-order",
     vValidator("param", idParamSchema),
     vValidator("json", reorderTracksSchema),
-    async (c) => {
-      const user = c.var.user;
-      const project = await findProjectOr404(user.id, c.req.valid("param").id);
-      if (!project) return c.json({ error: "project not found" }, 404);
+    (c) => {
       const { tracks: newOrder } = c.req.valid("json");
-
-      await withSlotRetry(() =>
-        prisma.$transaction(async (tx) => {
-          await tx.project.update({ where: { id: project.id }, data: { updatedAt: new Date() } });
-          const [videos, audios] = await Promise.all([
-            tx.video.findMany({
-              where: { projectId: project.id },
-              select: { id: true, projStartSec: true, projEndSec: true },
-            }),
-            tx.audio.findMany({
-              where: { projectId: project.id },
-              select: { id: true, projStartSec: true, projEndSec: true },
-            }),
-          ]);
-          const expected = videos.length + audios.length;
-          if (newOrder.length !== expected) {
-            throw new HTTPException(400, { message: "track-order: length mismatch" });
-          }
-          const videoMap = new Map(videos.map((row) => [row.id, row]));
-          const audioMap = new Map(audios.map((row) => [row.id, row]));
-          const seen = new Set<string>();
-          for (const t of newOrder) {
-            const exists = t.kind === "video" ? videoMap.has(t.id) : audioMap.has(t.id);
-            if (!exists) {
-              throw new HTTPException(400, {
-                message: `track-order: unknown ${t.kind} id ${t.id}`,
-              });
-            }
-            const key = `${t.kind}:${t.id}`;
-            if (seen.has(key)) {
-              throw new HTTPException(400, {
-                message: `track-order: duplicate ${t.kind} id ${t.id}`,
-              });
-            }
-            seen.add(key);
-          }
-          // 単体 timing edit と整合するよう reorder 後の合計でも cap を保証
-          const totalAbsDur =
-            videos.reduce((s, r) => s + Math.abs(r.projEndSec - r.projStartSec), 0) +
-            audios.reduce((s, r) => s + Math.abs(r.projEndSec - r.projStartSec), 0);
-          if (totalAbsDur > MAX_PROJECT_TIMING_SEC) {
-            throw new HTTPException(400, {
-              message: `track-order: total duration ${totalAbsDur} exceeds ${MAX_PROJECT_TIMING_SEC}`,
-            });
-          }
-          for (const [i, t] of newOrder.entries()) {
-            const data = { order: -(i + 1) };
-            if (t.kind === "video") await tx.video.update({ where: { id: t.id }, data });
-            else await tx.audio.update({ where: { id: t.id }, data });
-          }
-          let cursor = 0;
-          for (const [i, t] of newOrder.entries()) {
-            const row = (t.kind === "video" ? videoMap : audioMap).get(t.id);
-            if (!row) throw new Error("unreachable");
-            const absDur = Math.abs(row.projEndSec - row.projStartSec);
-            const reversed = row.projEndSec < row.projStartSec;
-            const data = {
-              order: i,
-              projStartSec: reversed ? cursor + absDur : cursor,
-              projEndSec: reversed ? cursor : cursor + absDur,
-            };
-            if (t.kind === "video") await tx.video.update({ where: { id: t.id }, data });
-            else await tx.audio.update({ where: { id: t.id }, data });
-            cursor += absDur;
-          }
-        }),
+      // withSlotRetry が P2002/P2034 throw を retry。validation 失敗の Left は
+      // txEither 内で rollback してから上に伝わるので retry 対象外
+      return pipe(
+        requireProject(c.var.user.id, c.req.valid("param").id),
+        Effect.flatMap((project) =>
+          pipe(
+            Effect.promise(() =>
+              withSlotRetry(() =>
+                Effect.runPromise(
+                  Effect.either(
+                    txEither((tx) =>
+                      Effect.gen(function* () {
+                        yield* Effect.promise(() =>
+                          tx.project.update({
+                            where: { id: project.id },
+                            data: { updatedAt: new Date() },
+                          }),
+                        );
+                        const [videos, audios] = yield* Effect.promise(() =>
+                          Promise.all([
+                            tx.video.findMany({
+                              where: { projectId: project.id },
+                              select: { id: true, projStartSec: true, projEndSec: true },
+                            }),
+                            tx.audio.findMany({
+                              where: { projectId: project.id },
+                              select: { id: true, projStartSec: true, projEndSec: true },
+                            }),
+                          ]),
+                        );
+                        const expected = videos.length + audios.length;
+                        if (newOrder.length !== expected) {
+                          return yield* leftErr({
+                            status: 400,
+                            error: "track-order: length mismatch",
+                          });
+                        }
+                        const videoMap = new Map(videos.map((row) => [row.id, row]));
+                        const audioMap = new Map(audios.map((row) => [row.id, row]));
+                        const seen = new Set<string>();
+                        for (const t of newOrder) {
+                          const exists =
+                            t.kind === "video" ? videoMap.has(t.id) : audioMap.has(t.id);
+                          if (!exists) {
+                            return yield* leftErr({
+                              status: 400,
+                              error: `track-order: unknown ${t.kind} id ${t.id}`,
+                            });
+                          }
+                          const key = `${t.kind}:${t.id}`;
+                          if (seen.has(key)) {
+                            return yield* leftErr({
+                              status: 400,
+                              error: `track-order: duplicate ${t.kind} id ${t.id}`,
+                            });
+                          }
+                          seen.add(key);
+                        }
+                        for (const [i, t] of newOrder.entries()) {
+                          const data = { order: -(i + 1) };
+                          if (t.kind === "video")
+                            yield* Effect.promise(() =>
+                              tx.video.update({ where: { id: t.id }, data }),
+                            );
+                          else
+                            yield* Effect.promise(() =>
+                              tx.audio.update({ where: { id: t.id }, data }),
+                            );
+                        }
+                        let cursor = 0;
+                        for (const [i, t] of newOrder.entries()) {
+                          const row = (t.kind === "video" ? videoMap : audioMap).get(t.id);
+                          if (!row) throw new Error("unreachable");
+                          const duration = row.projEndSec - row.projStartSec;
+                          const data = {
+                            order: i,
+                            projStartSec: cursor,
+                            projEndSec: cursor + duration,
+                          };
+                          if (t.kind === "video")
+                            yield* Effect.promise(() =>
+                              tx.video.update({ where: { id: t.id }, data }),
+                            );
+                          else
+                            yield* Effect.promise(() =>
+                              tx.audio.update({ where: { id: t.id }, data }),
+                            );
+                          cursor += duration;
+                        }
+                      }),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+            Effect.flatMap((r) => r),
+            Effect.flatMap(() => requireProjectDetail(c.var.user.id, project.id)),
+          ),
+        ),
+        Effect.map((updated): { project: ApiProjectDetail } => ({
+          project: toApiProjectDetail(updated),
+        })),
+        Effect.either,
+        Effect.map((r) => c.var.eitherJson(r)),
+        Effect.runPromise,
       );
-
-      const updated = await prisma.project.findFirst({
-        where: { id: project.id, userId: user.id },
-        include: {
-          videos: {
-            orderBy: { order: "asc" },
-            include: { thumbnails: { orderBy: { atSec: "asc" } } },
-          },
-          audios: { orderBy: { order: "asc" } },
-          tasks: {
-            where: { status: { in: ["pending", "running", "failed"] } },
-            orderBy: { createdAt: "desc" },
-            include: { upload: { select: { fileName: true, kind: true } } },
-          },
-        },
-      });
-      if (!updated) return c.json({ error: "project not found" }, 404);
-      return c.json({ project: toApiProjectDetail(updated) satisfies ApiProjectDetail });
     },
   )
 
@@ -265,10 +353,7 @@ export const projects = new Hono<AuthContext>()
     "/:id/uploads",
     vValidator("param", idParamSchema),
     vValidator("json", createUploadSchema),
-    async (c) => {
-      const user = c.var.user;
-      const project = await findProjectOr404(user.id, c.req.valid("param").id);
-      if (!project) return c.json({ error: "project not found" }, 404);
+    (c) => {
       const {
         kind,
         fileName,
@@ -279,21 +364,33 @@ export const projects = new Hono<AuthContext>()
       const chunkSize = requestedChunk ?? DEFAULT_CHUNK_SIZE;
       const totalChunks = Math.max(1, Math.ceil(totalBytes / chunkSize));
       const expiresAt = new Date(Date.now() + UPLOAD_EXPIRY_MS);
-
-      const upload = await prisma.upload.create({
-        data: {
-          projectId: project.id,
-          kind,
-          fileName,
-          contentType: contentType ?? null,
-          totalBytes: BigInt(totalBytes),
-          chunkSize,
-          totalChunks,
-          expiresAt,
-        },
-      });
-      await markPrefixForDeletion(uploadPrefix(project.id, upload.id), UPLOAD_EXPIRY_MS);
-      return c.json({ upload: toApiUpload(upload) satisfies ApiUpload }, 201);
+      return pipe(
+        requireProject(c.var.user.id, c.req.valid("param").id),
+        Effect.flatMap((project) =>
+          Effect.promise(async () => {
+            const upload = await prisma.upload.create({
+              data: {
+                projectId: project.id,
+                kind,
+                fileName,
+                contentType: contentType ?? null,
+                totalBytes: BigInt(totalBytes),
+                chunkSize,
+                totalChunks,
+                expiresAt,
+              },
+            });
+            await markPrefixForDeletion(uploadPrefix(project.id, upload.id), UPLOAD_EXPIRY_MS);
+            return upload;
+          }),
+        ),
+        Effect.mapBoth({
+          onSuccess: (upload) => c.json({ upload: toApiUpload(upload) satisfies ApiUpload }, 201),
+          onFailure: (err) => c.var.eitherJson(leftErr(err)),
+        }),
+        Effect.merge,
+        Effect.runPromise,
+      );
     },
   )
 
@@ -303,18 +400,14 @@ export const projects = new Hono<AuthContext>()
     async (c) => {
       const user = c.var.user;
       const { id, uploadId, index: indexStr } = c.req.valid("param");
-      const project = await findProjectOr404(user.id, id);
-      if (!project) return c.json({ error: "project not found" }, 404);
-      const upload = await prisma.upload.findFirst({
-        where: { id: uploadId, projectId: project.id },
-      });
-      if (!upload) return c.json({ error: "upload not found" }, 404);
-      if (upload.status !== "pending") {
-        return c.json({ error: `upload is ${upload.status}` }, 409);
-      }
-      if (upload.expiresAt.getTime() <= Date.now()) {
-        return c.json({ error: "upload expired" }, 410);
-      }
+      const projectR = await Effect.runPromise(Effect.either(requireProject(user.id, id)));
+      if (Either.isLeft(projectR)) return c.var.eitherJson(projectR);
+      const project = projectR.right;
+      const uploadR = await Effect.runPromise(
+        Effect.either(requirePendingUpload(uploadId, project.id)),
+      );
+      if (Either.isLeft(uploadR)) return c.var.eitherJson(uploadR);
+      const upload = uploadR.right;
       const index = Number(indexStr);
       if (!Number.isInteger(index) || index < 0 || index >= upload.totalChunks) {
         return c.json({ error: `chunk index out of range [0, ${upload.totalChunks})` }, 400);
@@ -331,8 +424,8 @@ export const projects = new Hono<AuthContext>()
       if (declared > upload.chunkSize) {
         return c.json({ error: `chunk exceeds declared chunkSize ${upload.chunkSize}` }, 413);
       }
-      if (declared > MAX_SINGLE_CHUNK_BYTES) {
-        return c.json({ error: `chunk too large (max ${MAX_SINGLE_CHUNK_BYTES} bytes)` }, 413);
+      if (declared > MAX_CHUNK_SIZE) {
+        return c.json({ error: `chunk too large (max ${MAX_CHUNK_SIZE} bytes)` }, 413);
       }
       const contentType = c.req.header("content-type") ?? "application/octet-stream";
       // PUT ごとに固有 s3Key (= DB row が指す 1 object)、tx で promote
@@ -342,10 +435,7 @@ export const projects = new Hono<AuthContext>()
       try {
         size = await uploadRawRequest(newS3Key, c.req.raw, contentType);
       } catch (err) {
-        return c.json(
-          { error: `chunk upload failed: ${err instanceof Error ? err.message : String(err)}` },
-          500,
-        );
+        return c.json({ error: `chunk upload failed: ${describeError(err)}` }, 500);
       }
       if (size > upload.chunkSize) {
         // CL pre-check の防衛策
@@ -354,38 +444,46 @@ export const projects = new Hono<AuthContext>()
           .catch(() => {});
         return c.json({ error: `chunk exceeds declared chunkSize ${upload.chunkSize}` }, 413);
       }
+      // skill: prisma-claim-first。chunk の read/delta は claim 後でないと
+      // 並行 PUT が同じ古い sizeBytes を基に delta を計算し receivedBytes が ずれる。
+      // stale を throw で表すと外側で新規 S3 を掃除できないので戻り値で表す
       const promoteResult = await prisma.$transaction(async (tx) => {
-        const fresh = await tx.upload.findUnique({
-          where: { id: upload.id },
-          select: { status: true, expiresAt: true },
+        const claimed = await tx.upload.updateMany({
+          where: {
+            id: upload.id,
+            status: "pending",
+            expiresAt: { gt: new Date() },
+          },
+          data: { updatedAt: new Date() },
         });
-        if (!fresh || fresh.status !== "pending") {
-          return { stale: true as const, status: fresh?.status ?? "missing", oldS3Key: null };
-        }
-        if (fresh.expiresAt.getTime() <= Date.now()) {
+        if (claimed.count === 0) {
+          const fresh = await tx.upload.findUnique({
+            where: { id: upload.id },
+            select: { status: true, expiresAt: true },
+          });
+          if (!fresh) return { stale: true as const, status: "missing" as const, oldS3Key: null };
+          if (fresh.status !== "pending") {
+            return { stale: true as const, status: fresh.status, oldS3Key: null };
+          }
           return { stale: true as const, status: "expired" as const, oldS3Key: null };
         }
         const existing = await tx.uploadChunk.findUnique({
           where: { uploadId_index: { uploadId: upload.id, index } },
         });
+        const delta = existing ? BigInt(size) - existing.sizeBytes : BigInt(size);
+        await tx.upload.update({
+          where: { id: upload.id },
+          data: { receivedBytes: { increment: delta } },
+        });
         if (existing) {
-          const delta = BigInt(size) - existing.sizeBytes;
           await tx.uploadChunk.update({
             where: { uploadId_index: { uploadId: upload.id, index } },
             data: { sizeBytes: BigInt(size), s3Key: newS3Key },
-          });
-          await tx.upload.update({
-            where: { id: upload.id },
-            data: { receivedBytes: { increment: delta } },
           });
           return { stale: false as const, oldS3Key: existing.s3Key };
         }
         await tx.uploadChunk.create({
           data: { uploadId: upload.id, index, sizeBytes: BigInt(size), s3Key: newS3Key },
-        });
-        await tx.upload.update({
-          where: { id: upload.id },
-          data: { receivedBytes: { increment: BigInt(size) } },
         });
         return { stale: false as const, oldS3Key: null };
       });
@@ -405,378 +503,347 @@ export const projects = new Hono<AuthContext>()
     },
   )
 
-  .post("/:id/uploads/:uploadId/complete", vValidator("param", uploadIdParamSchema), async (c) => {
-    const user = c.var.user;
+  .post("/:id/uploads/:uploadId/complete", vValidator("param", uploadIdParamSchema), (c) => {
     const { id, uploadId } = c.req.valid("param");
-    const project = await findProjectOr404(user.id, id);
-    if (!project) return c.json({ error: "project not found" }, 404);
-
-    type CompleteOutcome =
-      | { kind: "claimed"; task: ApiTask }
-      | { kind: "race_lost"; task: ApiTask }
-      | {
-          kind: "error";
-          status: 400 | 404 | 409 | 410 | 500;
-          error: string;
-        };
-
-    // chunks の read + validate を claim より後ろに置く。
-    // PUT promotion tx と /complete の race を塞ぐため、claim 先行 →
-    // validate 失敗時は throw で tx abort して claim を巻き戻す
-    class CompleteValidationFailure extends Error {
-      constructor(public outcome: Extract<CompleteOutcome, { kind: "error" }>) {
-        super(outcome.error);
-      }
-    }
-    let outcome: CompleteOutcome;
-    try {
-      outcome = await prisma.$transaction(async (tx) => {
-        const upload = await tx.upload.findFirst({
-          where: { id: uploadId, projectId: project.id },
-        });
-        if (!upload) {
-          return { kind: "error", status: 404, error: "upload not found" };
-        }
-        if (upload.status === "completed") {
-          const existing = await tx.task.findFirst({
-            where: { uploadId: upload.id },
-            orderBy: { createdAt: "desc" },
-            include: { upload: { select: { fileName: true, kind: true } } },
-          });
-          if (existing) return { kind: "race_lost", task: toApiTask(existing) };
-          return { kind: "error", status: 500, error: "completed upload has no task" };
-        }
-        if (upload.status !== "pending") {
-          return { kind: "error", status: 409, error: `upload is ${upload.status}` };
-        }
-        if (upload.expiresAt.getTime() <= Date.now()) {
-          return { kind: "error", status: 410, error: "upload expired" };
-        }
-        const claimed = await tx.upload.updateMany({
-          where: { id: upload.id, status: "pending" },
-          data: { status: "completed" },
-        });
-        if (claimed.count === 0) {
-          const existing = await tx.task.findFirst({
-            where: { uploadId: upload.id },
-            orderBy: { createdAt: "desc" },
-            include: { upload: { select: { fileName: true, kind: true } } },
-          });
-          if (existing) return { kind: "race_lost", task: toApiTask(existing) };
-          return { kind: "error", status: 500, error: "race lost but no task found" };
-        }
-        // claim 後に chunks 確定状態を read。PUT promotion はこの時点で stale 扱い
-        const chunks = await tx.uploadChunk.findMany({
-          where: { uploadId: upload.id },
-          select: { index: true, sizeBytes: true },
-        });
-        if (chunks.length !== upload.totalChunks) {
-          throw new CompleteValidationFailure({
-            kind: "error",
-            status: 400,
-            error: `missing chunks: received ${chunks.length}/${upload.totalChunks}`,
-          });
-        }
-        const seen = new Set(chunks.map((chunk) => chunk.index));
-        for (let i = 0; i < upload.totalChunks; i++) {
-          if (!seen.has(i)) {
-            throw new CompleteValidationFailure({
-              kind: "error",
-              status: 400,
-              error: `missing chunk ${i}`,
-            });
-          }
-        }
-        const sum = chunks.reduce((acc, chunk) => acc + chunk.sizeBytes, 0n);
-        if (sum !== upload.totalBytes) {
-          throw new CompleteValidationFailure({
-            kind: "error",
-            status: 400,
-            error: `byte total mismatch: received ${sum}, declared ${upload.totalBytes}`,
-          });
-        }
-        const task = await tx.task.create({
-          data: {
-            projectId: project.id,
-            type: upload.kind === "video" ? "video_validation" : "audio_validation",
-            uploadId: upload.id,
-            status: "pending",
-          },
-          include: { upload: { select: { fileName: true, kind: true } } },
-        });
-        // task 走行中の sweep を防ぐ。完了時 executeTask が mark ごと回収
-        await tx.deletionMark.updateMany({
-          where: { prefix: uploadPrefix(project.id, upload.id) },
-          data: { nextRetryAt: new Date(Date.now() + TASK_GRACE_MS) },
-        });
-        return { kind: "claimed", task: toApiTask(task) };
-      });
-    } catch (err) {
-      if (err instanceof CompleteValidationFailure) {
-        outcome = err.outcome;
-      } else {
-        throw err;
-      }
-    }
-
-    if (outcome.kind === "error") return c.json({ error: outcome.error }, outcome.status);
-    if (outcome.kind === "claimed") enqueueTask(outcome.task.id);
-    return c.json({ task: outcome.task satisfies ApiTask }, outcome.kind === "claimed" ? 201 : 200);
+    // skill: prisma-claim-first。completed なら冪等返却、validate 失敗は txEither が rollback
+    return pipe(
+      requireProject(c.var.user.id, id),
+      Effect.flatMap((project) =>
+        txEither((tx) =>
+          Effect.gen(function* () {
+            const claimed = yield* Effect.promise(() =>
+              tx.upload.updateMany({
+                where: {
+                  id: uploadId,
+                  projectId: project.id,
+                  status: "pending",
+                  expiresAt: { gt: new Date() },
+                },
+                data: { status: "completed" },
+              }),
+            );
+            if (claimed.count === 0) {
+              const upload = yield* requireUpload(tx, uploadId, project.id);
+              if (upload.status === "completed") {
+                // 冪等: 既存 task を返す (Task.id === Upload.id)
+                const existing = yield* Effect.promise(() =>
+                  tx.task.findUnique({ where: { id: upload.id } }),
+                );
+                if (!existing) {
+                  return yield* leftErr({ status: 500, error: "completed upload has no task" });
+                }
+                return { task: toApiTask(existing), enqueue: false };
+              }
+              yield* checkUploadPending(upload);
+              return yield* leftErr({
+                status: 500,
+                error: "unreachable: claim failed but upload is pending",
+              });
+            }
+            // claim 済み行を read。write lock を握っているので並行 read+write しない
+            const upload = yield* Effect.promise(() =>
+              tx.upload.findUniqueOrThrow({ where: { id: uploadId } }),
+            );
+            const chunks = yield* Effect.promise(() =>
+              tx.uploadChunk.findMany({
+                where: { uploadId: upload.id },
+                select: { index: true, sizeBytes: true },
+              }),
+            );
+            if (chunks.length !== upload.totalChunks) {
+              return yield* leftErr({
+                status: 400,
+                error: `missing chunks: received ${chunks.length}/${upload.totalChunks}`,
+              });
+            }
+            const seen = new Set(chunks.map((chunk) => chunk.index));
+            for (let i = 0; i < upload.totalChunks; i++) {
+              if (!seen.has(i)) return yield* leftErr({ status: 400, error: `missing chunk ${i}` });
+            }
+            const sum = chunks.reduce((acc, chunk) => acc + chunk.sizeBytes, 0n);
+            if (sum !== upload.totalBytes) {
+              return yield* leftErr({
+                status: 400,
+                error: `byte total mismatch: received ${sum}, declared ${upload.totalBytes}`,
+              });
+            }
+            const task = yield* Effect.promise(() =>
+              tx.task.create({
+                data: {
+                  id: upload.id,
+                  projectId: project.id,
+                  type: upload.kind === "video" ? "video_validation" : "audio_validation",
+                  fileName: upload.fileName,
+                  status: "pending",
+                },
+              }),
+            );
+            // task 走行中の sweep を防ぐ。完了時 executeTask が mark ごと回収
+            yield* Effect.promise(() =>
+              tx.deletionMark.updateMany({
+                where: { prefix: uploadPrefix(project.id, upload.id) },
+                data: { nextRetryAt: new Date(Date.now() + TASK_GRACE_MS) },
+              }),
+            );
+            return { task: toApiTask(task), enqueue: true };
+          }),
+        ),
+      ),
+      Effect.map(({ task, enqueue }): { task: ApiTask } => {
+        if (enqueue) enqueueTask(task.id);
+        return { task };
+      }),
+      Effect.either,
+      Effect.map((r) => c.var.eitherJson(r)),
+      Effect.runPromise,
+    );
   })
 
   // pending な upload の自発キャンセル用。completed 後は task が chunks を必要とするので拒否
-  .delete("/:id/uploads/:uploadId", vValidator("param", uploadIdParamSchema), async (c) => {
-    const user = c.var.user;
+  .delete("/:id/uploads/:uploadId", vValidator("param", uploadIdParamSchema), (c) => {
     const { id, uploadId } = c.req.valid("param");
-    const project = await findProjectOr404(user.id, id);
-    if (!project) return c.json({ error: "project not found" }, 404);
-    const prefix = uploadPrefix(project.id, uploadId);
-    // tx 内で status=pending を再確認して /complete と直列化
-    const aborted = await prisma.$transaction(async (tx) => {
-      const upload = await tx.upload.findFirst({
-        where: { id: uploadId, projectId: project.id },
-        select: { status: true },
-      });
-      if (!upload) return { ok: false as const, status: 404 as const, error: "upload not found" };
-      if (upload.status !== "pending") {
-        return {
-          ok: false as const,
-          status: 409 as const,
-          error: `cannot abort: upload is ${upload.status}`,
-        };
-      }
-      await tx.uploadChunk.deleteMany({ where: { uploadId } });
-      await tx.upload.update({ where: { id: uploadId }, data: { status: "aborted" } });
-      return { ok: true as const };
-    });
-    if (!aborted.ok) return c.json({ error: aborted.error }, aborted.status);
-    await eagerCleanupAndUnmark(prefix);
-    return c.body(null, 204);
+    // claim-first で pending → aborted に遷移 (skill: prisma-claim-first)。
+    // 期限切れ pending も abort 対象なので expiresAt 条件は付けない
+    return pipe(
+      requireProject(c.var.user.id, id),
+      Effect.flatMap((project) =>
+        pipe(
+          txEither((tx) =>
+            Effect.gen(function* () {
+              const claimed = yield* Effect.promise(() =>
+                tx.upload.updateMany({
+                  where: { id: uploadId, projectId: project.id, status: "pending" },
+                  data: { status: "aborted" },
+                }),
+              );
+              if (claimed.count === 0) {
+                const upload = yield* requireUpload(tx, uploadId, project.id);
+                return yield* leftErr({
+                  status: 409,
+                  error: `cannot abort: upload is ${upload.status}`,
+                });
+              }
+              yield* Effect.promise(() => tx.uploadChunk.deleteMany({ where: { uploadId } }));
+            }),
+          ),
+          Effect.flatMap(() =>
+            Effect.promise(() => eagerCleanupAndUnmark(uploadPrefix(project.id, uploadId))),
+          ),
+        ),
+      ),
+      Effect.mapBoth({
+        onSuccess: () => c.body(null, 204),
+        onFailure: (err) => c.var.eitherJson(leftErr(err)),
+      }),
+      Effect.merge,
+      Effect.runPromise,
+    );
   })
 
-  .get("/:id/tasks", vValidator("param", idParamSchema), async (c) => {
-    const user = c.var.user;
-    const project = await findProjectOr404(user.id, c.req.valid("param").id);
-    if (!project) return c.json({ error: "project not found" }, 404);
-    const tasks = await prisma.task.findMany({
-      where: { projectId: project.id },
-      orderBy: { createdAt: "desc" },
-      include: { upload: { select: { fileName: true, kind: true } } },
-    });
-    return c.json({ tasks: tasks.map(toApiTask) satisfies ApiTask[] });
-  })
+  .get("/:id/tasks", vValidator("param", idParamSchema), (c) =>
+    pipe(
+      requireProject(c.var.user.id, c.req.valid("param").id),
+      Effect.flatMap((project) =>
+        Effect.promise(() =>
+          prisma.task.findMany({
+            where: { projectId: project.id },
+            orderBy: { createdAt: "desc" },
+          }),
+        ),
+      ),
+      Effect.map((tasks) => ({ tasks: tasks.map(toApiTask) satisfies ApiTask[] })),
+      Effect.either,
+      Effect.map((r) => c.var.eitherJson(r)),
+      Effect.runPromise,
+    ),
+  )
 
-  .get("/:id/tasks/:taskId", vValidator("param", taskIdParamSchema), async (c) => {
-    const user = c.var.user;
+  .get("/:id/tasks/:taskId", vValidator("param", taskIdParamSchema), (c) => {
     const { id, taskId } = c.req.valid("param");
-    const project = await findProjectOr404(user.id, id);
-    if (!project) return c.json({ error: "project not found" }, 404);
-    const task = await prisma.task.findFirst({
-      where: { id: taskId, projectId: project.id },
-      include: { upload: { select: { fileName: true, kind: true } } },
-    });
-    if (!task) return c.json({ error: "task not found" }, 404);
-    return c.json({ task: toApiTask(task) satisfies ApiTask });
+    return pipe(
+      requireProject(c.var.user.id, id),
+      Effect.flatMap((project) =>
+        Effect.promise(() =>
+          prisma.task.findFirst({ where: { id: taskId, projectId: project.id } }),
+        ),
+      ),
+      Effect.flatMap(found({ status: 404, error: "task not found" })),
+      Effect.map((task) => ({ task: toApiTask(task) satisfies ApiTask })),
+      Effect.either,
+      Effect.map((r) => c.var.eitherJson(r)),
+      Effect.runPromise,
+    );
   })
 
-  .delete("/:id/videos/:videoId", vValidator("param", videoIdParamSchema), async (c) => {
-    const user = c.var.user;
+  // failed task の dismiss。expireAt を now に倒すと UI から消え、sweeper が同 id の Upload も回収
+  .post("/:id/tasks/:taskId/dismiss", vValidator("param", taskIdParamSchema), (c) => {
+    const { id, taskId } = c.req.valid("param");
+    return pipe(
+      requireProject(c.var.user.id, id),
+      Effect.flatMap((project) =>
+        Effect.promise(() =>
+          prisma.task.updateMany({
+            where: { id: taskId, projectId: project.id, status: "failed" },
+            data: { expireAt: new Date() },
+          }),
+        ),
+      ),
+      Effect.flatMap((res) =>
+        res.count === 0
+          ? leftErr({ status: 404, error: "failed task not found" })
+          : Either.right(null),
+      ),
+      Effect.mapBoth({
+        onSuccess: () => c.body(null, 204),
+        onFailure: (err) => c.var.eitherJson(leftErr(err)),
+      }),
+      Effect.merge,
+      Effect.runPromise,
+    );
+  })
+
+  .delete("/:id/videos/:videoId", vValidator("param", videoIdParamSchema), (c) => {
     const { id, videoId } = c.req.valid("param");
-    const project = await findProjectOr404(user.id, id);
-    if (!project) return c.json({ error: "project not found" }, 404);
-    const video = await prisma.video.findFirst({
-      where: { id: videoId, projectId: project.id },
-    });
-    if (!video) return c.json({ error: "video not found" }, 404);
-    const prefix = `${projectKey(project.id)}/videos/${video.id}/`;
-    await prisma.$transaction(async (tx) => {
-      await tx.deletionMark.create({ data: { prefix } });
-      await tx.thumbnail.deleteMany({ where: { videoId: video.id } });
-      await tx.video.delete({ where: { id: video.id } });
-    });
-    await eagerCleanupAndUnmark(prefix);
-    return c.body(null, 204);
+    return pipe(
+      requireProject(c.var.user.id, id),
+      Effect.flatMap((project) =>
+        pipe(
+          requireVideo(project.id, videoId),
+          Effect.flatMap((video) =>
+            Effect.promise(async () => {
+              const prefix = videoPrefix(project.id, video.id);
+              await prisma.$transaction([
+                prisma.deletionMark.create({ data: { prefix } }),
+                prisma.thumbnail.deleteMany({ where: { videoId: video.id } }),
+                prisma.video.delete({ where: { id: video.id } }),
+              ]);
+              await eagerCleanupAndUnmark(prefix);
+            }),
+          ),
+        ),
+      ),
+      Effect.mapBoth({
+        onSuccess: () => c.body(null, 204),
+        onFailure: (err) => c.var.eitherJson(leftErr(err)),
+      }),
+      Effect.merge,
+      Effect.runPromise,
+    );
   })
 
-  .patch(
-    "/:id/videos/:videoId/timing",
-    vValidator("param", videoIdParamSchema),
-    vValidator("json", timingSchema),
-    async (c) => {
-      const user = c.var.user;
-      const { id, videoId } = c.req.valid("param");
-      const body = c.req.valid("json");
-      const project = await findProjectOr404(user.id, id);
-      if (!project) return c.json({ error: "project not found" }, 404);
-      // task-runner.allocSlot と同じ project-row 書き込みを先に取り、新規 upload の
-      // slot 計算と timing 変更が interleave して overlap しないよう serialize する
-      const result = await withSlotRetry(() =>
-        prisma.$transaction(async (tx) => {
-          await tx.project.update({ where: { id: project.id }, data: { updatedAt: new Date() } });
-          const video = await tx.video.findFirst({
-            where: { id: videoId, projectId: project.id },
-          });
-          if (!video) return { kind: "not_found" as const };
-          if (body.srcEndSec > video.durationSec) {
-            return {
-              kind: "invalid" as const,
-              message: `srcEndSec must be <= durationSec (${video.durationSec})`,
-            };
-          }
-          const updated = await tx.video.update({
-            where: { id: video.id },
-            data: {
-              srcStartSec: body.srcStartSec,
-              srcEndSec: body.srcEndSec,
-              projStartSec: body.projStartSec,
-              projEndSec: body.projEndSec,
-            },
-            include: { thumbnails: { orderBy: { atSec: "asc" } } },
-          });
-          return { kind: "ok" as const, video: updated };
-        }),
-      );
-      if (result.kind === "not_found") return c.json({ error: "video not found" }, 404);
-      if (result.kind === "invalid") return c.json({ error: result.message }, 400);
-      return c.json({ video: toApiVideo(result.video) satisfies ApiVideo });
-    },
-  )
-
-  .get("/:id/videos/:videoId/stream", vValidator("param", videoIdParamSchema), async (c) => {
-    const user = c.var.user;
+  .get("/:id/videos/:videoId/stream", vValidator("param", videoIdParamSchema), (c) => {
     const { id, videoId } = c.req.valid("param");
-    const project = await findProjectOr404(user.id, id);
-    if (!project) return c.notFound();
-    const video = await prisma.video.findFirst({
-      where: { id: videoId, projectId: project.id },
-    });
-    if (!video) return c.notFound();
-    return await streamS3(c, video.videoKey, "video/mp4");
+    return pipe(
+      requireProject(c.var.user.id, id),
+      Effect.flatMap((project) => requireVideo(project.id, videoId)),
+      Effect.either,
+      Effect.flatMap((r) =>
+        Either.isLeft(r)
+          ? Effect.sync(() => c.var.eitherJson(r))
+          : Effect.promise(() => streamS3(c, r.right.videoKey, "video/mp4")),
+      ),
+      Effect.runPromise,
+    );
   })
 
-  .get("/:id/videos/:videoId/audio", vValidator("param", videoIdParamSchema), async (c) => {
-    const user = c.var.user;
+  .get("/:id/videos/:videoId/audio", vValidator("param", videoIdParamSchema), (c) => {
     const { id, videoId } = c.req.valid("param");
-    const project = await findProjectOr404(user.id, id);
-    if (!project) return c.notFound();
-    const video = await prisma.video.findFirst({
-      where: { id: videoId, projectId: project.id },
-    });
-    if (!video || !video.audioKey) return c.notFound();
-    return await streamS3(c, video.audioKey, "audio/mp4");
+    return pipe(
+      requireProject(c.var.user.id, id),
+      Effect.flatMap((project) => requireVideo(project.id, videoId)),
+      Effect.flatMap((video) =>
+        video.audioKey === null
+          ? leftErr({ status: 404, error: "video has no audio" })
+          : Either.right({ ...video, audioKey: video.audioKey }),
+      ),
+      Effect.either,
+      Effect.flatMap((r) =>
+        Either.isLeft(r)
+          ? Effect.sync(() => c.var.eitherJson(r))
+          : Effect.promise(() => streamS3(c, r.right.audioKey, "audio/mp4")),
+      ),
+      Effect.runPromise,
+    );
   })
 
-  .get(
-    "/:id/videos/:videoId/thumbnails/:thumbId",
-    vValidator("param", thumbIdParamSchema),
-    async (c) => {
-      const user = c.var.user;
-      const { id, thumbId } = c.req.valid("param");
-      const project = await findProjectOr404(user.id, id);
-      if (!project) return c.notFound();
-      const thumb = await prisma.thumbnail.findFirst({
-        where: { id: thumbId, video: { projectId: project.id } },
-      });
-      if (!thumb) return c.notFound();
-      return await streamS3(c, thumb.key, "image/jpeg");
-    },
-  )
-
-  .delete("/:id/audios/:audioId", vValidator("param", audioIdParamSchema), async (c) => {
-    const user = c.var.user;
-    const { id, audioId } = c.req.valid("param");
-    const project = await findProjectOr404(user.id, id);
-    if (!project) return c.json({ error: "project not found" }, 404);
-    const audio = await prisma.audio.findFirst({
-      where: { id: audioId, projectId: project.id },
-    });
-    if (!audio) return c.json({ error: "audio not found" }, 404);
-    const prefix = `${projectKey(project.id)}/audios/${audio.id}/`;
-    await prisma.$transaction(async (tx) => {
-      await tx.deletionMark.create({ data: { prefix } });
-      await tx.audio.delete({ where: { id: audio.id } });
-    });
-    await eagerCleanupAndUnmark(prefix);
-    return c.body(null, 204);
+  .get("/:id/videos/:videoId/thumbnails/:thumbId", vValidator("param", thumbIdParamSchema), (c) => {
+    const { id, thumbId } = c.req.valid("param");
+    return pipe(
+      requireProject(c.var.user.id, id),
+      Effect.flatMap((project) => requireThumbnail(project.id, thumbId)),
+      Effect.either,
+      Effect.flatMap((r) =>
+        Either.isLeft(r)
+          ? Effect.sync(() => c.var.eitherJson(r))
+          : Effect.promise(() => streamS3(c, r.right.key, "image/jpeg")),
+      ),
+      Effect.runPromise,
+    );
   })
 
-  .patch(
-    "/:id/audios/:audioId/timing",
-    vValidator("param", audioIdParamSchema),
-    vValidator("json", timingSchema),
-    async (c) => {
-      const user = c.var.user;
-      const { id, audioId } = c.req.valid("param");
-      const body = c.req.valid("json");
-      const project = await findProjectOr404(user.id, id);
-      if (!project) return c.json({ error: "project not found" }, 404);
-      const result = await withSlotRetry(() =>
-        prisma.$transaction(async (tx) => {
-          await tx.project.update({ where: { id: project.id }, data: { updatedAt: new Date() } });
-          const audio = await tx.audio.findFirst({
-            where: { id: audioId, projectId: project.id },
-          });
-          if (!audio) return { kind: "not_found" as const };
-          if (body.srcEndSec > audio.durationSec) {
-            return {
-              kind: "invalid" as const,
-              message: `srcEndSec must be <= durationSec (${audio.durationSec})`,
-            };
-          }
-          const updated = await tx.audio.update({
-            where: { id: audio.id },
-            data: {
-              srcStartSec: body.srcStartSec,
-              srcEndSec: body.srcEndSec,
-              projStartSec: body.projStartSec,
-              projEndSec: body.projEndSec,
-            },
-          });
-          return { kind: "ok" as const, audio: updated };
-        }),
-      );
-      if (result.kind === "not_found") return c.json({ error: "audio not found" }, 404);
-      if (result.kind === "invalid") return c.json({ error: result.message }, 400);
-      return c.json({ audio: toApiAudio(result.audio) satisfies ApiAudio });
-    },
-  )
-
-  .get("/:id/audios/:audioId/stream", vValidator("param", audioIdParamSchema), async (c) => {
-    const user = c.var.user;
+  .delete("/:id/audios/:audioId", vValidator("param", audioIdParamSchema), (c) => {
     const { id, audioId } = c.req.valid("param");
-    const project = await findProjectOr404(user.id, id);
-    if (!project) return c.notFound();
-    const audio = await prisma.audio.findFirst({
-      where: { id: audioId, projectId: project.id },
-    });
-    if (!audio) return c.notFound();
-    return await streamS3(c, audio.audioKey, "audio/mp4");
+    return pipe(
+      requireProject(c.var.user.id, id),
+      Effect.flatMap((project) =>
+        pipe(
+          requireAudio(project.id, audioId),
+          Effect.flatMap((audio) =>
+            Effect.promise(async () => {
+              const prefix = audioPrefix(project.id, audio.id);
+              await prisma.$transaction([
+                prisma.deletionMark.create({ data: { prefix } }),
+                prisma.audio.delete({ where: { id: audio.id } }),
+              ]);
+              await eagerCleanupAndUnmark(prefix);
+            }),
+          ),
+        ),
+      ),
+      Effect.mapBoth({
+        onSuccess: () => c.body(null, 204),
+        onFailure: (err) => c.var.eitherJson(leftErr(err)),
+      }),
+      Effect.merge,
+      Effect.runPromise,
+    );
   })
 
-  .get("/:id/audios/:audioId/raw", vValidator("param", audioIdParamSchema), async (c) => {
-    const user = c.var.user;
+  .get("/:id/audios/:audioId/stream", vValidator("param", audioIdParamSchema), (c) => {
     const { id, audioId } = c.req.valid("param");
-    const project = await findProjectOr404(user.id, id);
-    if (!project) return c.notFound();
-    const audio = await prisma.audio.findFirst({
-      where: { id: audioId, projectId: project.id },
-    });
-    if (!audio || !audio.rawKey) return c.notFound();
-    return await streamS3(c, audio.rawKey, audio.rawContentType ?? "application/octet-stream");
+    return pipe(
+      requireProject(c.var.user.id, id),
+      Effect.flatMap((project) => requireAudio(project.id, audioId)),
+      Effect.either,
+      Effect.flatMap((r) =>
+        Either.isLeft(r)
+          ? Effect.sync(() => c.var.eitherJson(r))
+          : Effect.promise(() => streamS3(c, r.right.audioKey, "audio/mp4")),
+      ),
+      Effect.runPromise,
+    );
+  })
+
+  .get("/:id/audios/:audioId/raw", vValidator("param", audioIdParamSchema), (c) => {
+    const { id, audioId } = c.req.valid("param");
+    return pipe(
+      requireProject(c.var.user.id, id),
+      Effect.flatMap((project) => requireAudio(project.id, audioId)),
+      Effect.flatMap((audio) =>
+        audio.rawKey === null
+          ? leftErr({ status: 404, error: "audio has no raw file" })
+          : Either.right({ ...audio, rawKey: audio.rawKey }),
+      ),
+      Effect.either,
+      Effect.flatMap((r) =>
+        Either.isLeft(r)
+          ? Effect.sync(() => c.var.eitherJson(r))
+          : Effect.promise(() =>
+              streamS3(c, r.right.rawKey, r.right.rawContentType ?? "application/octet-stream"),
+            ),
+      ),
+      Effect.runPromise,
+    );
   });
-
-// P2002 (unique) / P2034 (write conflict) の保険リトライ
-async function withSlotRetry<T>(fn: () => Promise<T>): Promise<T> {
-  const MAX_ATTEMPTS = 5;
-  for (let i = 0; i < MAX_ATTEMPTS; i++) {
-    try {
-      return await fn();
-    } catch (err) {
-      const code = (err as { code?: string } | null)?.code;
-      if ((code !== "P2002" && code !== "P2034") || i === MAX_ATTEMPTS - 1) throw err;
-    }
-  }
-  throw new Error("unreachable");
-}
 
 export type ProjectsAppType = typeof projects;
