@@ -785,29 +785,40 @@ export const projects = new Hono()
                             data: { updatedAt: new Date() },
                           }),
                         );
-                        const video = yield* pipe(
-                          Effect.promise(() =>
-                            tx.video.findFirst({
-                              where: { id: videoId, projectId: project.id },
-                            }),
-                          ),
-                          Effect.flatMap(found({ status: 404, error: "video not found" })),
-                        );
-                        if (body.srcEndSec > video.durationSec) {
-                          return yield* leftErr({
-                            status: 400,
-                            error: `srcEndSec must be <= durationSec (${video.durationSec})`,
-                          });
-                        }
-                        return yield* Effect.promise(() =>
-                          tx.video.update({
-                            where: { id: video.id },
+                        // durationSec 制約を where に畳んで claim-first で原子更新
+                        const claimed = yield* Effect.promise(() =>
+                          tx.video.updateMany({
+                            where: {
+                              id: videoId,
+                              projectId: project.id,
+                              durationSec: { gte: body.srcEndSec },
+                            },
                             data: {
                               srcStartSec: body.srcStartSec,
                               srcEndSec: body.srcEndSec,
                               projStartSec: body.projStartSec,
                               projEndSec: body.projEndSec,
                             },
+                          }),
+                        );
+                        if (claimed.count === 0) {
+                          const video = yield* Effect.promise(() =>
+                            tx.video.findFirst({
+                              where: { id: videoId, projectId: project.id },
+                              select: { durationSec: true },
+                            }),
+                          );
+                          if (video === null) {
+                            return yield* leftErr({ status: 404, error: "video not found" });
+                          }
+                          return yield* leftErr({
+                            status: 400,
+                            error: `srcEndSec must be <= durationSec (${video.durationSec})`,
+                          });
+                        }
+                        return yield* Effect.promise(() =>
+                          tx.video.findUniqueOrThrow({
+                            where: { id: videoId },
                             include: { thumbnails: { orderBy: { atSec: "asc" } } },
                           }),
                         );
@@ -931,23 +942,14 @@ export const projects = new Hono()
                             data: { updatedAt: new Date() },
                           }),
                         );
-                        const audio = yield* pipe(
-                          Effect.promise(() =>
-                            tx.audio.findFirst({
-                              where: { id: audioId, projectId: project.id },
-                            }),
-                          ),
-                          Effect.flatMap(found({ status: 404, error: "audio not found" })),
-                        );
-                        if (body.srcEndSec > audio.durationSec) {
-                          return yield* leftErr({
-                            status: 400,
-                            error: `srcEndSec must be <= durationSec (${audio.durationSec})`,
-                          });
-                        }
-                        return yield* Effect.promise(() =>
-                          tx.audio.update({
-                            where: { id: audio.id },
+                        // durationSec 制約を where に畳んで claim-first で原子更新
+                        const claimed = yield* Effect.promise(() =>
+                          tx.audio.updateMany({
+                            where: {
+                              id: audioId,
+                              projectId: project.id,
+                              durationSec: { gte: body.srcEndSec },
+                            },
                             data: {
                               srcStartSec: body.srcStartSec,
                               srcEndSec: body.srcEndSec,
@@ -955,6 +957,24 @@ export const projects = new Hono()
                               projEndSec: body.projEndSec,
                             },
                           }),
+                        );
+                        if (claimed.count === 0) {
+                          const audio = yield* Effect.promise(() =>
+                            tx.audio.findFirst({
+                              where: { id: audioId, projectId: project.id },
+                              select: { durationSec: true },
+                            }),
+                          );
+                          if (audio === null) {
+                            return yield* leftErr({ status: 404, error: "audio not found" });
+                          }
+                          return yield* leftErr({
+                            status: 400,
+                            error: `srcEndSec must be <= durationSec (${audio.durationSec})`,
+                          });
+                        }
+                        return yield* Effect.promise(() =>
+                          tx.audio.findUniqueOrThrow({ where: { id: audioId } }),
                         );
                       }),
                     ),
