@@ -126,9 +126,8 @@ async function mergeChunks(upload: Upload, destPath: string): Promise<void> {
   }
 }
 
-type TaskResult =
-  | { kind: "success"; videoId?: string; audioId?: string }
-  | { kind: "failure"; error: string };
+// 成功は付随データ不要 (executeTask は失敗時の error しか見ない)
+type TaskResult = Either.Either<void, string>;
 
 async function runVideoTask(taskId: string, upload: Upload): Promise<TaskResult> {
   await using td = await tempDir("video-task");
@@ -141,18 +140,15 @@ async function runVideoTask(taskId: string, upload: Upload): Promise<TaskResult>
   try {
     probe = await ffprobe(inputPath);
   } catch {
-    return { kind: "failure", error: "could not parse uploaded file" };
+    return Either.left("could not parse uploaded file");
   }
-  if (!probe.videoStream) return { kind: "failure", error: "no video stream" };
+  if (!probe.videoStream) return Either.left("no video stream");
   if (
     !Number.isFinite(probe.durationSec) ||
     probe.durationSec <= 0 ||
     probe.durationSec > MAX_DURATION_SEC
   ) {
-    return {
-      kind: "failure",
-      error: `duration must be > 0 and <= ${MAX_DURATION_SEC}s (input probe)`,
-    };
+    return Either.left(`duration must be > 0 and <= ${MAX_DURATION_SEC}s (input probe)`);
   }
 
   const hasAudio = probe.audioStream !== null;
@@ -167,20 +163,17 @@ async function runVideoTask(taskId: string, upload: Upload): Promise<TaskResult>
   } catch {
     ac.abort();
     await Promise.allSettled(tasks);
-    return { kind: "failure", error: "ffmpeg cannot decode this video" };
+    return Either.left("ffmpeg cannot decode this video");
   }
 
   const finalProbe = await ffprobe(videoOut);
   const vs = finalProbe.videoStream;
-  if (!vs) return { kind: "failure", error: "transcode produced no video stream" };
+  if (!vs) return Either.left("transcode produced no video stream");
   if (!Number.isFinite(finalProbe.durationSec) || finalProbe.durationSec <= 0) {
-    return { kind: "failure", error: "transcode produced unknown duration" };
+    return Either.left("transcode produced unknown duration");
   }
   if (finalProbe.durationSec > MAX_DURATION_SEC) {
-    return {
-      kind: "failure",
-      error: `duration must be > 0 and <= ${MAX_DURATION_SEC}s (transcoded probe)`,
-    };
+    return Either.left(`duration must be > 0 and <= ${MAX_DURATION_SEC}s (transcoded probe)`);
   }
 
   const thumbs = await extractThumbnails(
@@ -196,7 +189,7 @@ async function runVideoTask(taskId: string, upload: Upload): Promise<TaskResult>
   const aKey = hasAudio ? videoAudioKey(upload.projectId, videoId) : null;
   const vPrefix = videoPrefix(upload.projectId, videoId);
   if (!(await projectExists(upload.projectId))) {
-    return { kind: "failure", error: "project deleted before media upload" };
+    return Either.left("project deleted before media upload");
   }
   // Video.create commit で unmark、未到達なら sweeper 回収
   await markPrefixForDeletion(vPrefix, TASK_GRACE_MS);
@@ -261,12 +254,11 @@ async function runVideoTask(taskId: string, upload: Upload): Promise<TaskResult>
     }),
   );
   if (Either.isLeft(allocResult)) {
-    return {
-      kind: "failure",
-      error: `project timeline cap exceeded: would end at ${allocResult.left.projEnd}s (max ${MAX_PROJECT_TIMING_SEC}s)`,
-    };
+    return Either.left(
+      `project timeline cap exceeded: would end at ${allocResult.left.projEnd}s (max ${MAX_PROJECT_TIMING_SEC}s)`,
+    );
   }
-  return { kind: "success", videoId: allocResult.right.id };
+  return Either.right(undefined);
 }
 
 async function runAudioTask(taskId: string, upload: Upload): Promise<TaskResult> {
@@ -280,36 +272,30 @@ async function runAudioTask(taskId: string, upload: Upload): Promise<TaskResult>
   try {
     probe = await ffprobe(inputPath);
   } catch {
-    return { kind: "failure", error: "could not parse uploaded file" };
+    return Either.left("could not parse uploaded file");
   }
-  if (!probe.audioStream) return { kind: "failure", error: "no audio stream" };
+  if (!probe.audioStream) return Either.left("no audio stream");
   if (
     !Number.isFinite(probe.durationSec) ||
     probe.durationSec <= 0 ||
     probe.durationSec > MAX_DURATION_SEC
   ) {
-    return {
-      kind: "failure",
-      error: `duration must be > 0 and <= ${MAX_DURATION_SEC}s (input probe)`,
-    };
+    return Either.left(`duration must be > 0 and <= ${MAX_DURATION_SEC}s (input probe)`);
   }
 
   const transcodedPath = join(tmp, "transcoded.m4a");
   try {
     await transcodeAudio(inputPath, transcodedPath);
   } catch {
-    return { kind: "failure", error: "ffmpeg cannot decode this audio" };
+    return Either.left("ffmpeg cannot decode this audio");
   }
 
   const finalProbe = await ffprobe(transcodedPath);
   if (!Number.isFinite(finalProbe.durationSec) || finalProbe.durationSec <= 0) {
-    return { kind: "failure", error: "transcode produced unknown duration" };
+    return Either.left("transcode produced unknown duration");
   }
   if (finalProbe.durationSec > MAX_DURATION_SEC) {
-    return {
-      kind: "failure",
-      error: `duration must be > 0 and <= ${MAX_DURATION_SEC}s (transcoded probe)`,
-    };
+    return Either.left(`duration must be > 0 and <= ${MAX_DURATION_SEC}s (transcoded probe)`);
   }
 
   const audioId = crypto.randomUUID();
@@ -319,7 +305,7 @@ async function runAudioTask(taskId: string, upload: Upload): Promise<TaskResult>
   const rawKey = keepRaw ? audioRawKey(upload.projectId, audioId, ext) : null;
   const aPrefix = audioPrefix(upload.projectId, audioId);
   if (!(await projectExists(upload.projectId))) {
-    return { kind: "failure", error: "project deleted before media upload" };
+    return Either.left("project deleted before media upload");
   }
   await markPrefixForDeletion(aPrefix, TASK_GRACE_MS);
   await awaitAllOrAggregate([
@@ -371,12 +357,11 @@ async function runAudioTask(taskId: string, upload: Upload): Promise<TaskResult>
     }),
   );
   if (Either.isLeft(allocResult)) {
-    return {
-      kind: "failure",
-      error: `project timeline cap exceeded: would end at ${allocResult.left.projEnd}s (max ${MAX_PROJECT_TIMING_SEC}s)`,
-    };
+    return Either.left(
+      `project timeline cap exceeded: would end at ${allocResult.left.projEnd}s (max ${MAX_PROJECT_TIMING_SEC}s)`,
+    );
   }
-  return { kind: "success", audioId: allocResult.right.id };
+  return Either.right(undefined);
 }
 
 async function executeTask(taskId: string): Promise<void> {
@@ -411,18 +396,18 @@ async function executeTask(taskId: string): Promise<void> {
         ? await runVideoTask(task.id, upload)
         : await runAudioTask(task.id, upload);
   } catch (err) {
-    result = { kind: "failure", error: describeError(err) };
+    result = Either.left(describeError(err));
   }
 
   // success は run* 内で同 tx flip + chunk 削除済み。failure もここで同 tx にする
-  if (result.kind === "failure") {
+  if (Either.isLeft(result)) {
     const finishedAt = new Date();
     await prisma.$transaction([
       prisma.task.update({
         where: { id: task.id },
         data: {
           status: "failed",
-          error: result.error,
+          error: result.left,
           finishedAt,
           expireAt: new Date(finishedAt.getTime() + TASK_FAILURE_GRACE_MS),
         },
