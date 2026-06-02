@@ -271,19 +271,48 @@ describe("eagerCleanupAndUnmark", () => {
   });
 });
 
+async function makeGcTestProject(prefix: string): Promise<string> {
+  const user = await prisma.user.create({
+    data: { authentikSub: `${prefix}-${Math.random()}` },
+  });
+  const project = await prisma.project.create({ data: { userId: user.id, name: "p" } });
+  return project.id;
+}
+
+async function makeTaskWithUpload(pid: string, id: string, expireAt: Date | null): Promise<void> {
+  await prisma.upload.create({
+    data: {
+      id,
+      projectId: pid,
+      kind: "audio",
+      fileName: id,
+      totalBytes: 1n,
+      chunkSize: 1024,
+      totalChunks: 1,
+      expiresAt: new Date(Date.now() + 60_000),
+      status: "completed",
+    },
+  });
+  await prisma.uploadChunk.create({
+    data: { uploadId: id, index: 0, sizeBytes: 1n, s3Key: `${id}/0` },
+  });
+  await prisma.task.create({
+    data: {
+      id,
+      projectId: pid,
+      type: "audio_validation",
+      fileName: id,
+      status: expireAt ? "failed" : "running",
+      expireAt,
+    },
+  });
+}
+
 describe("cleanupAbandonedUploads", () => {
   useDbFixture();
 
-  async function makeProject(): Promise<string> {
-    const user = await prisma.user.create({
-      data: { authentikSub: `cleanup-test-${Math.random()}` },
-    });
-    const project = await prisma.project.create({ data: { userId: user.id, name: "p" } });
-    return project.id;
-  }
-
   it("expired pending と aborted な Upload を chunks ごと削除する", async () => {
-    const pid = await makeProject();
+    const pid = await makeGcTestProject("cleanup-test");
     const past = new Date(Date.now() - 1000);
     const future = new Date(Date.now() + 60_000);
     const expired = await prisma.upload.create({
@@ -336,45 +365,8 @@ describe("cleanupAbandonedUploads", () => {
 describe("cleanupExpiredTasks", () => {
   useDbFixture();
 
-  async function makeProject(): Promise<string> {
-    const user = await prisma.user.create({
-      data: { authentikSub: `expired-task-test-${Math.random()}` },
-    });
-    const project = await prisma.project.create({ data: { userId: user.id, name: "p" } });
-    return project.id;
-  }
-
-  async function makeTaskWithUpload(pid: string, id: string, expireAt: Date | null): Promise<void> {
-    await prisma.upload.create({
-      data: {
-        id,
-        projectId: pid,
-        kind: "audio",
-        fileName: id,
-        totalBytes: 1n,
-        chunkSize: 1024,
-        totalChunks: 1,
-        expiresAt: new Date(Date.now() + 60_000),
-        status: "completed",
-      },
-    });
-    await prisma.uploadChunk.create({
-      data: { uploadId: id, index: 0, sizeBytes: 1n, s3Key: `${id}/0` },
-    });
-    await prisma.task.create({
-      data: {
-        id,
-        projectId: pid,
-        type: "audio_validation",
-        fileName: id,
-        status: expireAt ? "failed" : "running",
-        expireAt,
-      },
-    });
-  }
-
   it("expireAt 過ぎた Task と shared id の Upload/chunk を消し、未来のものは残す", async () => {
-    const pid = await makeProject();
+    const pid = await makeGcTestProject("expired-task-test");
     const past = new Date(Date.now() - 1000);
     const future = new Date(Date.now() + 60_000);
     await makeTaskWithUpload(pid, "expired", past);

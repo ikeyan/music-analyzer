@@ -734,20 +734,60 @@ describe("POST /projects/:id/tasks/:taskId/dismiss", () => {
   });
 });
 
+async function makeProjectDetail(userSub: string, name: string): Promise<string> {
+  const user = await prisma.user.create({ data: { authentikSub: userSub } });
+  const project = await prisma.project.create({ data: { userId: user.id, name } });
+  return project.id;
+}
+
+function unwrapRight<R, E>(r: Either.Either<R, E>): R {
+  if (Either.isLeft(r)) throw new Error(`expected Right, got Left: ${JSON.stringify(r.left)}`);
+  return r.right;
+}
+
+// Video/Audio schema が wide なので test data はヘルパーで圧縮する。
+// order だけ可変、その他は最小限の satisfy で詰める
+const makeVideoData = (pid: string, id: string, order: number) => ({
+  id,
+  projectId: pid,
+  order,
+  name: id,
+  videoKey: id,
+  durationSec: 1,
+  width: 1,
+  height: 1,
+  fps: 1,
+  sizeBytes: 1n,
+  srcStartSec: 0,
+  srcEndSec: 1,
+  projStartSec: order,
+  projEndSec: order + 1,
+});
+const makeAudioData = (pid: string, id: string, order: number) => ({
+  id,
+  projectId: pid,
+  order,
+  name: id,
+  audioKey: id,
+  durationSec: 1,
+  sizeBytes: 1n,
+  srcStartSec: 0,
+  srcEndSec: 1,
+  projStartSec: order + 100,
+  projEndSec: order + 101,
+});
+const makeThumbnailData = (videoId: string, atSec: number) => ({
+  id: `t${videoId}-${atSec}`,
+  videoId,
+  atSec,
+  key: `k${atSec}`,
+  width: 1,
+  height: 1,
+});
+
 describe("requireProjectDetail", () => {
-  async function makeProject(userSub: string, name: string): Promise<string> {
-    const user = await prisma.user.create({ data: { authentikSub: userSub } });
-    const project = await prisma.project.create({ data: { userId: user.id, name } });
-    return project.id;
-  }
-
-  function unwrapRight<R, E>(r: Either.Either<R, E>): R {
-    if (Either.isLeft(r)) throw new Error(`expected Right, got Left: ${JSON.stringify(r.left)}`);
-    return r.right;
-  }
-
   it("returns Right with empty videos/audios/tasks arrays when none exist", async () => {
-    const pid = await makeProject("detail-empty", "empty");
+    const pid = await makeProjectDetail("detail-empty", "empty");
     const owner = await prisma.user.findFirstOrThrow({ where: { authentikSub: "detail-empty" } });
     const project = unwrapRight(
       await Effect.runPromise(Effect.either(requireProjectDetail(owner.id, pid))),
@@ -759,7 +799,7 @@ describe("requireProjectDetail", () => {
   });
 
   it("returns Left 404 when the project belongs to another user", async () => {
-    const pidA = await makeProject("detail-owner-a", "a");
+    const pidA = await makeProjectDetail("detail-owner-a", "a");
     const userB = await prisma.user.create({ data: { authentikSub: "detail-owner-b" } });
     const r = await Effect.runPromise(Effect.either(requireProjectDetail(userB.id, pidA)));
     expect(Either.isLeft(r)).toBe(true);
@@ -775,46 +815,6 @@ describe("requireProjectDetail", () => {
     if (Either.isLeft(r)) expect(r.left).toEqual({ status: 404, error: "project not found" });
   });
 
-  // Video/Audio schema が wide なので test data はヘルパーで圧縮する。
-  // order だけ可変、その他は最小限の satisfy で詰める
-  const v = (pid: string, id: string, order: number) => ({
-    id,
-    projectId: pid,
-    order,
-    name: id,
-    videoKey: id,
-    durationSec: 1,
-    width: 1,
-    height: 1,
-    fps: 1,
-    sizeBytes: 1n,
-    srcStartSec: 0,
-    srcEndSec: 1,
-    projStartSec: order,
-    projEndSec: order + 1,
-  });
-  const a = (pid: string, id: string, order: number) => ({
-    id,
-    projectId: pid,
-    order,
-    name: id,
-    audioKey: id,
-    durationSec: 1,
-    sizeBytes: 1n,
-    srcStartSec: 0,
-    srcEndSec: 1,
-    projStartSec: order + 100,
-    projEndSec: order + 101,
-  });
-  const t = (videoId: string, atSec: number) => ({
-    id: `t${videoId}-${atSec}`,
-    videoId,
-    atSec,
-    key: `k${atSec}`,
-    width: 1,
-    height: 1,
-  });
-
   // 性質: 入力順に関係なく order/atSec 昇順で返る。整数 orders / float atSec を任意配列で
   it("videos/audios は order asc、thumbnails は atSec asc で返る", async () => {
     await fc.assert(
@@ -827,11 +827,11 @@ describe("requireProjectDetail", () => {
         }),
         async (vOrders, aOrders, atSecs) => {
           const sub = `order-${crypto.randomUUID()}`;
-          const pid = await makeProject(sub, "p");
-          await prisma.video.createMany({ data: vOrders.map((o) => v(pid, `${pid}v${o}`, o)) });
-          await prisma.audio.createMany({ data: aOrders.map((o) => a(pid, `${pid}a${o}`, o)) });
+          const pid = await makeProjectDetail(sub, "p");
+          await prisma.video.createMany({ data: vOrders.map((o) => makeVideoData(pid, `${pid}v${o}`, o)) });
+          await prisma.audio.createMany({ data: aOrders.map((o) => makeAudioData(pid, `${pid}a${o}`, o)) });
           const vid = `${pid}v${vOrders[0]}`;
-          await prisma.thumbnail.createMany({ data: atSecs.map((s) => t(vid, s)) });
+          await prisma.thumbnail.createMany({ data: atSecs.map((s) => makeThumbnailData(vid, s)) });
           const owner = await prisma.user.findFirstOrThrow({ where: { authentikSub: sub } });
           const project = unwrapRight(
             await Effect.runPromise(Effect.either(requireProjectDetail(owner.id, pid))),
@@ -869,7 +869,7 @@ describe("requireProjectDetail", () => {
     await fc.assert(
       fc.asyncProperty(fc.array(taskGen, { minLength: 1, maxLength: 6 }), async (tasks) => {
         const sub = `filter-${crypto.randomUUID()}`;
-        const pid = await makeProject(sub, "p");
+        const pid = await makeProjectDetail(sub, "p");
         const now = Date.now();
         const rows = tasks.map(([status, dt], i) => ({
           id: `${pid}t${i}`,

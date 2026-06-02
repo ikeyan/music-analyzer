@@ -25,31 +25,31 @@ describe("leftErr", () => {
   });
 });
 
-describe("provideEitherJson", () => {
-  function app() {
-    return new Hono()
-      .use("*", provideEitherJson)
-      .get("/left", (c) => c.var.eitherJson(leftErr({ status: 404, error: "not found" })))
-      .get("/right", (c) => c.var.eitherJson(Either.right({ ok: true })))
-      .get("/left-with-extra", (c) =>
-        c.var.eitherJson(leftErr({ status: 409, error: "already aborted", uploadId: "u_1" })),
-      );
-  }
+function makeEitherJsonApp() {
+  return new Hono()
+    .use("*", provideEitherJson)
+    .get("/left", (c) => c.var.eitherJson(leftErr({ status: 404, error: "not found" })))
+    .get("/right", (c) => c.var.eitherJson(Either.right({ ok: true })))
+    .get("/left-with-extra", (c) =>
+      c.var.eitherJson(leftErr({ status: 409, error: "already aborted", uploadId: "u_1" })),
+    );
+}
 
+describe("provideEitherJson", () => {
   it("dispatches Left to c.json with status from e.status and the rest as body", async () => {
-    const res = await app().request("/left");
+    const res = await makeEitherJsonApp().request("/left");
     expect(res.status).toBe(404);
     expect(await res.json()).toEqual({ error: "not found" });
   });
 
   it("dispatches Right to c.json at 200", async () => {
-    const res = await app().request("/right");
+    const res = await makeEitherJsonApp().request("/right");
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ ok: true });
   });
 
   it("preserves extra properties of the error payload in the response body", async () => {
-    const res = await app().request("/left-with-extra");
+    const res = await makeEitherJsonApp().request("/left-with-extra");
     expect(res.status).toBe(409);
     expect(await res.json()).toEqual({ error: "already aborted", uploadId: "u_1" });
   });

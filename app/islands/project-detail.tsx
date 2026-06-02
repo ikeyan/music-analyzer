@@ -348,9 +348,10 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
         <span style={{ fontVariantNumeric: "tabular-nums" }}>
           {formatTime(currentTime)} / {formatTime(playEnd)}
         </span>
-        <label style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: "0.4rem" }}>
+        <label htmlFor="zoom-range" style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: "0.4rem" }}>
           ズーム
           <input
+            id="zoom-range"
             type="range"
             min={10}
             max={200}
@@ -928,7 +929,7 @@ function UploadField({
   return (
     <div>
       <label style={{ display: "inline-flex", alignItems: "center", gap: "0.5rem" }}>
-        <span>{label}</span>
+        {label}
         <input
           ref={ref}
           type="file"
@@ -970,8 +971,8 @@ function ModalShell({
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose]);
   return (
-    <div
-      role="dialog"
+    <dialog
+      open
       aria-modal="true"
       aria-label={title}
       style={{
@@ -981,6 +982,15 @@ function ModalShell({
         alignItems: "center",
         justifyContent: "center",
         zIndex: 100,
+        border: "none",
+        padding: 0,
+        margin: 0,
+        background: "transparent",
+        maxWidth: "none",
+        maxHeight: "none",
+        width: "100%",
+        height: "100%",
+        overflow: "visible",
       }}
     >
       <button
@@ -1025,7 +1035,7 @@ function ModalShell({
         </header>
         {children}
       </div>
-    </div>
+    </dialog>
   );
 }
 
@@ -1171,9 +1181,10 @@ function MediaEditDialog({
       <section style={dialogSectionStyle}>
         <h3 style={dialogH3Style}>移動・拡縮</h3>
         <div style={dialogRowStyle}>
-          <label style={dialogLabelStyle}>
+          <label htmlFor="edit-anchor" style={dialogLabelStyle}>
             基準
             <select
+              id="edit-anchor"
               value={anchorKey}
               onChange={(e) => setAnchorKey(e.target.value)}
               disabled={busy !== null}
@@ -1186,9 +1197,10 @@ function MediaEditDialog({
               ))}
             </select>
           </label>
-          <label style={dialogLabelStyle}>
+          <label htmlFor="edit-pattern" style={dialogLabelStyle}>
             配置
             <select
+              id="edit-pattern"
               value={pattern}
               onChange={(e) => setPattern(e.target.value as AlignPattern)}
               disabled={busy !== null}
@@ -1203,9 +1215,10 @@ function MediaEditDialog({
               </option>
             </select>
           </label>
-          <label style={dialogLabelStyle}>
+          <label htmlFor="edit-scale" style={dialogLabelStyle}>
             倍率
             <input
+              id="edit-scale"
               type="number"
               step="0.01"
               min="0"
@@ -1224,9 +1237,10 @@ function MediaEditDialog({
       <section style={dialogSectionStyle}>
         <h3 style={dialogH3Style}>直接入力</h3>
         <div style={dialogRowStyle}>
-          <label style={dialogLabelStyle}>
+          <label htmlFor="edit-proj-start" style={dialogLabelStyle}>
             projStartSec
             <input
+              id="edit-proj-start"
               type="number"
               step="0.001"
               min="0"
@@ -1236,9 +1250,10 @@ function MediaEditDialog({
               style={{ width: 120 }}
             />
           </label>
-          <label style={dialogLabelStyle}>
+          <label htmlFor="edit-proj-end" style={dialogLabelStyle}>
             projEndSec
             <input
+              id="edit-proj-end"
               type="number"
               step="0.001"
               min="0"
@@ -1336,9 +1351,10 @@ function MediaTrimDialog({
         全長 (durationSec): {t.durationSec.toFixed(3)}s
       </p>
       <div style={dialogRowStyle}>
-        <label style={dialogLabelStyle}>
+        <label htmlFor="trim-src-start" style={dialogLabelStyle}>
           srcStartSec
           <input
+            id="trim-src-start"
             type="number"
             step="0.001"
             min="0"
@@ -1349,9 +1365,10 @@ function MediaTrimDialog({
             style={{ width: 120 }}
           />
         </label>
-        <label style={dialogLabelStyle}>
+        <label htmlFor="trim-src-end" style={dialogLabelStyle}>
           srcEndSec
           <input
+            id="trim-src-end"
             type="number"
             step="0.001"
             min="0"

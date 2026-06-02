@@ -49,6 +49,7 @@ export default function ProjectList({ initial }: { initial: ProjectSummary[] }) 
       >
         <input
           type="text"
+          aria-label="新しいプロジェクト名"
           value={name}
           onChange={(e) => setName(e.target.value)}
           placeholder="新しいプロジェクト名"
