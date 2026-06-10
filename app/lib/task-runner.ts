@@ -1,6 +1,6 @@
 import { Either } from "effect";
 import { extname, join } from "node:path";
-import type { Upload } from "../generated/prisma/client";
+import type { Task, Upload } from "../generated/prisma/client";
 import { describeError } from "./error";
 import {
   MAX_DURATION_SEC,
@@ -17,10 +17,12 @@ import { prisma } from "./prisma";
 import { withSlotRetry } from "./prisma-retry";
 import { awaitAllOrAggregate } from "./promise";
 import { getS3 } from "./s3";
+import { runSpectrogramTask } from "./spectrogram-task";
 import {
   audioPrefix,
   audioRawKey,
   audioTranscodedKey,
+  spectrogramPrefix,
   uploadFile,
   uploadPrefix,
   videoAudioKey,
@@ -364,6 +366,38 @@ async function runAudioTask(taskId: string, upload: Upload): Promise<TaskResult>
   return Either.right(undefined);
 }
 
+// cqt_spectrogram は Upload を持たない。失敗時は Spectrogram も failed に倒し、
+// 書きかけの S3 prefix を eager に掃除する (mark は task 内で立っている)
+async function executeSpectrogramTask(task: Task): Promise<void> {
+  let result: Either.Either<void, string>;
+  try {
+    result = await runSpectrogramTask(task, TASK_GRACE_MS, TASK_SUCCESS_GRACE_MS);
+  } catch (err) {
+    result = Either.left(describeError(err));
+  }
+  if (Either.isLeft(result)) {
+    const finishedAt = new Date();
+    await prisma.$transaction([
+      prisma.task.update({
+        where: { id: task.id },
+        data: {
+          status: "failed",
+          error: result.left,
+          finishedAt,
+          expireAt: new Date(finishedAt.getTime() + TASK_FAILURE_GRACE_MS),
+        },
+      }),
+      prisma.spectrogram.updateMany({
+        where: { id: task.id, status: "pending" },
+        data: { status: "failed" },
+      }),
+    ]);
+    if (task.audioId) {
+      await eagerCleanupAndUnmark(spectrogramPrefix(task.projectId, task.audioId, task.id));
+    }
+  }
+}
+
 async function executeTask(taskId: string): Promise<void> {
   const claimed = await prisma.task.updateMany({
     where: { id: taskId, status: "pending" },
@@ -373,6 +407,10 @@ async function executeTask(taskId: string): Promise<void> {
 
   const task = await prisma.task.findUnique({ where: { id: taskId } });
   if (!task) return;
+  if (task.type === "cqt_spectrogram") {
+    await executeSpectrogramTask(task);
+    return;
+  }
   // Task.id === Upload.id 不変。Upload 不在は recovery 漏れか手動操作のみで実運用では起きない
   const upload = await prisma.upload.findUnique({ where: { id: task.id } });
   if (!upload) {
@@ -452,6 +490,12 @@ export function enqueueTask(taskId: string): void {
         .catch(() => {
           /* DB 自体が死亡なら recovery 任せ */
         });
+      await prisma.spectrogram
+        .updateMany({
+          where: { id: taskId, status: "pending" },
+          data: { status: "failed" },
+        })
+        .catch(() => {});
     } finally {
       inflight.delete(taskId);
     }
@@ -483,19 +527,29 @@ export async function recoverTasksOnStartup(): Promise<void> {
         },
       }),
       prisma.uploadChunk.deleteMany({ where: { uploadId: { in: orphanedIds } } }),
+      prisma.spectrogram.updateMany({
+        where: { id: { in: orphanedIds }, status: "pending" },
+        data: { status: "failed" },
+      }),
     ]);
     console.error(`task-runner: marked ${orphaned.length} orphaned tasks as failed`);
   }
   const pending = await prisma.task.findMany({
     where: { status: "pending" },
-    select: { id: true, projectId: true },
+    select: { id: true, projectId: true, type: true, audioId: true },
   });
   const refreshAt = new Date(Date.now() + TASK_GRACE_MS);
   for (const t of pending) {
-    await prisma.deletionMark.updateMany({
-      where: { prefix: uploadPrefix(t.projectId, t.id) },
-      data: { nextRetryAt: refreshAt },
-    });
+    const prefix =
+      t.type === "cqt_spectrogram"
+        ? t.audioId && spectrogramPrefix(t.projectId, t.audioId, t.id)
+        : uploadPrefix(t.projectId, t.id);
+    if (prefix) {
+      await prisma.deletionMark.updateMany({
+        where: { prefix },
+        data: { nextRetryAt: refreshAt },
+      });
+    }
     enqueueTask(t.id);
   }
 }

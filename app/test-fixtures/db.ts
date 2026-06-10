@@ -2,10 +2,11 @@ import { beforeAll, beforeEach } from "bun:test";
 import assert from "node:assert";
 import { prisma } from "../lib/prisma";
 
-// FK 順: thumbnail → video, audio, task → upload → uploadChunk, deletionMark → project → user
+// FK 順: thumbnail → video, spectrogram → audio, task → upload → uploadChunk, deletionMark → project → user
 export async function clearDb(): Promise<void> {
   await prisma.thumbnail.deleteMany();
   await prisma.video.deleteMany();
+  await prisma.spectrogram.deleteMany();
   await prisma.audio.deleteMany();
   await prisma.task.deleteMany();
   await prisma.uploadChunk.deleteMany();

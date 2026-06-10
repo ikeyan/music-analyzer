@@ -2,7 +2,14 @@ import { describe, expect, it } from "bun:test";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { useMediaFixture } from "../test-fixtures/media";
-import { extractAudio, extractThumbnails, ffprobe, transcodeAudio, transcodeVideo } from "./ffmpeg";
+import {
+  decodeAudioPcm,
+  extractAudio,
+  extractThumbnails,
+  ffprobe,
+  transcodeAudio,
+  transcodeVideo,
+} from "./ffmpeg";
 import { tempDir } from "./temp-dir";
 
 const getMedia = useMediaFixture();
@@ -115,5 +122,29 @@ describe("extractThumbnails", () => {
     expect(existsSync(thumbs[0]!.path)).toBe(true);
     expect(existsSync(thumbs[1]!.path)).toBe(true);
     expect(thumbs[0]?.width).toBe(320);
+  });
+});
+
+describe("decodeAudioPcm", () => {
+  it("440Hz 正弦波 wav を decode すると CQT の argmax が 440Hz bin になる", async () => {
+    const { computeCqt, cqtBinFrequency } = await import("./cqt");
+    const fs = 8000;
+    const samples = await decodeAudioPcm(getMedia().audioWav, fs);
+    expect(samples.length).toBeGreaterThan(fs * 0.9);
+    expect(samples.length).toBeLessThan(fs * 1.1);
+    const { magnitudes, frames, bins } = computeCqt(samples, {
+      sampleRate: fs,
+      binsPerOctave: 12,
+      octaves: 5,
+      fminHz: 55,
+      hop: 64,
+    });
+    const mid = Math.floor(frames / 2);
+    let best = 0;
+    for (let k = 1; k < bins; k++) {
+      if (magnitudes[mid * bins + k]! > magnitudes[mid * bins + best]!) best = k;
+    }
+    // 55 * 2^(36/12) = 440
+    expect(cqtBinFrequency(55, 12, best)).toBeCloseTo(440, 0);
   });
 });
