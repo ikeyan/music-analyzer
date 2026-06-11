@@ -401,23 +401,33 @@ async function executeSpectrogramTask(task: Task): Promise<void> {
   }
 }
 
-async function executeTask(taskId: string): Promise<void> {
+// pending → running の claim。0 行なら他所が実行済み (または行が消えた)
+async function claimTask(taskId: string): Promise<Task | null> {
   const claimed = await prisma.task.updateMany({
     where: { id: taskId, status: "pending" },
     data: { status: "running", startedAt: new Date() },
   });
-  if (claimed.count === 0) return;
+  if (claimed.count === 0) return null;
+  return await prisma.task.findUnique({ where: { id: taskId } });
+}
 
-  const task = await prisma.task.findUnique({ where: { id: taskId } });
-  if (!task) return;
-  if (task.type === "cqt_spectrogram") {
+async function executeTask(taskId: string): Promise<void> {
+  // claim 前に type だけ読む。CQT は queue 待ちの間 pending のまま残し、
+  // restart しても recovery が failed に倒さず再 enqueue できるようにする
+  const peek = await prisma.task.findUnique({
+    where: { id: taskId },
+    select: { type: true },
+  });
+  if (!peek) return;
+  if (peek.type === "cqt_spectrogram") {
     // CQT は in-process 計算で job ごとに PCM + CQT バッファを保持する。協調 yield で
     // 同一スレッドを分け合うだけなので並列化は peak メモリを増やすだけ → global に直列化
+    const run = async () => {
+      const task = await claimTask(taskId);
+      if (task) await executeSpectrogramTask(task);
+    };
     const prev = globalThis.__musicAnalyzerCqtChain ?? Promise.resolve();
-    const next = prev.then(
-      () => executeSpectrogramTask(task),
-      () => executeSpectrogramTask(task),
-    );
+    const next = prev.then(run, run);
     globalThis.__musicAnalyzerCqtChain = next.then(
       () => {},
       () => {},
@@ -425,6 +435,9 @@ async function executeTask(taskId: string): Promise<void> {
     await next;
     return;
   }
+
+  const task = await claimTask(taskId);
+  if (!task) return;
   // Task.id === Upload.id 不変。Upload 不在は recovery 漏れか手動操作のみで実運用では起きない
   const upload = await prisma.upload.findUnique({ where: { id: task.id } });
   if (!upload) {
