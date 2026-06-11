@@ -17,7 +17,13 @@
     "types": ["bun", "vite/client"],
     "baseUrl": ".",
     "paths": {
-      "@/*": ["./app/*"]
+      "@/*": ["./app/*"],
+      // globalStore の cache links 配下から import される react に @types が届かないため、
+      // 型解決だけ project の @types に固定する (react 19 は型非同梱)
+      "react": ["./node_modules/@types/react"],
+      "react/*": ["./node_modules/@types/react/*"],
+      "react-dom": ["./node_modules/@types/react-dom"],
+      "react-dom/*": ["./node_modules/@types/react-dom/*"]
     }
   },
   "include": ["app", "prisma", "scripts", ".claude/hooks", "vite.config.ts"]

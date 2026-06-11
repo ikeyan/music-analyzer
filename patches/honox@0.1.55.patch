@@ -1,0 +1,26 @@
+diff --git a/package.json b/package.json
+index 1a5cbfa7f852abbb4a68c1cf9347dec90323a851..abf94fd68df31e02178616ec0cd98ce57d65bbda 100644
+--- a/package.json
++++ b/package.json
+@@ -109,7 +109,8 @@
+     "@typescript-eslint/typescript-estree": "^8.19.0"
+   },
+   "peerDependencies": {
+-    "hono": ">=4.*"
++    "hono": ">=4.*",
++    "vite": "*"
+   },
+   "devDependencies": {
+     "@hono/eslint-config": "^1.1.1",
+@@ -135,5 +136,10 @@
+   },
+   "optionalDependencies": {
+     "@rollup/rollup-linux-x64-gnu": "^4.9.6"
++  },
++  "peerDependenciesMeta": {
++    "vite": {
++      "optional": true
++    }
+   }
+ }
+\ No newline at end of file

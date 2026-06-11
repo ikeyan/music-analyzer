@@ -1,6 +1,6 @@
 [install]
 linker = "isolated"
-globalStore = false
+globalStore = true
 
 [test]
 # 全 test 開始前に temp SQLite を作って prisma schema を push する。

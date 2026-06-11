@@ -3,6 +3,7 @@ FROM mwader/static-ffmpeg:7.1.1 AS ffmpeg
 FROM oven/bun:1.3.13 AS builder
 WORKDIR /app
 COPY package.json bun.lock ./
+COPY patches/ ./patches/
 RUN --mount=type=cache,target=/root/.bun/install/cache,sharing=locked \
     bun install --frozen-lockfile
 COPY prisma/ ./prisma/
