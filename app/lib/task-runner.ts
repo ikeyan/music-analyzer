@@ -411,7 +411,18 @@ async function executeTask(taskId: string): Promise<void> {
   const task = await prisma.task.findUnique({ where: { id: taskId } });
   if (!task) return;
   if (task.type === "cqt_spectrogram") {
-    await executeSpectrogramTask(task);
+    // CQT は in-process 計算で job ごとに PCM + CQT バッファを保持する。協調 yield で
+    // 同一スレッドを分け合うだけなので並列化は peak メモリを増やすだけ → global に直列化
+    const prev = globalThis.__musicAnalyzerCqtChain ?? Promise.resolve();
+    const next = prev.then(
+      () => executeSpectrogramTask(task),
+      () => executeSpectrogramTask(task),
+    );
+    globalThis.__musicAnalyzerCqtChain = next.then(
+      () => {},
+      () => {},
+    );
+    await next;
     return;
   }
   // Task.id === Upload.id 不変。Upload 不在は recovery 漏れか手動操作のみで実運用では起きない
@@ -461,10 +472,12 @@ async function executeTask(taskId: string): Promise<void> {
   await eagerCleanupAndUnmark(uploadPrefix(upload.projectId, upload.id));
 }
 
-// dev HMR / test 横断で重複起動しないよう inflight set を global に置く
+// dev HMR / test 横断で重複起動しないよう inflight set / CQT 直列化 chain を global に置く
 declare global {
   // eslint-disable-next-line no-var
   var __musicAnalyzerInflightTasks: Set<string> | undefined;
+  // eslint-disable-next-line no-var
+  var __musicAnalyzerCqtChain: Promise<void> | undefined;
 }
 const inflight =
   globalThis.__musicAnalyzerInflightTasks ??

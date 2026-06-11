@@ -8,8 +8,9 @@ export type SpectrogramSelection = { specId: string; mode: string };
 
 export const SPECTROGRAM_STRIP_HEIGHT = 128;
 const PREFETCH_PX = 256;
-const TILE_CACHE_MAX = 384;
-const CANVAS_CACHE_MAX = 128;
+// 1 エントリが最大 ~1MiB (タイル) / ~4MiB (canvas) になりうるのでバイト予算で LRU する
+const TILE_CACHE_MAX_BYTES = 64 << 20;
+const CANVAS_CACHE_MAX_BYTES = 96 << 20;
 const TILE_FAIL_COOLDOWN_MS = 10_000;
 
 const metaCache = new Map<string, Promise<SpectrogramMeta>>();
@@ -29,9 +30,21 @@ function fetchMeta(spec: ApiSpectrogram): Promise<SpectrogramMeta> {
 
 // タイルバイト列の共有キャッシュ。Map の挿入順を LRU として使う
 const tileBytes = new Map<string, Uint8Array>();
+let tileBytesTotal = 0;
 const tileInflight = new Set<string>();
 const tileFailedUntil = new Map<string, number>();
 const tileListeners = new Set<() => void>();
+
+function putTileBytes(url: string, data: Uint8Array): void {
+  tileBytes.set(url, data);
+  tileBytesTotal += data.byteLength;
+  while (tileBytesTotal > TILE_CACHE_MAX_BYTES) {
+    const oldest = tileBytes.entries().next().value;
+    if (!oldest) break;
+    tileBytes.delete(oldest[0]);
+    tileBytesTotal -= oldest[1].byteLength;
+  }
+}
 
 function getTileBytes(url: string): Uint8Array | null {
   const hit = tileBytes.get(url);
@@ -52,12 +65,7 @@ function getTileBytes(url: string): Uint8Array | null {
           return;
         }
         tileFailedUntil.delete(url);
-        tileBytes.set(url, new Uint8Array(await res.arrayBuffer()));
-        while (tileBytes.size > TILE_CACHE_MAX) {
-          const oldest = tileBytes.keys().next().value;
-          if (oldest === undefined) break;
-          tileBytes.delete(oldest);
-        }
+        putTileBytes(url, new Uint8Array(await res.arrayBuffer()));
         for (const l of tileListeners) l();
       } catch {
         tileFailedUntil.set(url, Date.now() + TILE_FAIL_COOLDOWN_MS);
@@ -101,6 +109,18 @@ function modeHarmonics(meta: SpectrogramMeta, mode: string): number[] {
 }
 
 const canvasCache = new Map<string, HTMLCanvasElement>();
+let canvasCacheBytes = 0;
+
+function putCanvas(key: string, canvas: HTMLCanvasElement): void {
+  canvasCache.set(key, canvas);
+  canvasCacheBytes += canvas.width * canvas.height * 4;
+  while (canvasCacheBytes > CANVAS_CACHE_MAX_BYTES) {
+    const oldest = canvasCache.entries().next().value;
+    if (!oldest) break;
+    canvasCache.delete(oldest[0]);
+    canvasCacheBytes -= oldest[1].width * oldest[1].height * 4;
+  }
+}
 
 // 必要タイルのバイト列が揃っていれば描画済み canvas を返す。未取得は fetch を蹴って null
 function renderTile(
@@ -157,12 +177,7 @@ function renderTile(
     }
   }
   ctx.putImageData(img, 0, 0);
-  canvasCache.set(cacheKey, canvas);
-  while (canvasCache.size > CANVAS_CACHE_MAX) {
-    const oldest = canvasCache.keys().next().value;
-    if (oldest === undefined) break;
-    canvasCache.delete(oldest);
-  }
+  putCanvas(cacheKey, canvas);
   return canvas;
 }
 
