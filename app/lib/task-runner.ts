@@ -1,6 +1,6 @@
 import { Either } from "effect";
 import { extname, join } from "node:path";
-import type { Upload } from "../generated/prisma/client";
+import type { Task, Upload } from "../generated/prisma/client";
 import { describeError } from "./error";
 import {
   MAX_DURATION_SEC,
@@ -17,10 +17,12 @@ import { prisma } from "./prisma";
 import { withSlotRetry } from "./prisma-retry";
 import { awaitAllOrAggregate } from "./promise";
 import { getS3 } from "./s3";
+import { runSpectrogramTask } from "./spectrogram-task";
 import {
   audioPrefix,
   audioRawKey,
   audioTranscodedKey,
+  spectrogramPrefix,
   uploadFile,
   uploadPrefix,
   videoAudioKey,
@@ -364,14 +366,77 @@ async function runAudioTask(taskId: string, upload: Upload): Promise<TaskResult>
   return Either.right(undefined);
 }
 
-async function executeTask(taskId: string): Promise<void> {
+// cqt_spectrogram は Upload を持たない。失敗時は Spectrogram も failed に倒し、
+// 書きかけの S3 prefix を eager に掃除する (mark は task 内で立っている)
+async function executeSpectrogramTask(task: Task): Promise<void> {
+  let result: Either.Either<void, string>;
+  try {
+    result = await runSpectrogramTask(task, TASK_GRACE_MS, TASK_SUCCESS_GRACE_MS);
+  } catch (err) {
+    result = Either.left(describeError(err));
+  }
+  if (Either.isLeft(result)) {
+    const finishedAt = new Date();
+    // audio/project DELETE が task/spectrogram 行ごと消すレースがあるので、
+    // 行不在で throw しない updateMany にして必ず eager 掃除まで到達させる
+    // (掃除し損ねても task 内で立てた spectrogramPrefix の mark を sweeper が拾う)
+    await prisma.$transaction([
+      prisma.task.updateMany({
+        where: { id: task.id },
+        data: {
+          status: "failed",
+          error: result.left,
+          finishedAt,
+          expireAt: new Date(finishedAt.getTime() + TASK_FAILURE_GRACE_MS),
+        },
+      }),
+      prisma.spectrogram.updateMany({
+        where: { id: task.id, status: "pending" },
+        data: { status: "failed" },
+      }),
+    ]);
+    if (task.audioId) {
+      await eagerCleanupAndUnmark(spectrogramPrefix(task.projectId, task.audioId, task.id));
+    }
+  }
+}
+
+// pending → running の claim。0 行なら他所が実行済み (または行が消えた)
+async function claimTask(taskId: string): Promise<Task | null> {
   const claimed = await prisma.task.updateMany({
     where: { id: taskId, status: "pending" },
     data: { status: "running", startedAt: new Date() },
   });
-  if (claimed.count === 0) return;
+  if (claimed.count === 0) return null;
+  return await prisma.task.findUnique({ where: { id: taskId } });
+}
 
-  const task = await prisma.task.findUnique({ where: { id: taskId } });
+async function executeTask(taskId: string): Promise<void> {
+  // claim 前に type だけ読む。CQT は queue 待ちの間 pending のまま残し、
+  // restart しても recovery が failed に倒さず再 enqueue できるようにする
+  const peek = await prisma.task.findUnique({
+    where: { id: taskId },
+    select: { type: true },
+  });
+  if (!peek) return;
+  if (peek.type === "cqt_spectrogram") {
+    // CQT は in-process 計算で job ごとに PCM + CQT バッファを保持する。協調 yield で
+    // 同一スレッドを分け合うだけなので並列化は peak メモリを増やすだけ → global に直列化
+    const run = async () => {
+      const task = await claimTask(taskId);
+      if (task) await executeSpectrogramTask(task);
+    };
+    const prev = globalThis.__musicAnalyzerCqtChain ?? Promise.resolve();
+    const next = prev.then(run, run);
+    globalThis.__musicAnalyzerCqtChain = next.then(
+      () => {},
+      () => {},
+    );
+    await next;
+    return;
+  }
+
+  const task = await claimTask(taskId);
   if (!task) return;
   // Task.id === Upload.id 不変。Upload 不在は recovery 漏れか手動操作のみで実運用では起きない
   const upload = await prisma.upload.findUnique({ where: { id: task.id } });
@@ -420,10 +485,12 @@ async function executeTask(taskId: string): Promise<void> {
   await eagerCleanupAndUnmark(uploadPrefix(upload.projectId, upload.id));
 }
 
-// dev HMR / test 横断で重複起動しないよう inflight set を global に置く
+// dev HMR / test 横断で重複起動しないよう inflight set / CQT 直列化 chain を global に置く
 declare global {
   // eslint-disable-next-line no-var
   var __musicAnalyzerInflightTasks: Set<string> | undefined;
+  // eslint-disable-next-line no-var
+  var __musicAnalyzerCqtChain: Promise<void> | undefined;
 }
 const inflight =
   globalThis.__musicAnalyzerInflightTasks ??
@@ -452,6 +519,12 @@ export function enqueueTask(taskId: string): void {
         .catch(() => {
           /* DB 自体が死亡なら recovery 任せ */
         });
+      await prisma.spectrogram
+        .updateMany({
+          where: { id: taskId, status: "pending" },
+          data: { status: "failed" },
+        })
+        .catch(() => {});
     } finally {
       inflight.delete(taskId);
     }
@@ -483,19 +556,29 @@ export async function recoverTasksOnStartup(): Promise<void> {
         },
       }),
       prisma.uploadChunk.deleteMany({ where: { uploadId: { in: orphanedIds } } }),
+      prisma.spectrogram.updateMany({
+        where: { id: { in: orphanedIds }, status: "pending" },
+        data: { status: "failed" },
+      }),
     ]);
     console.error(`task-runner: marked ${orphaned.length} orphaned tasks as failed`);
   }
   const pending = await prisma.task.findMany({
     where: { status: "pending" },
-    select: { id: true, projectId: true },
+    select: { id: true, projectId: true, type: true, audioId: true },
   });
   const refreshAt = new Date(Date.now() + TASK_GRACE_MS);
   for (const t of pending) {
-    await prisma.deletionMark.updateMany({
-      where: { prefix: uploadPrefix(t.projectId, t.id) },
-      data: { nextRetryAt: refreshAt },
-    });
+    const prefix =
+      t.type === "cqt_spectrogram"
+        ? t.audioId && spectrogramPrefix(t.projectId, t.audioId, t.id)
+        : uploadPrefix(t.projectId, t.id);
+    if (prefix) {
+      await prisma.deletionMark.updateMany({
+        where: { prefix },
+        data: { nextRetryAt: refreshAt },
+      });
+    }
     enqueueTask(t.id);
   }
 }

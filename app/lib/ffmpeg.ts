@@ -199,6 +199,45 @@ export async function extractAudio(
 
 export const transcodeAudio = extractAudio;
 
+// mono f32le PCM へデコード (CQT 解析用)
+export async function decodeAudioPcm(
+  input: string,
+  sampleRate: number,
+  signal?: AbortSignal,
+): Promise<Float32Array<ArrayBuffer>> {
+  if (signal?.aborted) throw new Error("ffmpeg aborted before start");
+  const proc = Bun.spawn(
+    [
+      FFMPEG,
+      "-hide_banner",
+      "-loglevel",
+      "error",
+      "-i",
+      input,
+      "-vn",
+      "-ac",
+      "1",
+      "-ar",
+      String(sampleRate),
+      "-f",
+      "f32le",
+      "-",
+    ],
+    { stdout: "pipe", stderr: "pipe" },
+  );
+  using _abort = signal ? addAbortListener(signal, () => proc.kill()) : null;
+  const [buf, stderr, exitCode] = await Promise.all([
+    new Response(proc.stdout).arrayBuffer(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ]);
+  if (signal?.aborted) throw new Error("ffmpeg aborted");
+  if (exitCode !== 0) {
+    throw new Error(`ffmpeg pcm decode failed (exit ${exitCode}): ${stderr.slice(0, 1000)}`);
+  }
+  return new Float32Array(buf, 0, Math.floor(buf.byteLength / 4));
+}
+
 // HTMLMediaElement が再生しうる codec / container の許容セット
 const BROWSER_AUDIO_CODECS = new Set([
   "aac",

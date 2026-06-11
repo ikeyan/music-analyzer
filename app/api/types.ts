@@ -1,11 +1,21 @@
 // API レスポンス用の DTO。Prisma 行をこれに射影してから c.json で返すと、
 // bigint が JSON に乗らず Hono RPC の型推論も全フィールドにつく
-import type { Audio, Project, Task, Thumbnail, Upload, Video } from "../generated/prisma/client";
+import type {
+  Audio,
+  Project,
+  Spectrogram,
+  Task,
+  Thumbnail,
+  Upload,
+  Video,
+} from "../generated/prisma/client";
+import { parseHarmonics } from "../lib/spectrogram";
 
 const UPLOAD_KINDS = ["video", "audio"] as const;
 const UPLOAD_STATUSES = ["pending", "completed", "aborted"] as const;
-const TASK_TYPES = ["video_validation", "audio_validation"] as const;
+const TASK_TYPES = ["video_validation", "audio_validation", "cqt_spectrogram"] as const;
 const TASK_STATUSES = ["pending", "running", "succeeded", "failed"] as const;
+const SPECTROGRAM_STATUSES = ["pending", "ready", "failed"] as const;
 
 function assertIn<T extends string>(
   v: string,
@@ -50,6 +60,21 @@ export type ApiVideo = {
   thumbnails: ApiThumbnail[];
 };
 
+export type ApiSpectrogram = {
+  id: string;
+  audioId: string;
+  status: "pending" | "ready" | "failed";
+  binsPerOctave: number;
+  octaves: number;
+  fminHz: number;
+  harmonics: number[];
+  createdAt: string;
+  updatedAt: string;
+  metaUrl: string;
+  // `${tileUrlBase}/${harmonic}/${level}/${index}` がタイル endpoint
+  tileUrlBase: string;
+};
+
 export type ApiAudio = {
   id: string;
   projectId: string;
@@ -71,6 +96,7 @@ export type ApiAudio = {
   updatedAt: string;
   streamUrl: string;
   rawUrl: string | null;
+  spectrograms: ApiSpectrogram[];
 };
 
 export type ApiProject = {
@@ -112,8 +138,8 @@ export type ApiUpload = {
 export type ApiTask = {
   id: string;
   projectId: string;
-  type: "video_validation" | "audio_validation";
-  kind: "video" | "audio";
+  type: "video_validation" | "audio_validation" | "cqt_spectrogram";
+  kind: "video" | "audio" | "spectrogram";
   status: "pending" | "running" | "succeeded" | "failed";
   error: string | null;
   fileName: string;
@@ -163,7 +189,25 @@ export function toApiVideo(v: Video & { thumbnails: Thumbnail[] }): ApiVideo {
   };
 }
 
-export function toApiAudio(a: Audio): ApiAudio {
+export function toApiSpectrogram(projectId: string, s: Spectrogram): ApiSpectrogram {
+  assertIn(s.status, SPECTROGRAM_STATUSES, "Spectrogram.status");
+  const base = `/api/projects/${projectId}/audios/${s.audioId}/spectrograms/${s.id}`;
+  return {
+    id: s.id,
+    audioId: s.audioId,
+    status: s.status,
+    binsPerOctave: s.binsPerOctave,
+    octaves: s.octaves,
+    fminHz: s.fminHz,
+    harmonics: parseHarmonics(s.harmonics),
+    createdAt: s.createdAt.toISOString(),
+    updatedAt: s.updatedAt.toISOString(),
+    metaUrl: `${base}/meta`,
+    tileUrlBase: `${base}/tiles`,
+  };
+}
+
+export function toApiAudio(a: Audio & { spectrograms: Spectrogram[] }): ApiAudio {
   return {
     id: a.id,
     projectId: a.projectId,
@@ -185,6 +229,7 @@ export function toApiAudio(a: Audio): ApiAudio {
     updatedAt: a.updatedAt.toISOString(),
     streamUrl: `/api/projects/${a.projectId}/audios/${a.id}/stream`,
     rawUrl: a.rawKey ? `/api/projects/${a.projectId}/audios/${a.id}/raw` : null,
+    spectrograms: a.spectrograms.map((s) => toApiSpectrogram(a.projectId, s)),
   };
 }
 
@@ -201,7 +246,7 @@ export function toApiProject(p: Project): ApiProject {
 export function toApiProjectDetail(
   p: Project & {
     videos: (Video & { thumbnails: Thumbnail[] })[];
-    audios: Audio[];
+    audios: (Audio & { spectrograms: Spectrogram[] })[];
     tasks: Task[];
   },
 ): ApiProjectDetail {
@@ -250,7 +295,12 @@ export function toApiTask(t: Task): ApiTask {
     id: t.id,
     projectId: t.projectId,
     type: t.type,
-    kind: t.type === "video_validation" ? "video" : "audio",
+    kind:
+      t.type === "video_validation"
+        ? "video"
+        : t.type === "audio_validation"
+          ? "audio"
+          : "spectrogram",
     status: t.status,
     error: t.error,
     fileName: t.fileName,

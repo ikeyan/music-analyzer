@@ -11,6 +11,7 @@ WORKDIR /app
 
 # Install deps first for better layer caching.
 COPY package.json bun.lock ./
+COPY patches/ ./patches/
 RUN --mount=type=cache,target=/root/.bun/install/cache,sharing=locked \
     bun install --frozen-lockfile
 

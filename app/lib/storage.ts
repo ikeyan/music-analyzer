@@ -22,6 +22,20 @@ export const audioRawKey = (projectId: string, audioId: string, ext: string) =>
   `${audioPrefix(projectId, audioId)}raw.${ext.replace(/^\./, "")}`;
 export const audioTranscodedKey = (projectId: string, audioId: string) =>
   `${audioPrefix(projectId, audioId)}transcoded.m4a`;
+export const spectrogramPrefix = (projectId: string, audioId: string, specId: string) =>
+  `${audioPrefix(projectId, audioId)}spectrograms/${specId}/`;
+export const spectrogramMetaKey = (projectId: string, audioId: string, specId: string) =>
+  `${spectrogramPrefix(projectId, audioId, specId)}meta.json`;
+export const spectrogramTileKey = (
+  projectId: string,
+  audioId: string,
+  specId: string,
+  harmonic: number,
+  level: number,
+  index: number,
+) =>
+  `${spectrogramPrefix(projectId, audioId, specId)}tiles/h${harmonic}/${level}/${String(index).padStart(6, "0")}.bin`;
+
 // retry は別 key を書いて DB tx で promote するため writeId で unique 化
 export const uploadChunkKey = (
   projectId: string,
@@ -32,6 +46,14 @@ export const uploadChunkKey = (
 
 export async function uploadFile(key: string, path: string, contentType: string): Promise<void> {
   await getS3().write(key, Bun.file(path), { type: contentType });
+}
+
+export async function uploadBytes(
+  key: string,
+  data: Uint8Array<ArrayBuffer>,
+  contentType: string,
+): Promise<void> {
+  await getS3().write(key, data, { type: contentType });
 }
 
 // Bun.serve 経由の Request では S3Client.write の戻り値 size が常に 0 を返すバグの

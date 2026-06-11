@@ -18,8 +18,18 @@ import {
 } from "../lib/prisma-tx";
 import { getS3 } from "../lib/s3";
 import {
+  MAX_SPECTROGRAM_BINS,
+  MAX_SPECTROGRAM_FMAX_HZ,
+  MAX_SPECTROGRAM_HARMONICS,
+  MIN_SPECTROGRAM_FMIN_HZ,
+  parseHarmonics,
+} from "../lib/spectrogram";
+import {
   audioPrefix,
   projectPrefix,
+  spectrogramMetaKey,
+  spectrogramPrefix,
+  spectrogramTileKey,
   streamS3,
   uploadChunkKey,
   uploadPrefix,
@@ -32,6 +42,7 @@ import {
   type ApiProject,
   type ApiProjectDetail,
   type ApiProjectSummary,
+  type ApiSpectrogram,
   type ApiTask,
   type ApiUpload,
   type ApiVideo,
@@ -39,6 +50,7 @@ import {
   toApiProject,
   toApiProjectDetail,
   toApiProjectSummary,
+  toApiSpectrogram,
   toApiTask,
   toApiUpload,
   toApiVideo,
@@ -63,6 +75,19 @@ const uploadChunkParamSchema = v.object({
   index: v.string(),
 });
 const taskIdParamSchema = v.object({ id: v.string(), taskId: v.string() });
+const spectrogramIdParamSchema = v.object({
+  id: v.string(),
+  audioId: v.string(),
+  specId: v.string(),
+});
+const spectrogramTileParamSchema = v.object({
+  id: v.string(),
+  audioId: v.string(),
+  specId: v.string(),
+  harmonic: v.string(),
+  level: v.string(),
+  index: v.string(),
+});
 
 const createProjectSchema = v.object({
   name: v.pipe(v.string(), v.trim(), v.minLength(1)),
@@ -84,6 +109,28 @@ const createUploadSchema = v.object({
     v.pipe(v.number(), v.integer(), v.minValue(MIN_CHUNK_SIZE), v.maxValue(MAX_CHUNK_SIZE)),
   ),
 });
+
+const createSpectrogramSchema = v.pipe(
+  v.object({
+    binsPerOctave: v.pipe(v.number(), v.integer(), v.minValue(1), v.maxValue(96)),
+    octaves: v.pipe(v.number(), v.integer(), v.minValue(1), v.maxValue(10)),
+    fminHz: v.pipe(v.number(), v.finite(), v.minValue(MIN_SPECTROGRAM_FMIN_HZ), v.maxValue(4000)),
+    harmonics: v.pipe(
+      v.array(v.pipe(v.number(), v.integer(), v.minValue(1), v.maxValue(16))),
+      v.minLength(1),
+      v.maxLength(MAX_SPECTROGRAM_HARMONICS),
+    ),
+  }),
+  v.check((d) => new Set(d.harmonics).size === d.harmonics.length, "harmonics must be unique"),
+  v.check(
+    (d) => d.binsPerOctave * d.octaves <= MAX_SPECTROGRAM_BINS,
+    `binsPerOctave * octaves must be <= ${MAX_SPECTROGRAM_BINS}`,
+  ),
+  v.check(
+    (d) => d.fminHz * 2 ** d.octaves * Math.max(...d.harmonics) <= MAX_SPECTROGRAM_FMAX_HZ,
+    `fminHz * 2^octaves * max(harmonics) must be <= ${MAX_SPECTROGRAM_FMAX_HZ}`,
+  ),
+);
 
 // 反転は projStart > projEnd で表現するため proj 側に大小制約は置かない。
 // src は正方向のみで、durationSec 超過は row 取得後に handler 側で検証する
@@ -156,6 +203,24 @@ function requireAudio(projectId: string, audioId: string) {
   );
 }
 
+function requireSpectrogram(audioId: string, specId: string) {
+  return pipe(
+    Effect.promise(() => prisma.spectrogram.findFirst({ where: { id: specId, audioId } })),
+    Effect.flatMap(found({ status: 404, error: "spectrogram not found" })),
+  );
+}
+
+function requireReadySpectrogram(audioId: string, specId: string) {
+  return pipe(
+    requireSpectrogram(audioId, specId),
+    Effect.flatMap((s) =>
+      s.status === "ready"
+        ? Either.right(s)
+        : leftErr({ status: 409, error: `spectrogram is ${s.status}` }),
+    ),
+  );
+}
+
 function requireThumbnail(projectId: string, thumbId: string) {
   return pipe(
     Effect.promise(() =>
@@ -177,7 +242,10 @@ export function requireProjectDetail(userId: string, projectId: string) {
             orderBy: { order: "asc" },
             include: { thumbnails: { orderBy: { atSec: "asc" } } },
           },
-          audios: { orderBy: { order: "asc" } },
+          audios: {
+            orderBy: { order: "asc" },
+            include: { spectrograms: { orderBy: { createdAt: "asc" } } },
+          },
           tasks: {
             where: {
               OR: [
@@ -236,6 +304,7 @@ export const projects = new Hono()
             prisma.upload.deleteMany({ where: { projectId: project.id } }),
             prisma.thumbnail.deleteMany({ where: { video: { projectId: project.id } } }),
             prisma.video.deleteMany({ where: { projectId: project.id } }),
+            prisma.spectrogram.deleteMany({ where: { audio: { projectId: project.id } } }),
             prisma.audio.deleteMany({ where: { projectId: project.id } }),
             prisma.project.delete({ where: { id: project.id } }),
           ]);
@@ -901,6 +970,8 @@ export const projects = new Hono()
               const prefix = audioPrefix(project.id, audio.id);
               await prisma.$transaction([
                 prisma.deletionMark.create({ data: { prefix } }),
+                prisma.task.deleteMany({ where: { audioId: audio.id, type: "cqt_spectrogram" } }),
+                prisma.spectrogram.deleteMany({ where: { audioId: audio.id } }),
                 prisma.audio.delete({ where: { id: audio.id } }),
               ]);
               await eagerCleanupAndUnmark(prefix);
@@ -974,7 +1045,10 @@ export const projects = new Hono()
                           });
                         }
                         return yield* Effect.promise(() =>
-                          tx.audio.findUniqueOrThrow({ where: { id: audioId } }),
+                          tx.audio.findUniqueOrThrow({
+                            where: { id: audioId },
+                            include: { spectrograms: { orderBy: { createdAt: "asc" } } },
+                          }),
                         );
                       }),
                     ),
@@ -1028,6 +1102,210 @@ export const projects = new Hono()
       ),
       Effect.runPromise,
     );
-  });
+  })
+
+  .get("/:id/audios/:audioId/spectrograms", vValidator("param", audioIdParamSchema), (c) => {
+    const { id, audioId } = c.req.valid("param");
+    return pipe(
+      requireProject(c.var.user.id, id),
+      Effect.flatMap((project) => requireAudio(project.id, audioId)),
+      Effect.flatMap((audio) =>
+        Effect.promise(() =>
+          prisma.spectrogram.findMany({
+            where: { audioId: audio.id },
+            orderBy: { createdAt: "asc" },
+          }),
+        ),
+      ),
+      Effect.map((specs) => ({
+        spectrograms: specs.map((s) => toApiSpectrogram(id, s)) satisfies ApiSpectrogram[],
+      })),
+      Effect.either,
+      Effect.map((r) => c.var.eitherJson(r)),
+      Effect.runPromise,
+    );
+  })
+
+  .post(
+    "/:id/audios/:audioId/spectrograms",
+    vValidator("param", audioIdParamSchema),
+    vValidator("json", createSpectrogramSchema),
+    (c) => {
+      const { id, audioId } = c.req.valid("param");
+      const body = c.req.valid("json");
+      return pipe(
+        requireProject(c.var.user.id, id),
+        Effect.flatMap((project) => requireAudio(project.id, audioId)),
+        Effect.flatMap((audio) =>
+          Effect.promise(async () => {
+            // Spectrogram.id === Task.id (Upload と同じ共有 id パターン)
+            const specId = crypto.randomUUID();
+            const [spec, task] = await prisma.$transaction([
+              prisma.spectrogram.create({
+                data: {
+                  id: specId,
+                  audioId: audio.id,
+                  binsPerOctave: body.binsPerOctave,
+                  octaves: body.octaves,
+                  fminHz: body.fminHz,
+                  harmonics: JSON.stringify(body.harmonics.toSorted((a, b) => a - b)),
+                },
+              }),
+              prisma.task.create({
+                data: {
+                  id: specId,
+                  projectId: audio.projectId,
+                  type: "cqt_spectrogram",
+                  fileName: audio.name,
+                  audioId: audio.id,
+                  status: "pending",
+                },
+              }),
+            ]);
+            enqueueTask(task.id);
+            return { spectrogram: toApiSpectrogram(audio.projectId, spec), task: toApiTask(task) };
+          }),
+        ),
+        Effect.mapBoth({
+          onSuccess: (r) => c.json(r satisfies { spectrogram: ApiSpectrogram; task: ApiTask }, 201),
+          onFailure: (err) => c.var.eitherJson(leftErr(err)),
+        }),
+        Effect.merge,
+        Effect.runPromise,
+      );
+    },
+  )
+
+  // pending (task 走行中) は拒否。terminal のみ claim-first で削除し S3 は mark + eager 掃除
+  .delete(
+    "/:id/audios/:audioId/spectrograms/:specId",
+    vValidator("param", spectrogramIdParamSchema),
+    (c) => {
+      const { id, audioId, specId } = c.req.valid("param");
+      return pipe(
+        requireProject(c.var.user.id, id),
+        Effect.flatMap((project) =>
+          pipe(
+            requireAudio(project.id, audioId),
+            Effect.flatMap((audio) =>
+              pipe(
+                txEither((tx) =>
+                  Effect.gen(function* () {
+                    const deleted = yield* Effect.promise(() =>
+                      tx.spectrogram.deleteMany({
+                        where: {
+                          id: specId,
+                          audioId: audio.id,
+                          status: { in: ["ready", "failed"] },
+                        },
+                      }),
+                    );
+                    if (deleted.count === 0) {
+                      const spec = yield* requireSpectrogram(audio.id, specId);
+                      return yield* leftErr({
+                        status: 409,
+                        error: `cannot delete: spectrogram is ${spec.status}`,
+                      });
+                    }
+                    yield* Effect.promise(() => tx.task.deleteMany({ where: { id: specId } }));
+                    yield* Effect.promise(() =>
+                      tx.deletionMark.create({
+                        data: { prefix: spectrogramPrefix(project.id, audio.id, specId) },
+                      }),
+                    );
+                  }),
+                ),
+                Effect.flatMap(() =>
+                  Effect.promise(() =>
+                    eagerCleanupAndUnmark(spectrogramPrefix(project.id, audio.id, specId)),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+        Effect.mapBoth({
+          onSuccess: () => c.body(null, 204),
+          onFailure: (err) => c.var.eitherJson(leftErr(err)),
+        }),
+        Effect.merge,
+        Effect.runPromise,
+      );
+    },
+  )
+
+  .get(
+    "/:id/audios/:audioId/spectrograms/:specId/meta",
+    vValidator("param", spectrogramIdParamSchema),
+    (c) => {
+      const { id, audioId, specId } = c.req.valid("param");
+      return pipe(
+        requireProject(c.var.user.id, id),
+        Effect.flatMap((project) => requireAudio(project.id, audioId)),
+        Effect.flatMap((audio) => requireReadySpectrogram(audio.id, specId)),
+        Effect.either,
+        Effect.flatMap((r) =>
+          Either.isLeft(r)
+            ? Effect.sync(() => c.var.eitherJson(r))
+            : Effect.promise(async () => {
+                const res = await streamS3(
+                  c,
+                  spectrogramMetaKey(id, audioId, specId),
+                  "application/json",
+                );
+                res.headers.set("cache-control", "private, max-age=31536000, immutable");
+                return res;
+              }),
+        ),
+        Effect.runPromise,
+      );
+    },
+  )
+
+  .get(
+    "/:id/audios/:audioId/spectrograms/:specId/tiles/:harmonic/:level/:index",
+    vValidator("param", spectrogramTileParamSchema),
+    (c) => {
+      const { id, audioId, specId, harmonic, level, index } = c.req.valid("param");
+      const h = Number(harmonic);
+      const lv = Number(level);
+      const idx = Number(index);
+      if (
+        !Number.isInteger(h) ||
+        h < 1 ||
+        !Number.isInteger(lv) ||
+        lv < 0 ||
+        !Number.isInteger(idx) ||
+        idx < 0
+      ) {
+        return c.json({ error: "harmonic/level/index must be non-negative integers" }, 400);
+      }
+      return pipe(
+        requireProject(c.var.user.id, id),
+        Effect.flatMap((project) => requireAudio(project.id, audioId)),
+        Effect.flatMap((audio) => requireReadySpectrogram(audio.id, specId)),
+        Effect.flatMap((spec) =>
+          parseHarmonics(spec.harmonics).includes(h)
+            ? Either.right(spec)
+            : leftErr({ status: 404, error: `harmonic ${h} not in spectrogram` }),
+        ),
+        Effect.either,
+        Effect.flatMap((r) =>
+          Either.isLeft(r)
+            ? Effect.sync(() => c.var.eitherJson(r))
+            : Effect.promise(async () => {
+                const res = await streamS3(
+                  c,
+                  spectrogramTileKey(id, audioId, specId, h, lv, idx),
+                  "application/octet-stream",
+                );
+                res.headers.set("cache-control", "private, max-age=31536000, immutable");
+                return res;
+              }),
+        ),
+        Effect.runPromise,
+      );
+    },
+  );
 
 export type ProjectsAppType = typeof projects;

@@ -7,7 +7,23 @@ import {
   useRef,
   useState,
 } from "react";
-import type { ApiAudio, ApiProjectDetail, ApiTask, ApiThumbnail, ApiVideo } from "../api/types";
+import type {
+  ApiAudio,
+  ApiProjectDetail,
+  ApiSpectrogram,
+  ApiTask,
+  ApiThumbnail,
+  ApiVideo,
+} from "../api/types";
+import {
+  HarmonicLens,
+  type LensHover,
+  SPECTROGRAM_STRIP_HEIGHT,
+  type SpectrogramCreateParams,
+  SpectrogramDialogBody,
+  type SpectrogramSelection,
+  SpectrogramStrip,
+} from "../components/spectrogram";
 import { apiClient } from "../lib/api-client";
 import { chunkedUpload } from "../lib/chunked-upload";
 
@@ -43,6 +59,10 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
   const [error, setError] = useState<string | null>(null);
   const [editing, setEditing] = useState<TrackRef | null>(null);
   const [trimming, setTrimming] = useState<TrackRef | null>(null);
+  const [specDialog, setSpecDialog] = useState<string | null>(null);
+  const [specViews, setSpecViews] = useState<Record<string, SpectrogramSelection | undefined>>({});
+  // harmonic CQT lens: spectrogram 表示中の audio 行を hover している間だけ出す
+  const [lens, setLens] = useState<(LensHover & { audioId: string }) | null>(null);
 
   const tracks: Track[] = useMemo(() => {
     const all: Track[] = [
@@ -61,6 +81,33 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
     [tracks],
   );
   const displayDuration = useMemo(() => Math.max(60, playEnd), [playEnd]);
+
+  // spectrogram の lazy load 用に横スクロール viewport を追跡する (rAF で間引き)
+  const scrollBoxRef = useRef<HTMLDivElement | null>(null);
+  const [viewport, setViewport] = useState({ left: 0, width: 1200 });
+  useEffect(() => {
+    const el = scrollBoxRef.current;
+    if (!el) return;
+    let raf: number | null = null;
+    const measure = () => {
+      raf = null;
+      setViewport((prev) => {
+        const next = { left: el.scrollLeft, width: el.clientWidth };
+        return prev.left === next.left && prev.width === next.width ? prev : next;
+      });
+    };
+    const schedule = () => {
+      if (raf === null) raf = requestAnimationFrame(measure);
+    };
+    measure();
+    el.addEventListener("scroll", schedule, { passive: true });
+    window.addEventListener("resize", schedule);
+    return () => {
+      if (raf !== null) cancelAnimationFrame(raf);
+      el.removeEventListener("scroll", schedule);
+      window.removeEventListener("resize", schedule);
+    };
+  }, []);
 
   const mediaRefs = useRef(new Map<string, HTMLMediaElement>());
   const lastTickRef = useRef<number | null>(null);
@@ -269,6 +316,43 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
     return { ok: true };
   }
 
+  async function createSpectrogram(
+    audioId: string,
+    params: SpectrogramCreateParams,
+  ): Promise<{ ok: true } | { error: string }> {
+    const res = await apiClient.projects[":id"].audios[":audioId"].spectrograms.$post({
+      param: { id: data.id, audioId },
+      json: params,
+    });
+    if (!res.ok) {
+      const body = (await res.json().catch(() => ({}))) as { error?: string };
+      return { error: `CQT 生成開始失敗 (HTTP ${res.status}): ${body.error ?? "(no message)"}` };
+    }
+    const body = await res.json();
+    // refresh 失敗時も polling effect が動くよう task を直接 seed (uploadMedia と同じ)
+    setData((d) => ({
+      ...d,
+      tasks: [body.task, ...d.tasks.filter((t) => t.id !== body.task.id)],
+    }));
+    await refresh();
+    return { ok: true };
+  }
+
+  async function deleteSpectrogram(
+    audioId: string,
+    specId: string,
+  ): Promise<{ ok: true } | { error: string }> {
+    const res = await apiClient.projects[":id"].audios[":audioId"].spectrograms[":specId"].$delete({
+      param: { id: data.id, audioId, specId },
+    });
+    if (!res.ok) {
+      const body = (await res.json().catch(() => ({}))) as { error?: string };
+      return { error: `削除失敗 (HTTP ${res.status}): ${body.error ?? "(no message)"}` };
+    }
+    await refresh();
+    return { ok: true };
+  }
+
   const editingTrack = useMemo(
     () =>
       editing ? tracks.find((t) => t.kind === editing.kind && t.data.id === editing.id) : null,
@@ -281,6 +365,42 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
   );
 
   const totalWidth = displayDuration * pxPerSec;
+
+  // spectrogram 表示中の audio 行だけ高さを広げるため、行の top/height を累積で持つ
+  type RowInfo = {
+    top: number;
+    height: number;
+    shownSpec: { spec: ApiSpectrogram; mode: string; audio: AudioItem } | null;
+  };
+  const rowInfos: RowInfo[] = useMemo(() => {
+    let top = 0;
+    return tracks.map((t) => {
+      let shownSpec: RowInfo["shownSpec"] = null;
+      if (t.kind === "audio") {
+        const sel = specViews[t.data.id];
+        const spec = sel ? t.data.spectrograms.find((s) => s.id === sel.specId) : undefined;
+        if (sel && spec && spec.status === "ready") {
+          shownSpec = { spec, mode: sel.mode, audio: t.data };
+        }
+      }
+      const height = TRACK_HEIGHT + (shownSpec ? SPECTROGRAM_STRIP_HEIGHT + 4 : 0);
+      const info = { top, height, shownSpec };
+      top += height + TRACK_GAP;
+      return info;
+    });
+  }, [tracks, specViews]);
+  const tracksTotalHeight =
+    rowInfos.length === 0
+      ? 0
+      : rowInfos[rowInfos.length - 1]!.top + rowInfos[rowInfos.length - 1]!.height + TRACK_GAP;
+
+  const specDialogAudio = specDialog
+    ? (data.audios.find((a) => a.id === specDialog) ?? null)
+    : null;
+
+  const lensTarget = lens
+    ? (rowInfos.find((i) => i.shownSpec?.audio.id === lens.audioId)?.shownSpec ?? null)
+    : null;
 
   return (
     <div>
@@ -362,6 +482,7 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
       </section>
 
       <div
+        ref={scrollBoxRef}
         style={{
           border: "1px solid #ddd",
           borderRadius: 6,
@@ -377,46 +498,67 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
             // TrackRow は absolute なので親がコンテンツ高さを取れない。
             // ruler 24px + 各 row + gap でレーン全体を確保し、2件以上でも
             // overflowY: hidden で潰れないようにする
-            minHeight: 24 + Math.max(1, tracks.length) * (TRACK_HEIGHT + TRACK_GAP),
+            minHeight: 24 + Math.max(TRACK_HEIGHT + TRACK_GAP, tracksTotalHeight),
           }}
         >
           <TimeRuler duration={displayDuration} pxPerSec={pxPerSec} />
           <div
             style={{
               position: "relative",
-              height: tracks.length * (TRACK_HEIGHT + TRACK_GAP),
+              height: tracksTotalHeight,
             }}
           >
-            {tracks.map((t, idx) => (
-              <TrackRow
-                key={trackKey(t)}
-                track={t}
-                index={idx}
-                total={tracks.length}
-                pxPerSec={pxPerSec}
-                onSeek={(time) => {
-                  setPlaying(false);
-                  setCurrentTime(Math.max(0, Math.min(displayDuration, time)));
-                }}
-                onDelete={() => deleteTrack(t)}
-                onMove={(dir) => moveTrack(idx, dir)}
-                onEdit={() => setEditing({ kind: t.kind, id: t.data.id })}
-                onTrim={() => setTrimming({ kind: t.kind, id: t.data.id })}
-                attachRef={(el) => {
-                  if (el) mediaRefs.current.set(trackKey(t), el);
-                  else mediaRefs.current.delete(trackKey(t));
-                }}
-              />
-            ))}
+            {tracks.map((t, idx) => {
+              const info = rowInfos[idx]!;
+              const shown = info.shownSpec;
+              return (
+                <TrackRow
+                  key={trackKey(t)}
+                  track={t}
+                  index={idx}
+                  total={tracks.length}
+                  top={info.top}
+                  rowHeight={info.height}
+                  pxPerSec={pxPerSec}
+                  onSeek={(time) => {
+                    setPlaying(false);
+                    setCurrentTime(Math.max(0, Math.min(displayDuration, time)));
+                  }}
+                  onDelete={() => deleteTrack(t)}
+                  onMove={(dir) => moveTrack(idx, dir)}
+                  onEdit={() => setEditing({ kind: t.kind, id: t.data.id })}
+                  onTrim={() => setTrimming({ kind: t.kind, id: t.data.id })}
+                  onSpectrogram={t.kind === "audio" ? () => setSpecDialog(t.data.id) : undefined}
+                  onLensHover={
+                    shown ? (h) => setLens(h ? { ...h, audioId: t.data.id } : null) : undefined
+                  }
+                  lensProjT={shown && lens?.audioId === t.data.id ? lens.projT : null}
+                  attachRef={(el) => {
+                    if (el) mediaRefs.current.set(trackKey(t), el);
+                    else mediaRefs.current.delete(trackKey(t));
+                  }}
+                  spectrogram={
+                    shown && (
+                      <SpectrogramStrip
+                        spec={shown.spec}
+                        mode={shown.mode}
+                        audio={shown.audio}
+                        pxPerSec={pxPerSec}
+                        viewportLeft={viewport.left}
+                        viewportWidth={viewport.width}
+                        top={TRACK_HEIGHT + 2}
+                        height={SPECTROGRAM_STRIP_HEIGHT}
+                      />
+                    )
+                  }
+                />
+              );
+            })}
             {tracks.length === 0 && (
               <p style={{ padding: "1rem", color: "#666" }}>動画または音声を追加してください。</p>
             )}
           </div>
-          <Playhead
-            time={currentTime}
-            pxPerSec={pxPerSec}
-            height={tracks.length * (TRACK_HEIGHT + TRACK_GAP) + 24}
-          />
+          <Playhead time={currentTime} pxPerSec={pxPerSec} height={tracksTotalHeight + 24} />
         </div>
       </div>
 
@@ -439,6 +581,32 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
           onApply={(timing) =>
             updateTiming({ kind: trimmingTrack.kind, id: trimmingTrack.data.id }, timing)
           }
+        />
+      )}
+      {specDialogAudio && (
+        <ModalShell
+          title={`CQT Spectrogram: ${specDialogAudio.name}`}
+          onClose={() => setSpecDialog(null)}
+        >
+          <SpectrogramDialogBody
+            audio={specDialogAudio}
+            view={specViews[specDialogAudio.id] ?? null}
+            onChangeView={(v) =>
+              setSpecViews((prev) => ({ ...prev, [specDialogAudio.id]: v ?? undefined }))
+            }
+            onCreate={(p) => createSpectrogram(specDialogAudio.id, p)}
+            onDelete={(specId) => deleteSpectrogram(specDialogAudio.id, specId)}
+          />
+        </ModalShell>
+      )}
+      {lens && lensTarget && (
+        <HarmonicLens
+          spec={lensTarget.spec}
+          audio={lensTarget.audio}
+          projT={lens.projT}
+          yRatio={lens.yRatio}
+          anchorX={lens.clientX}
+          anchorY={lens.clientY}
         />
       )}
     </div>
@@ -568,24 +736,36 @@ function TrackRow({
   track,
   index,
   total,
+  top,
+  rowHeight,
   pxPerSec,
   onSeek,
   onDelete,
   onMove,
   onEdit,
   onTrim,
+  onSpectrogram,
+  onLensHover,
+  lensProjT,
   attachRef,
+  spectrogram,
 }: {
   track: Track;
   index: number;
   total: number;
+  top: number;
+  rowHeight: number;
   pxPerSec: number;
   onSeek: (time: number) => void;
   onDelete: () => void;
   onMove: (direction: -1 | 1) => void;
   onEdit: () => void;
   onTrim: () => void;
+  onSpectrogram?: () => void;
+  onLensHover?: (h: LensHover | null) => void;
+  lensProjT?: number | null;
   attachRef: (el: HTMLMediaElement | null) => void;
+  spectrogram?: ReactNode;
 }) {
   const item = track.data;
   const projLow = Math.min(item.projStartSec, item.projEndSec);
@@ -598,7 +778,6 @@ function TrackRow({
       ? 0
       : (item.srcEndSec - item.srcStartSec) / (item.projEndSec - item.projStartSec);
 
-  const top = index * (TRACK_HEIGHT + TRACK_GAP);
   const color = track.kind === "video" ? "#3b82f6" : "#10b981";
 
   return (
@@ -608,7 +787,7 @@ function TrackRow({
         top,
         left: 0,
         right: 0,
-        height: TRACK_HEIGHT,
+        height: rowHeight,
       }}
     >
       <button
@@ -620,6 +799,26 @@ function TrackRow({
           const x = e.clientX - bounds.left + parent.scrollLeft;
           onSeek(x / pxPerSec);
         }}
+        onPointerMove={
+          onLensHover
+            ? (e) => {
+                const bounds = (
+                  e.currentTarget.parentElement as HTMLDivElement
+                ).getBoundingClientRect();
+                const yIn = e.clientY - bounds.top - (TRACK_HEIGHT + 2);
+                onLensHover({
+                  projT: (e.clientX - bounds.left) / pxPerSec,
+                  yRatio:
+                    yIn >= 0 && yIn < SPECTROGRAM_STRIP_HEIGHT
+                      ? yIn / SPECTROGRAM_STRIP_HEIGHT
+                      : null,
+                  clientX: e.clientX,
+                  clientY: e.clientY,
+                });
+              }
+            : undefined
+        }
+        onPointerLeave={onLensHover ? () => onLensHover(null) : undefined}
         style={{
           position: "absolute",
           inset: 0,
@@ -630,6 +829,19 @@ function TrackRow({
           cursor: "pointer",
         }}
       />
+      {lensProjT != null && (
+        <div
+          style={{
+            position: "absolute",
+            left: lensProjT * pxPerSec,
+            top: 0,
+            width: 1,
+            height: rowHeight,
+            background: "rgba(255,255,255,0.8)",
+            pointerEvents: "none",
+          }}
+        />
+      )}
       <div
         style={{
           position: "absolute",
@@ -666,6 +878,7 @@ function TrackRow({
           <ThumbnailStrip video={item as VideoItem} pxPerSec={pxPerSec} trackWidth={width} />
         )}
       </div>
+      {spectrogram}
       <div
         style={{
           position: "absolute",
@@ -722,6 +935,19 @@ function TrackRow({
         >
           トリミング
         </button>
+        {onSpectrogram && (
+          <button
+            type="button"
+            aria-label={`${item.name} の CQT spectrogram`}
+            onClick={(e) => {
+              e.stopPropagation();
+              onSpectrogram();
+            }}
+            style={trackButtonStyle}
+          >
+            CQT
+          </button>
+        )}
         <button
           type="button"
           aria-label={`${item.name} を削除`}
@@ -837,7 +1063,7 @@ function TaskList({ tasks }: { tasks: ApiTask[] }) {
 }
 
 function TaskRow({ task }: { task: ApiTask }) {
-  const kindLabel = task.kind === "video" ? "動画" : "音声";
+  const kindLabel = task.kind === "video" ? "動画" : task.kind === "audio" ? "音声" : "CQT";
   const statusLabel = (() => {
     switch (task.status) {
       case "pending":
@@ -878,7 +1104,8 @@ function TaskRow({ task }: { task: ApiTask }) {
           display: "inline-block",
           minWidth: "2.5rem",
           padding: "0 0.4rem",
-          background: task.kind === "video" ? "#3b82f6" : "#10b981",
+          background:
+            task.kind === "video" ? "#3b82f6" : task.kind === "audio" ? "#10b981" : "#8b5cf6",
           color: "white",
           borderRadius: 3,
           fontSize: "0.75rem",
