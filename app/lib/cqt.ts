@@ -19,6 +19,24 @@ export type CqtResult = {
   bins: number;
 };
 
+// 長い計算はサーバプロセス内で走るので、スライス境界で event loop に制御を返す。
+// undefined なら yield なし (テスト等)
+export type MaybeYield = () => Promise<void>;
+
+export function makeCooperativeYield(intervalMs = 25): MaybeYield {
+  let last = performance.now();
+  return async () => {
+    if (performance.now() - last < intervalMs) return;
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    last = performance.now();
+  };
+}
+
+// 同期ホットループの 1 スライスあたりの処理量
+const FRAME_SLICE = 2048;
+const SAMPLE_SLICE = 1 << 16;
+const QUANTIZE_SLICE = 1 << 20;
+
 type Kernel = {
   /** bin ごとの窓掛け複素指数 (実部/虚部) */
   re: Float32Array<ArrayBuffer>[];
@@ -78,11 +96,14 @@ const halfbandFir: Float32Array<ArrayBuffer> = (() => {
   return h;
 })();
 
-export function downsample2(x: Float32Array<ArrayBuffer>): Float32Array<ArrayBuffer> {
-  const outLen = Math.ceil(x.length / 2);
-  const y = new Float32Array(outLen);
+function downsample2Slice(
+  x: Float32Array<ArrayBuffer>,
+  y: Float32Array<ArrayBuffer>,
+  m0: number,
+  m1: number,
+): void {
   const c = (HALFBAND_TAPS - 1) / 2;
-  for (let m = 0; m < outLen; m++) {
+  for (let m = m0; m < m1; m++) {
     const base = 2 * m - c;
     const lo = Math.max(0, -base);
     const hi = Math.min(HALFBAND_TAPS, x.length - base);
@@ -90,11 +111,52 @@ export function downsample2(x: Float32Array<ArrayBuffer>): Float32Array<ArrayBuf
     for (let t = lo; t < hi; t++) acc += halfbandFir[t]! * x[base + t]!;
     y[m] = acc;
   }
+}
+
+export async function downsample2(
+  x: Float32Array<ArrayBuffer>,
+  maybeYield?: MaybeYield,
+): Promise<Float32Array<ArrayBuffer>> {
+  const outLen = Math.ceil(x.length / 2);
+  const y = new Float32Array(outLen);
+  for (let m0 = 0; m0 < outLen; m0 += SAMPLE_SLICE) {
+    downsample2Slice(x, y, m0, Math.min(outLen, m0 + SAMPLE_SLICE));
+    if (maybeYield) await maybeYield();
+  }
   return y;
 }
 
-// 1 オクターブ分の直接相関。frame i の窓中心は signal[i * hop]
-function correlateOctave(
+// 1 bin × 1 frame スライス分の直接相関。frame i の窓中心は signal[i * hop]
+function correlateBinSlice(
+  signal: Float32Array<ArrayBuffer>,
+  hop: number,
+  kr: Float32Array<ArrayBuffer>,
+  ki: Float32Array<ArrayBuffer>,
+  norm: number,
+  out: Float32Array<ArrayBuffer>,
+  bins: number,
+  outBin: number,
+  f0: number,
+  f1: number,
+): void {
+  const n = kr.length;
+  const half = n >> 1;
+  for (let i = f0; i < f1; i++) {
+    const start = i * hop - half;
+    const lo = Math.max(0, -start);
+    const hi = Math.min(n, signal.length - start);
+    let accRe = 0;
+    let accIm = 0;
+    for (let t = lo; t < hi; t++) {
+      const s = signal[start + t]!;
+      accRe += kr[t]! * s;
+      accIm += ki[t]! * s;
+    }
+    out[i * bins + outBin] = Math.sqrt(accRe * accRe + accIm * accIm) * norm;
+  }
+}
+
+async function correlateOctave(
   signal: Float32Array<ArrayBuffer>,
   hop: number,
   frames: number,
@@ -102,31 +164,33 @@ function correlateOctave(
   out: Float32Array<ArrayBuffer>,
   bins: number,
   binOffset: number,
-): void {
+  maybeYield?: MaybeYield,
+): Promise<void> {
   const B = kernel.re.length;
   for (let k = 0; k < B; k++) {
-    const kr = kernel.re[k]!;
-    const ki = kernel.im[k]!;
-    const n = kr.length;
-    const half = n >> 1;
-    const norm = kernel.norm[k]!;
-    for (let i = 0; i < frames; i++) {
-      const start = i * hop - half;
-      const lo = Math.max(0, -start);
-      const hi = Math.min(n, signal.length - start);
-      let accRe = 0;
-      let accIm = 0;
-      for (let t = lo; t < hi; t++) {
-        const s = signal[start + t]!;
-        accRe += kr[t]! * s;
-        accIm += ki[t]! * s;
-      }
-      out[i * bins + binOffset + k] = Math.sqrt(accRe * accRe + accIm * accIm) * norm;
+    for (let f0 = 0; f0 < frames; f0 += FRAME_SLICE) {
+      correlateBinSlice(
+        signal,
+        hop,
+        kernel.re[k]!,
+        kernel.im[k]!,
+        kernel.norm[k]!,
+        out,
+        bins,
+        binOffset + k,
+        f0,
+        Math.min(frames, f0 + FRAME_SLICE),
+      );
+      if (maybeYield) await maybeYield();
     }
   }
 }
 
-export function computeCqt(samples: Float32Array<ArrayBuffer>, p: CqtParams): CqtResult {
+export async function computeCqt(
+  samples: Float32Array<ArrayBuffer>,
+  p: CqtParams,
+  maybeYield?: MaybeYield,
+): Promise<CqtResult> {
   if (p.hop % 2 ** (p.octaves - 1) !== 0) {
     throw new Error(`cqt: hop ${p.hop} must be divisible by 2^(octaves-1)`);
   }
@@ -137,9 +201,18 @@ export function computeCqt(samples: Float32Array<ArrayBuffer>, p: CqtParams): Cq
   let signal = samples;
   let hop = p.hop;
   for (let o = 0; o < p.octaves; o++) {
-    correlateOctave(signal, hop, frames, kernel, out, bins, (p.octaves - 1 - o) * p.binsPerOctave);
+    await correlateOctave(
+      signal,
+      hop,
+      frames,
+      kernel,
+      out,
+      bins,
+      (p.octaves - 1 - o) * p.binsPerOctave,
+      maybeYield,
+    );
     if (o + 1 < p.octaves) {
-      signal = downsample2(signal);
+      signal = await downsample2(signal, maybeYield);
       hop >>= 1;
     }
   }
@@ -147,16 +220,21 @@ export function computeCqt(samples: Float32Array<ArrayBuffer>, p: CqtParams): Cq
 }
 
 // dB スケール [dbMin, dbMax] → Uint8 [0, 255]
-export function magnitudesToU8(
+export async function magnitudesToU8(
   mags: Float32Array<ArrayBuffer>,
   dbMin: number,
   dbMax: number,
-): Uint8Array<ArrayBuffer> {
+  maybeYield?: MaybeYield,
+): Promise<Uint8Array<ArrayBuffer>> {
   const out = new Uint8Array(mags.length);
   const scale = 255 / (dbMax - dbMin);
-  for (let i = 0; i < mags.length; i++) {
-    const db = 20 * Math.log10(Math.max(mags[i]!, 1e-10));
-    out[i] = Math.max(0, Math.min(255, Math.round((db - dbMin) * scale)));
+  for (let i0 = 0; i0 < mags.length; i0 += QUANTIZE_SLICE) {
+    const i1 = Math.min(mags.length, i0 + QUANTIZE_SLICE);
+    for (let i = i0; i < i1; i++) {
+      const db = 20 * Math.log10(Math.max(mags[i]!, 1e-10));
+      out[i] = Math.max(0, Math.min(255, Math.round((db - dbMin) * scale)));
+    }
+    if (maybeYield) await maybeYield();
   }
   return out;
 }

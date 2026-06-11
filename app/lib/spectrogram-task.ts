@@ -1,7 +1,7 @@
 import { Either } from "effect";
 import { join } from "node:path";
 import type { Task } from "../generated/prisma/client";
-import { computeCqt, magnitudesToU8 } from "./cqt";
+import { computeCqt, magnitudesToU8, makeCooperativeYield } from "./cqt";
 import { decodeAudioPcm } from "./ffmpeg";
 import { markPrefixForDeletion } from "./gc";
 import { prisma } from "./prisma";
@@ -76,19 +76,27 @@ export async function runSpectrogramTask(
 
   let frames = 0;
   let levels = 0;
+  // DSP は in-process で走るので、協調 yield で event loop を塞がないようにする
+  const maybeYield = makeCooperativeYield();
   for (const h of harmonics) {
-    const result = computeCqt(samples, {
-      sampleRate,
-      binsPerOctave: spec.binsPerOctave,
-      octaves: spec.octaves,
-      fminHz: spec.fminHz * h,
-      hop,
-    });
+    const result = await computeCqt(
+      samples,
+      {
+        sampleRate,
+        binsPerOctave: spec.binsPerOctave,
+        octaves: spec.octaves,
+        fminHz: spec.fminHz * h,
+        hop,
+      },
+      maybeYield,
+    );
     frames = result.frames;
-    const pyramid = buildPyramid(
-      magnitudesToU8(result.magnitudes, SPECTROGRAM_DB_MIN, SPECTROGRAM_DB_MAX),
+    const pyramid = await buildPyramid(
+      await magnitudesToU8(result.magnitudes, SPECTROGRAM_DB_MIN, SPECTROGRAM_DB_MAX, maybeYield),
       result.frames,
       bins,
+      SPECTROGRAM_TILE_FRAMES,
+      maybeYield,
     );
     levels = pyramid.length;
     const jobs: (() => Promise<void>)[] = [];

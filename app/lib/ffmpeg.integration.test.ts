@@ -132,7 +132,7 @@ describe("decodeAudioPcm", () => {
     const samples = await decodeAudioPcm(getMedia().audioWav, fs);
     expect(samples.length).toBeGreaterThan(fs * 0.9);
     expect(samples.length).toBeLessThan(fs * 1.1);
-    const { magnitudes, frames, bins } = computeCqt(samples, {
+    const { magnitudes, frames, bins } = await computeCqt(samples, {
       sampleRate: fs,
       binsPerOctave: 12,
       octaves: 5,

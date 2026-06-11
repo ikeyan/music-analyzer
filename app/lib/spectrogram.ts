@@ -1,3 +1,5 @@
+import type { MaybeYield } from "./cqt";
+
 // CQT spectrogram のタイル layout と解析パラメータ導出。
 // S3 上の構造: meta.json + tiles/h{harmonic}/{level}/{index}.bin
 // タイルは frame-major の Uint8 (frames × bins)、level L は L-1 を time 方向に 2:1 max-pool
@@ -76,23 +78,30 @@ export function levelCount(frames: number, tileFrames = SPECTROGRAM_TILE_FRAMES)
   return levels;
 }
 
-export function buildPyramid(
+const PYRAMID_FRAME_SLICE = 4096;
+
+export async function buildPyramid(
   level0: Uint8Array<ArrayBuffer>,
   frames: number,
   bins: number,
   tileFrames = SPECTROGRAM_TILE_FRAMES,
-): PyramidLevel[] {
+  maybeYield?: MaybeYield,
+): Promise<PyramidLevel[]> {
   const levels: PyramidLevel[] = [{ frames, data: level0 }];
   let prev = levels[0]!;
   while (prev.frames > tileFrames) {
     const nextFrames = Math.ceil(prev.frames / 2);
     const next = new Uint8Array(nextFrames * bins);
-    for (let i = 0; i < nextFrames; i++) {
-      const a = 2 * i;
-      const b = Math.min(2 * i + 1, prev.frames - 1);
-      for (let k = 0; k < bins; k++) {
-        next[i * bins + k] = Math.max(prev.data[a * bins + k]!, prev.data[b * bins + k]!);
+    for (let i0 = 0; i0 < nextFrames; i0 += PYRAMID_FRAME_SLICE) {
+      const i1 = Math.min(nextFrames, i0 + PYRAMID_FRAME_SLICE);
+      for (let i = i0; i < i1; i++) {
+        const a = 2 * i;
+        const b = Math.min(2 * i + 1, prev.frames - 1);
+        for (let k = 0; k < bins; k++) {
+          next[i * bins + k] = Math.max(prev.data[a * bins + k]!, prev.data[b * bins + k]!);
+        }
       }
+      if (maybeYield) await maybeYield();
     }
     prev = { frames: nextFrames, data: next };
     levels.push(prev);

@@ -34,17 +34,17 @@ describe("chooseHop", () => {
 describe("buildPyramid / sliceTile", () => {
   // 性質: 最終 level は tileFrames 以下、level L+1 の各値は L の隣接 2 frame の max
   // 入力: frames ∈ [1, 4*tile], bins ∈ [1, 8] のランダム Uint8
-  it("max-pool ピラミッドを構成する", () => {
+  it("max-pool ピラミッドを構成する", async () => {
     const tile = 16;
-    fc.assert(
-      fc.property(
+    await fc.assert(
+      fc.asyncProperty(
         fc.integer({ min: 1, max: 64 }),
         fc.integer({ min: 1, max: 8 }),
         fc.integer(),
-        (frames, bins, seed) => {
+        async (frames, bins, seed) => {
           const data = new Uint8Array(frames * bins);
           for (let i = 0; i < data.length; i++) data[i] = (seed + i * 2654435761) & 0xff;
-          const levels = buildPyramid(data, frames, bins, tile);
+          const levels = await buildPyramid(data, frames, bins, tile);
           expect(levels.length).toBe(levelCount(frames, tile));
           expect(levels[levels.length - 1]!.frames).toBeLessThanOrEqual(tile);
           for (let l = 1; l < levels.length; l++) {
