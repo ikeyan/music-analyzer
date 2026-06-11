@@ -7,7 +7,7 @@ import { markPrefixForDeletion } from "./gc";
 import { prisma } from "./prisma";
 import { getS3 } from "./s3";
 import {
-  MAX_ANALYSIS_SAMPLES,
+  MAX_ANALYSIS_BYTES,
   SPECTROGRAM_DB_MAX,
   SPECTROGRAM_DB_MIN,
   SPECTROGRAM_TILE_FRAMES,
@@ -15,6 +15,7 @@ import {
   analysisSampleRate,
   buildPyramid,
   chooseHop,
+  estimateAnalysisBytes,
   parseHarmonics,
   sliceTile,
   tileCount,
@@ -55,10 +56,18 @@ export async function runSpectrogramTask(
 
   const fmaxHz = spec.fminHz * 2 ** spec.octaves * Math.max(...harmonics);
   const sampleRate = analysisSampleRate(fmaxHz);
-  if (sampleRate * audio.durationSec > MAX_ANALYSIS_SAMPLES) {
+  const bins = spec.binsPerOctave * spec.octaves;
+  // decode 前に PCM + magnitudes + タイル列の合計ピークを見積もってゲートする
+  const estSamples = Math.ceil(sampleRate * audio.durationSec);
+  const estBytes = estimateAnalysisBytes(
+    estSamples,
+    chooseHop(sampleRate, spec.octaves, estSamples),
+    bins,
+  );
+  if (estBytes > MAX_ANALYSIS_BYTES) {
     return Either.left(
-      `audio too long for these parameters: ${Math.round(audio.durationSec)}s at ${sampleRate}Hz ` +
-        `exceeds analysis budget. Reduce octaves / fmin / harmonics.`,
+      `estimated analysis memory ${Math.round(estBytes / 2 ** 20)}MB exceeds budget ` +
+        `${MAX_ANALYSIS_BYTES / 2 ** 20}MB. Reduce octaves / fmin / binsPerOctave / harmonics.`,
     );
   }
 
@@ -69,7 +78,6 @@ export async function runSpectrogramTask(
   if (samples.length === 0) return Either.left("decoded audio is empty");
 
   const hop = chooseHop(sampleRate, spec.octaves, samples.length);
-  const bins = spec.binsPerOctave * spec.octaves;
 
   const prefix = spectrogramPrefix(audio.projectId, audio.id, spec.id);
   await markPrefixForDeletion(prefix, graceMs);

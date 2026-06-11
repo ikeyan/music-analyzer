@@ -152,6 +152,28 @@ describe("cqt spectrogram task", () => {
     expect(await prisma.deletionMark.count()).toBe(0);
   });
 
+  it("メモリ見積もりが予算超過なら decode せずに failed になる", async () => {
+    const client = makeClient();
+    const { projectId, audioId } = await seedAudio(client);
+    // 2h × fmax ~16.7kHz (fs ~43kHz) は PCM だけで予算超過
+    await prisma.audio.update({
+      where: { id: audioId },
+      data: { durationSec: 7200, srcEndSec: 7200, projEndSec: 7200 },
+    });
+    const created = await client.projects[":id"].audios[":audioId"].spectrograms.$post({
+      param: { id: projectId, audioId },
+      json: { binsPerOctave: 12, octaves: 9, fminHz: 32.7, harmonics: [1] },
+    });
+    expect(created.status).toBe(201);
+    if (!created.ok) throw new Error("unreachable");
+    const { task } = await created.json();
+
+    await waitForInflightTasks();
+    const doneTask = await prisma.task.findUniqueOrThrow({ where: { id: task.id } });
+    expect(doneTask.status).toBe("failed");
+    expect(doneTask.error).toContain("exceeds budget");
+  });
+
   it("fmax 超過パラメータは 400", async () => {
     const client = makeClient();
     const { projectId, audioId } = await seedAudio(client);

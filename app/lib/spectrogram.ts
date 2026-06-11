@@ -15,9 +15,8 @@ export const MAX_SPECTROGRAM_BINS = 512;
 export const MAX_SPECTROGRAM_HARMONICS = 8;
 // level0 の frame 数上限 (~2^18)。長尺でも 1 harmonic あたり数十 MB に収める
 export const MAX_SPECTROGRAM_FRAMES = 1 << 18;
-// decode する PCM サンプル数の上限 (Float32 で ~500MB)。超える場合は octaves /
-// harmonics を減らして fs を下げてもらう
-export const MAX_ANALYSIS_SAMPLES = 130_000_000;
+// 1 task が同時に保持するバッファの概算ピーク上限。decode 前に見積もって拒否する
+export const MAX_ANALYSIS_BYTES = 768 << 20;
 
 export type SpectrogramMeta = {
   version: 1;
@@ -60,6 +59,12 @@ export function chooseHop(sampleRate: number, octaves: number, samples: number):
     Math.ceil(Math.log2(Math.max(1, samples) / MAX_SPECTROGRAM_FRAMES)),
   );
   return 2 ** e;
+}
+
+// PCM (downsample 中間込みで ×1.5) + Float32 magnitudes + Uint8 level0/pyramid (< ×3)
+export function estimateAnalysisBytes(samples: number, hop: number, bins: number): number {
+  const frames = Math.floor(samples / hop) + 1;
+  return Math.round(4 * samples * 1.5 + 4 * frames * bins + 3 * frames * bins);
 }
 
 export type PyramidLevel = {
