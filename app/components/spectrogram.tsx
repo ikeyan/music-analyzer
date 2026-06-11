@@ -302,6 +302,217 @@ export function SpectrogramStrip({
   );
 }
 
+// track 行の pointer 位置。yRatio は spectrogram 帯内の縦位置 (0=上端)、帯外は null
+export type LensHover = {
+  projT: number;
+  yRatio: number | null;
+  clientX: number;
+  clientY: number;
+};
+
+const LENS_AXIS_W = 44;
+const LENS_STRIPE_W = 16;
+const LENS_LABEL_H = 14;
+
+const NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+
+function noteName(freq: number): string {
+  const midi = Math.round(69 + 12 * Math.log2(freq / 440));
+  if (!Number.isFinite(midi) || midi < 0 || midi > 127) return "";
+  return `${NOTE_NAMES[midi % 12]}${Math.floor(midi / 12) - 1}`;
+}
+
+function formatHz(freq: number): string {
+  return freq >= 1000 ? `${(freq / 1000).toFixed(1)}k` : `${Math.round(freq)}`;
+}
+
+// harmonic CQT lens: ポインタ時刻の縦スライスを harmonic ごとに並べる浮動パネル。
+// 行 b は f0 候補 fmin*2^(b/B) で揃え、列 h はその第 h 倍音の強度 (= HCQT の depth 軸)。
+// ピッチのある音は水平の明るい行になり、行に沿って倍音エンベロープが読める
+export function HarmonicLens({
+  spec,
+  audio,
+  projT,
+  yRatio,
+  anchorX,
+  anchorY,
+}: {
+  spec: ApiSpectrogram;
+  audio: ApiAudio;
+  projT: number;
+  yRatio: number | null;
+  anchorX: number;
+  anchorY: number;
+}) {
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const [meta, setMeta] = useState<SpectrogramMeta | null>(null);
+  const [tilesVersion, setTilesVersion] = useState(0);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetchMeta(spec)
+      .then((m) => {
+        if (!cancelled) setMeta(m);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [spec]);
+
+  useEffect(() => {
+    const bump = () => setTilesVersion((v) => v + 1);
+    tileListeners.add(bump);
+    return () => {
+      tileListeners.delete(bump);
+    };
+  }, []);
+
+  // layout は spec だけで決まる (meta 到着前にパネル寸法が変わらないように)
+  const numH = spec.harmonics.length;
+  const bins = spec.binsPerOctave * spec.octaves;
+  const displayH = Math.min(320, Math.max(144, bins * 2));
+  const canvasW = LENS_AXIS_W + numH * LENS_STRIPE_W;
+  const canvasH = displayH + LENS_LABEL_H;
+
+  const dProj = audio.projEndSec - audio.projStartSec;
+  const dSrc = audio.srcEndSec - audio.srcStartSec;
+  const srcT =
+    dProj === 0 || dSrc === 0
+      ? 0
+      : Math.max(
+          0,
+          Math.min(
+            audio.durationSec,
+            audio.srcStartSec + (projT - audio.projStartSec) * (dSrc / dProj),
+          ),
+        );
+  const binSel =
+    yRatio === null ? null : Math.min(bins - 1, Math.max(0, Math.floor((1 - yRatio) * bins)));
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || !meta) return;
+    if (canvas.width !== canvasW) canvas.width = canvasW;
+    if (canvas.height !== canvasH) canvas.height = canvasH;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    ctx.imageSmoothingEnabled = false;
+    ctx.fillStyle = "#111";
+    ctx.fillRect(0, 0, canvasW, canvasH);
+
+    const fps0 = meta.sampleRate / meta.hop;
+    const frame = Math.min(meta.frames - 1, Math.max(0, Math.round(srcT * fps0)));
+    const tileIdx = Math.floor(frame / meta.tileFrames);
+    const offset = (frame - tileIdx * meta.tileFrames) * meta.bins;
+
+    // 1 harmonic = 1px 列の ImageData を作って横に引き伸ばす
+    const off = document.createElement("canvas");
+    off.width = numH;
+    off.height = bins;
+    const octx = off.getContext("2d");
+    if (!octx) return;
+    const img = octx.createImageData(numH, bins);
+    const px = img.data;
+    for (let hi = 0; hi < numH; hi++) {
+      const bytes = getTileBytes(`${spec.tileUrlBase}/${meta.harmonics[hi]}/0/${tileIdx}`);
+      for (let b = 0; b < bins; b++) {
+        const o = ((bins - 1 - b) * numH + hi) * 4;
+        if (bytes) {
+          const v = bytes[offset + b]!;
+          px[o] = COLORMAP[v * 3]!;
+          px[o + 1] = COLORMAP[v * 3 + 1]!;
+          px[o + 2] = COLORMAP[v * 3 + 2]!;
+        } else {
+          px[o] = 70;
+          px[o + 1] = 70;
+          px[o + 2] = 70;
+        }
+        px[o + 3] = 255;
+      }
+    }
+    octx.putImageData(img, 0, 0);
+    ctx.drawImage(off, 0, 0, numH, bins, LENS_AXIS_W, 0, numH * LENS_STRIPE_W, displayH);
+
+    // 列区切り + オクターブ目盛 + harmonic ラベル
+    ctx.strokeStyle = "rgba(0,0,0,0.5)";
+    ctx.beginPath();
+    for (let hi = 1; hi < numH; hi++) {
+      const x = LENS_AXIS_W + hi * LENS_STRIPE_W + 0.5;
+      ctx.moveTo(x, 0);
+      ctx.lineTo(x, displayH);
+    }
+    ctx.stroke();
+    ctx.font = "9px system-ui, sans-serif";
+    ctx.fillStyle = "#aaa";
+    ctx.strokeStyle = "rgba(255,255,255,0.25)";
+    ctx.textBaseline = "middle";
+    ctx.textAlign = "right";
+    for (let o = 0; o <= spec.octaves; o++) {
+      const y = Math.round(displayH * (1 - (o * spec.binsPerOctave) / bins));
+      ctx.beginPath();
+      ctx.moveTo(LENS_AXIS_W, y + 0.5);
+      ctx.lineTo(canvasW, y + 0.5);
+      ctx.stroke();
+      ctx.fillText(formatHz(spec.fminHz * 2 ** o), LENS_AXIS_W - 4, Math.max(6, y));
+    }
+    ctx.textAlign = "center";
+    ctx.fillStyle = "#ccc";
+    for (let hi = 0; hi < numH; hi++) {
+      ctx.fillText(
+        `×${meta.harmonics[hi]}`,
+        LENS_AXIS_W + (hi + 0.5) * LENS_STRIPE_W,
+        displayH + LENS_LABEL_H / 2 + 1,
+      );
+    }
+
+    if (binSel !== null) {
+      const rowH = displayH / bins;
+      const y = displayH * (1 - (binSel + 1) / bins);
+      ctx.strokeStyle = "#fff";
+      ctx.strokeRect(LENS_AXIS_W + 0.5, y + 0.5, numH * LENS_STRIPE_W - 1, Math.max(1, rowH));
+    }
+  }, [meta, spec, srcT, binSel, tilesVersion, numH, bins, displayH, canvasW, canvasH]);
+
+  const panelW = canvasW + 18;
+  const panelH = canvasH + 40;
+  let left = anchorX + 18;
+  if (left + panelW > window.innerWidth - 8) left = anchorX - panelW - 12;
+  const top = Math.max(8, Math.min(window.innerHeight - panelH - 8, anchorY - panelH / 2));
+
+  const f0 = binSel === null ? null : spec.fminHz * 2 ** (binSel / spec.binsPerOctave);
+  return (
+    <div
+      aria-hidden="true"
+      style={{
+        position: "fixed",
+        left,
+        top,
+        zIndex: 50,
+        background: "rgba(17,17,17,0.95)",
+        border: "1px solid #444",
+        borderRadius: 6,
+        padding: "4px 8px 6px",
+        pointerEvents: "none",
+        boxShadow: "0 4px 16px rgba(0,0,0,0.4)",
+      }}
+    >
+      <div
+        style={{
+          color: "#ddd",
+          fontSize: 11,
+          fontVariantNumeric: "tabular-nums",
+          marginBottom: 2,
+          whiteSpace: "nowrap",
+        }}
+      >
+        t={srcT.toFixed(2)}s{f0 !== null && ` / f0候補 ${f0.toFixed(1)}Hz ${noteName(f0)}`}
+      </div>
+      <canvas ref={canvasRef} style={{ width: canvasW, height: canvasH, display: "block" }} />
+    </div>
+  );
+}
+
 export type SpectrogramCreateParams = {
   binsPerOctave: number;
   octaves: number;

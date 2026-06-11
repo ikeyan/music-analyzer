@@ -16,6 +16,8 @@ import type {
   ApiVideo,
 } from "../api/types";
 import {
+  HarmonicLens,
+  type LensHover,
   SPECTROGRAM_STRIP_HEIGHT,
   type SpectrogramCreateParams,
   SpectrogramDialogBody,
@@ -59,6 +61,8 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
   const [trimming, setTrimming] = useState<TrackRef | null>(null);
   const [specDialog, setSpecDialog] = useState<string | null>(null);
   const [specViews, setSpecViews] = useState<Record<string, SpectrogramSelection | undefined>>({});
+  // harmonic CQT lens: spectrogram 表示中の audio 行を hover している間だけ出す
+  const [lens, setLens] = useState<(LensHover & { audioId: string }) | null>(null);
 
   const tracks: Track[] = useMemo(() => {
     const all: Track[] = [
@@ -394,6 +398,10 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
     ? (data.audios.find((a) => a.id === specDialog) ?? null)
     : null;
 
+  const lensTarget = lens
+    ? (rowInfos.find((i) => i.shownSpec?.audio.id === lens.audioId)?.shownSpec ?? null)
+    : null;
+
   return (
     <div>
       <header style={{ display: "flex", alignItems: "baseline", gap: "1rem" }}>
@@ -521,6 +529,10 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
                   onEdit={() => setEditing({ kind: t.kind, id: t.data.id })}
                   onTrim={() => setTrimming({ kind: t.kind, id: t.data.id })}
                   onSpectrogram={t.kind === "audio" ? () => setSpecDialog(t.data.id) : undefined}
+                  onLensHover={
+                    shown ? (h) => setLens(h ? { ...h, audioId: t.data.id } : null) : undefined
+                  }
+                  lensProjT={shown && lens?.audioId === t.data.id ? lens.projT : null}
                   attachRef={(el) => {
                     if (el) mediaRefs.current.set(trackKey(t), el);
                     else mediaRefs.current.delete(trackKey(t));
@@ -586,6 +598,16 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
             onDelete={(specId) => deleteSpectrogram(specDialogAudio.id, specId)}
           />
         </ModalShell>
+      )}
+      {lens && lensTarget && (
+        <HarmonicLens
+          spec={lensTarget.spec}
+          audio={lensTarget.audio}
+          projT={lens.projT}
+          yRatio={lens.yRatio}
+          anchorX={lens.clientX}
+          anchorY={lens.clientY}
+        />
       )}
     </div>
   );
@@ -723,6 +745,8 @@ function TrackRow({
   onEdit,
   onTrim,
   onSpectrogram,
+  onLensHover,
+  lensProjT,
   attachRef,
   spectrogram,
 }: {
@@ -738,6 +762,8 @@ function TrackRow({
   onEdit: () => void;
   onTrim: () => void;
   onSpectrogram?: () => void;
+  onLensHover?: (h: LensHover | null) => void;
+  lensProjT?: number | null;
   attachRef: (el: HTMLMediaElement | null) => void;
   spectrogram?: ReactNode;
 }) {
@@ -773,6 +799,26 @@ function TrackRow({
           const x = e.clientX - bounds.left + parent.scrollLeft;
           onSeek(x / pxPerSec);
         }}
+        onPointerMove={
+          onLensHover
+            ? (e) => {
+                const bounds = (
+                  e.currentTarget.parentElement as HTMLDivElement
+                ).getBoundingClientRect();
+                const yIn = e.clientY - bounds.top - (TRACK_HEIGHT + 2);
+                onLensHover({
+                  projT: (e.clientX - bounds.left) / pxPerSec,
+                  yRatio:
+                    yIn >= 0 && yIn < SPECTROGRAM_STRIP_HEIGHT
+                      ? yIn / SPECTROGRAM_STRIP_HEIGHT
+                      : null,
+                  clientX: e.clientX,
+                  clientY: e.clientY,
+                });
+              }
+            : undefined
+        }
+        onPointerLeave={onLensHover ? () => onLensHover(null) : undefined}
         style={{
           position: "absolute",
           inset: 0,
@@ -783,6 +829,19 @@ function TrackRow({
           cursor: "pointer",
         }}
       />
+      {lensProjT != null && (
+        <div
+          style={{
+            position: "absolute",
+            left: lensProjT * pxPerSec,
+            top: 0,
+            width: 1,
+            height: rowHeight,
+            background: "rgba(255,255,255,0.8)",
+            pointerEvents: "none",
+          }}
+        />
+      )}
       <div
         style={{
           position: "absolute",
