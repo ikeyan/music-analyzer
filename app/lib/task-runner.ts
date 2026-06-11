@@ -377,8 +377,11 @@ async function executeSpectrogramTask(task: Task): Promise<void> {
   }
   if (Either.isLeft(result)) {
     const finishedAt = new Date();
+    // audio/project DELETE が task/spectrogram 行ごと消すレースがあるので、
+    // 行不在で throw しない updateMany にして必ず eager 掃除まで到達させる
+    // (掃除し損ねても task 内で立てた spectrogramPrefix の mark を sweeper が拾う)
     await prisma.$transaction([
-      prisma.task.update({
+      prisma.task.updateMany({
         where: { id: task.id },
         data: {
           status: "failed",

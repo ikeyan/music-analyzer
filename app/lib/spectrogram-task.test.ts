@@ -132,6 +132,26 @@ describe("cqt spectrogram task", () => {
     expect(await listPrefix(spectrogramPrefix(projectId, audioId, spectrogram.id))).toEqual([]);
   }, 60_000);
 
+  it("audio 実体が S3 にないと task/spectrogram が failed になり mark も残らない", async () => {
+    const client = makeClient();
+    const { projectId, audioId } = await seedAudio(client);
+    await getS3().delete(audioTranscodedKey(projectId, audioId));
+    const created = await client.projects[":id"].audios[":audioId"].spectrograms.$post({
+      param: { id: projectId, audioId },
+      json: { binsPerOctave: 12, octaves: 5, fminHz: 55, harmonics: [1] },
+    });
+    expect(created.status).toBe(201);
+    if (!created.ok) throw new Error("unreachable");
+    const { task } = await created.json();
+
+    await waitForInflightTasks();
+    const doneTask = await prisma.task.findUniqueOrThrow({ where: { id: task.id } });
+    expect(doneTask.status).toBe("failed");
+    const spec = await prisma.spectrogram.findUniqueOrThrow({ where: { id: task.id } });
+    expect(spec.status).toBe("failed");
+    expect(await prisma.deletionMark.count()).toBe(0);
+  });
+
   it("fmax 超過パラメータは 400", async () => {
     const client = makeClient();
     const { projectId, audioId } = await seedAudio(client);
