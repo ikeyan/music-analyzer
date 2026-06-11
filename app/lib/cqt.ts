@@ -49,6 +49,19 @@ export function cqtBinFrequency(fminHz: number, binsPerOctave: number, bin: numb
   return fminHz * 2 ** (bin / binsPerOctave);
 }
 
+// 直接相関の概算 tap 反復回数 (実測 ~0.5-1G/s)。decode 前の compute 予算ゲート用。
+// 全オクターブで frame 数とカーネル長が同一なので octaves 倍するだけでよい
+export function estimateCqtOps(samples: number, p: CqtParams): number {
+  const q = 1 / (2 ** (1 / p.binsPerOctave) - 1);
+  let kernelTaps = 0;
+  for (let k = 0; k < p.binsPerOctave; k++) {
+    const f = cqtBinFrequency(p.fminHz, p.binsPerOctave, (p.octaves - 1) * p.binsPerOctave + k);
+    kernelTaps += Math.max(2, Math.round((q * p.sampleRate) / f));
+  }
+  const frames = Math.floor(samples / p.hop) + 1;
+  return 2 * p.octaves * frames * kernelTaps;
+}
+
 // 最上位オクターブ (bin = (octaves-1)*B .. octaves*B-1) 用のカーネル
 function designTopOctaveKernel(p: CqtParams): Kernel {
   const B = p.binsPerOctave;

@@ -1,13 +1,14 @@
 import { Either } from "effect";
 import { join } from "node:path";
 import type { Task } from "../generated/prisma/client";
-import { computeCqt, magnitudesToU8, makeCooperativeYield } from "./cqt";
+import { computeCqt, estimateCqtOps, magnitudesToU8, makeCooperativeYield } from "./cqt";
 import { decodeAudioPcm } from "./ffmpeg";
 import { markPrefixForDeletion } from "./gc";
 import { prisma } from "./prisma";
 import { getS3 } from "./s3";
 import {
   MAX_ANALYSIS_BYTES,
+  MAX_ANALYSIS_OPS,
   SPECTROGRAM_DB_MAX,
   SPECTROGRAM_DB_MIN,
   SPECTROGRAM_TILE_FRAMES,
@@ -59,15 +60,29 @@ export async function runSpectrogramTask(
   const bins = spec.binsPerOctave * spec.octaves;
   // decode 前に PCM + magnitudes + タイル列の合計ピークを見積もってゲートする
   const estSamples = Math.ceil(sampleRate * audio.durationSec);
-  const estBytes = estimateAnalysisBytes(
-    estSamples,
-    chooseHop(sampleRate, spec.octaves, estSamples),
-    bins,
-  );
+  const estHop = chooseHop(sampleRate, spec.octaves, estSamples);
+  const estBytes = estimateAnalysisBytes(estSamples, estHop, bins);
   if (estBytes > MAX_ANALYSIS_BYTES) {
     return Either.left(
       `estimated analysis memory ${Math.round(estBytes / 2 ** 20)}MB exceeds budget ` +
         `${MAX_ANALYSIS_BYTES / 2 ** 20}MB. Reduce octaves / fmin / binsPerOctave / harmonics.`,
+    );
+  }
+  // 低周波 × 高 bins はカーネルが伸びて演算量が爆発するので compute 予算でもゲートする
+  let estOps = 0;
+  for (const h of harmonics) {
+    estOps += estimateCqtOps(estSamples, {
+      sampleRate,
+      binsPerOctave: spec.binsPerOctave,
+      octaves: spec.octaves,
+      fminHz: spec.fminHz * h,
+      hop: estHop,
+    });
+  }
+  if (estOps > MAX_ANALYSIS_OPS) {
+    return Either.left(
+      `estimated compute ${Math.round(estOps / 1e9)}G ops exceeds budget ` +
+        `${MAX_ANALYSIS_OPS / 1e9}G. Reduce binsPerOctave / duration or raise fmin.`,
     );
   }
 

@@ -17,6 +17,9 @@ export const MAX_SPECTROGRAM_HARMONICS = 8;
 export const MAX_SPECTROGRAM_FRAMES = 1 << 18;
 // 1 task が同時に保持するバッファの概算ピーク上限。decode 前に見積もって拒否する
 export const MAX_ANALYSIS_BYTES = 768 << 20;
+// 1 task の直接相関 tap 反復の上限 (~0.5-1G/s なので数分相当)。低周波 × 高 bins で
+// カーネルが極端に伸びる組み合わせが直列 queue を長時間占有するのを防ぐ
+export const MAX_ANALYSIS_OPS = 150e9;
 
 export type SpectrogramMeta = {
   version: 1;
