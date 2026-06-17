@@ -1,6 +1,6 @@
 import { type CSSProperties, useEffect, useRef, useState } from "react";
 import type { ApiAudio, ApiSpectrogram } from "../api/types";
-import type { SpectrogramMeta } from "../lib/spectrogram";
+import { MAX_SPECTROGRAM_BINS, type SpectrogramMeta } from "../lib/spectrogram";
 
 // audio track ごとに表示する spectrogram の選択。mode は "h{n}" (単一 harmonic) か
 // "rgb" (先頭 3 harmonics を R/G/B に割り当てる合成表示)
@@ -691,17 +691,22 @@ export function SpectrogramDialogBody({
         <div style={specRowStyle}>
           <label style={specLabelStyle}>
             bins / octave
-            <select
+            <input
+              type="number"
+              min="1"
+              max="96"
+              step="1"
+              list="bins-per-octave-presets"
               value={binsPerOctave}
               onChange={(e) => setBinsPerOctave(e.target.value)}
               disabled={busy !== null}
-            >
-              {[12, 24, 36, 48].map((b) => (
-                <option key={b} value={String(b)}>
-                  {b}
-                </option>
+              style={{ width: 80 }}
+            />
+            <datalist id="bins-per-octave-presets">
+              {[12, 19, 24, 31, 36, 41, 48, 53, 62, 72, 82].map((b) => (
+                <option key={b} value={String(b)} />
               ))}
-            </select>
+            </datalist>
           </label>
           <label style={specLabelStyle}>
             octaves
@@ -729,6 +734,10 @@ export function SpectrogramDialogBody({
             />
           </label>
         </div>
+        <p style={{ fontSize: 11, color: "#666", margin: "0.4rem 0 0" }}>
+          n 平均律は bins/octave に n（細かくするならその倍数）を指定。最大 96、 bins/octave ×
+          octaves ≤ {MAX_SPECTROGRAM_BINS}。
+        </p>
         <div style={{ ...specRowStyle, marginTop: "0.5rem" }}>
           <span style={{ fontSize: 12, color: "#444" }}>harmonics:</span>
           {HARMONIC_CHOICES.map((h) => (
