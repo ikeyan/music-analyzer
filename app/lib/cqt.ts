@@ -232,6 +232,23 @@ export async function computeCqt(
   return { magnitudes: out, frames, bins };
 }
 
+// center freq > fmaxHz の bin は decode Nyquist 付近で信頼できないので 0 に潰す。frame-major in-place
+export function zeroBinsAboveFmax(
+  mags: Float32Array<ArrayBuffer>,
+  frames: number,
+  bins: number,
+  fminHz: number,
+  binsPerOctave: number,
+  fmaxHz: number,
+): void {
+  let cutoff = 0;
+  while (cutoff < bins && cqtBinFrequency(fminHz, binsPerOctave, cutoff) <= fmaxHz) cutoff++;
+  if (cutoff >= bins) return;
+  for (let f = 0; f < frames; f++) {
+    for (let b = cutoff; b < bins; b++) mags[f * bins + b] = 0;
+  }
+}
+
 // dB スケール [dbMin, dbMax] → Uint8 [0, 255]
 export async function magnitudesToU8(
   mags: Float32Array<ArrayBuffer>,

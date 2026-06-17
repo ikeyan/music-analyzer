@@ -1,7 +1,13 @@
 import { Either } from "effect";
 import { join } from "node:path";
 import type { Task } from "../generated/prisma/client";
-import { computeCqt, estimateCqtOps, magnitudesToU8, makeCooperativeYield } from "./cqt";
+import {
+  computeCqt,
+  estimateCqtOps,
+  magnitudesToU8,
+  makeCooperativeYield,
+  zeroBinsAboveFmax,
+} from "./cqt";
 import { decodeAudioPcm } from "./ffmpeg";
 import { markPrefixForDeletion } from "./gc";
 import { prisma } from "./prisma";
@@ -9,6 +15,7 @@ import { getS3 } from "./s3";
 import {
   MAX_ANALYSIS_BYTES,
   MAX_ANALYSIS_OPS,
+  MAX_SPECTROGRAM_FMAX_HZ,
   SPECTROGRAM_DB_MAX,
   SPECTROGRAM_DB_MIN,
   SPECTROGRAM_TILE_FRAMES,
@@ -114,6 +121,14 @@ export async function runSpectrogramTask(
       maybeYield,
     );
     frames = result.frames;
+    zeroBinsAboveFmax(
+      result.magnitudes,
+      result.frames,
+      bins,
+      spec.fminHz * h,
+      spec.binsPerOctave,
+      MAX_SPECTROGRAM_FMAX_HZ,
+    );
     const pyramid = await buildPyramid(
       await magnitudesToU8(result.magnitudes, SPECTROGRAM_DB_MIN, SPECTROGRAM_DB_MAX, maybeYield),
       result.frames,

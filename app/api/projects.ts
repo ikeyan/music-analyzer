@@ -127,8 +127,8 @@ const createSpectrogramSchema = v.pipe(
     `binsPerOctave * octaves must be <= ${MAX_SPECTROGRAM_BINS}`,
   ),
   v.check(
-    (d) => d.fminHz * 2 ** d.octaves * Math.max(...d.harmonics) <= MAX_SPECTROGRAM_FMAX_HZ,
-    `fminHz * 2^octaves * max(harmonics) must be <= ${MAX_SPECTROGRAM_FMAX_HZ}`,
+    (d) => d.fminHz * 2 ** d.octaves <= MAX_SPECTROGRAM_FMAX_HZ,
+    `fminHz * 2^octaves must be <= ${MAX_SPECTROGRAM_FMAX_HZ}`,
   ),
 );
 

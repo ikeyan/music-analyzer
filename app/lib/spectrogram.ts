@@ -7,7 +7,8 @@ import type { MaybeYield } from "./cqt";
 export const SPECTROGRAM_DB_MIN = -80;
 export const SPECTROGRAM_DB_MAX = 0;
 export const SPECTROGRAM_TILE_FRAMES = 2048;
-// 最上位 bin (fmin * 2^octaves * max(harmonics)) の許容上限。decode fs の Nyquist を保証する
+// 表示帯域の上限 Hz。基本レンジ fmin*2^octaves はこれ以下に制限し、これを超える
+// 高調波 plane の bin は 0 に潰す (decode fs の Nyquist を超えるため)
 export const MAX_SPECTROGRAM_FMAX_HZ = 20000;
 // fminHz * harmonic の解析下限。窓長が極端に伸びるのを防ぐ
 export const MIN_SPECTROGRAM_FMIN_HZ = 8;

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import * as fc from "fast-check";
-import { computeCqt, cqtBinFrequency, downsample2, magnitudesToU8 } from "./cqt";
+import { computeCqt, cqtBinFrequency, downsample2, magnitudesToU8, zeroBinsAboveFmax } from "./cqt";
 
 const FS = 8000;
 const B = 12;
@@ -91,6 +91,36 @@ describe("downsample2", () => {
         expect((await downsample2(new Float32Array(n))).length).toBe(Math.ceil(n / 2));
       }),
       { numRuns: 20 },
+    );
+  });
+});
+
+describe("zeroBinsAboveFmax", () => {
+  // 性質: center freq > fmaxHz の bin だけ 0、それ以外は不変
+  // 入力: fmin∈[8,2000], B∈[1,24], octaves∈[1,8], fmax∈[8,20000]
+  it("fmax 超の bin だけ 0 に潰す", () => {
+    fc.assert(
+      fc.property(
+        fc.integer({ min: 8, max: 2000 }),
+        fc.integer({ min: 1, max: 24 }),
+        fc.integer({ min: 1, max: 8 }),
+        fc.integer({ min: 8, max: 20000 }),
+        fc.integer({ min: 1, max: 5 }),
+        (fmin, bpo, octaves, fmax, frames) => {
+          const bins = bpo * octaves;
+          const orig = new Float32Array(frames * bins);
+          for (let i = 0; i < orig.length; i++) orig[i] = i + 1;
+          const mags = orig.slice();
+          zeroBinsAboveFmax(mags, frames, bins, fmin, bpo, fmax);
+          for (let f = 0; f < frames; f++) {
+            for (let b = 0; b < bins; b++) {
+              const over = cqtBinFrequency(fmin, bpo, b) > fmax;
+              expect(mags[f * bins + b]).toBe(over ? 0 : orig[f * bins + b]!);
+            }
+          }
+        },
+      ),
+      { numRuns: 30 },
     );
   });
 });

@@ -1,6 +1,10 @@
 import { type CSSProperties, useEffect, useRef, useState } from "react";
 import type { ApiAudio, ApiSpectrogram } from "../api/types";
-import { MAX_SPECTROGRAM_BINS, type SpectrogramMeta } from "../lib/spectrogram";
+import {
+  MAX_SPECTROGRAM_BINS,
+  MAX_SPECTROGRAM_FMAX_HZ,
+  type SpectrogramMeta,
+} from "../lib/spectrogram";
 
 // audio track ごとに表示する spectrogram の選択。mode は "h{n}" (単一 harmonic) か
 // "rgb" (先頭 3 harmonics を R/G/B に割り当てる合成表示)
@@ -585,6 +589,10 @@ export function SpectrogramDialogBody({
       setError("fmin は正の有限数で指定してください");
       return;
     }
+    if (f * 2 ** o > MAX_SPECTROGRAM_FMAX_HZ) {
+      setError(`基本レンジ上端 fmin×2^octaves は ${MAX_SPECTROGRAM_FMAX_HZ}Hz 以下にしてください`);
+      return;
+    }
     if (harmonics.length === 0) {
       setError("harmonics を 1 つ以上選択してください");
       return;
@@ -605,6 +613,10 @@ export function SpectrogramDialogBody({
     if ("error" in result) setError(result.error);
     else if (view?.specId === specId) onChangeView(null);
   }
+
+  const baseTopHz = Number(fminHz) * 2 ** Number(octaves);
+  const baseTopValid = Number.isFinite(baseTopHz) && baseTopHz > 0;
+  const baseTopOver = baseTopValid && baseTopHz > MAX_SPECTROGRAM_FMAX_HZ;
 
   return (
     <div>
@@ -738,6 +750,18 @@ export function SpectrogramDialogBody({
           n 平均律は bins/octave に n（細かくするならその倍数）を指定。最大 96、 bins/octave ×
           octaves ≤ {MAX_SPECTROGRAM_BINS}。
         </p>
+        {baseTopValid && (
+          <p
+            style={{
+              fontSize: 11,
+              margin: "0.2rem 0 0",
+              color: baseTopOver ? "crimson" : "#666",
+            }}
+          >
+            基本レンジ上端 fmin×2^octaves ≈ {formatHz(baseTopHz)}Hz
+            {baseTopOver && ` — ${MAX_SPECTROGRAM_FMAX_HZ}Hz 以下にしてください`}
+          </p>
+        )}
         <div style={{ ...specRowStyle, marginTop: "0.5rem" }}>
           <span style={{ fontSize: 12, color: "#444" }}>harmonics:</span>
           {HARMONIC_CHOICES.map((h) => (
@@ -763,9 +787,10 @@ export function SpectrogramDialogBody({
         </div>
         <p style={{ fontSize: 11, color: "#666", margin: "0.4rem 0" }}>
           harmonic CQT は選んだ各倍音 (fmin×h) ごとに CQT を計算します。複数選ぶと RGB
-          合成表示が使えます。
+          合成表示が使えます。fmin×h が {MAX_SPECTROGRAM_FMAX_HZ}Hz
+          を超える高域は自動で黒く（クランプ）表示されます。
         </p>
-        <button type="button" onClick={create} disabled={busy !== null}>
+        <button type="button" onClick={create} disabled={busy !== null || baseTopOver}>
           {busy === "create" ? "開始中…" : "生成開始"}
         </button>
       </section>
