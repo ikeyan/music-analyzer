@@ -7,8 +7,9 @@ import type { MaybeYield } from "./cqt";
 export const SPECTROGRAM_DB_MIN = -80;
 export const SPECTROGRAM_DB_MAX = 0;
 export const SPECTROGRAM_TILE_FRAMES = 2048;
-// 表示帯域の上限 Hz。基本レンジ fmin*2^octaves はこれ以下に制限し、これを超える
-// 高調波 plane の bin は 0 に潰す (decode fs の Nyquist を超えるため)
+// 表示帯域の上限 Hz。基本レンジ fmin*2^octaves はこれ以下に制限する。各 harmonic plane は
+// この周波数を超えない octave 数だけ計算し、超える高域 octave は 0 padding する (最上位
+// octave のカーネルを全 octave で使い回すので、それが Nyquist を超えると全 octave が aliasing する)
 export const MAX_SPECTROGRAM_FMAX_HZ = 20000;
 // fminHz * harmonic の解析下限。窓長が極端に伸びるのを防ぐ
 export const MIN_SPECTROGRAM_FMIN_HZ = 8;
@@ -47,6 +48,14 @@ export function cqtRangeFromCenter(
   octavesUp: number,
 ): { fminHz: number; octaves: number } {
   return { fminHz: centerHz / 2 ** octavesDown, octaves: octavesDown + octavesUp };
+}
+
+// harmonic plane (最低周波数 fminHz) を fmaxHz 以下で表せる octave 数。computeCqt は最上位
+// octave のカーネルを全 octave で使い回すため、最上位 octave が Nyquist を超えると全 octave が
+// aliasing する。これを超える octave は計算せず 0 padding する
+export function safeCqtOctaves(fminHz: number, octaves: number, fmaxHz: number): number {
+  if (!(fminHz < fmaxHz)) return 0;
+  return Math.min(octaves, Math.floor(Math.log2(fmaxHz / fminHz)));
 }
 
 export function parseHarmonics(json: string): number[] {

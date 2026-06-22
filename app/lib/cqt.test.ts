@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import * as fc from "fast-check";
-import { computeCqt, cqtBinFrequency, downsample2, magnitudesToU8, zeroBinsAboveFmax } from "./cqt";
+import { computeCqt, cqtBinFrequency, downsample2, magnitudesToU8, padBinsToFull } from "./cqt";
 
 const FS = 8000;
 const B = 12;
@@ -95,27 +95,24 @@ describe("downsample2", () => {
   });
 });
 
-describe("zeroBinsAboveFmax", () => {
-  // 性質: center freq > fmaxHz の bin だけ 0、それ以外は不変
-  // 入力: fmin∈[8,2000], B∈[1,24], octaves∈[1,8], fmax∈[8,20000]
-  it("fmax 超の bin だけ 0 に潰す", () => {
+describe("padBinsToFull", () => {
+  // 性質: 低域 fromBins 本はそのまま、残り (toBins-fromBins) は 0、frame-major で配置
+  // 入力: frames∈[1,5], fromBins∈[1,12], extra∈[0,12]
+  it("低域を保ち高域を 0 padding する", () => {
     fc.assert(
       fc.property(
-        fc.integer({ min: 8, max: 2000 }),
-        fc.integer({ min: 1, max: 24 }),
-        fc.integer({ min: 1, max: 8 }),
-        fc.integer({ min: 8, max: 20000 }),
         fc.integer({ min: 1, max: 5 }),
-        (fmin, bpo, octaves, fmax, frames) => {
-          const bins = bpo * octaves;
-          const orig = new Float32Array(frames * bins);
-          for (let i = 0; i < orig.length; i++) orig[i] = i + 1;
-          const mags = orig.slice();
-          zeroBinsAboveFmax(mags, frames, bins, fmin, bpo, fmax);
+        fc.integer({ min: 1, max: 12 }),
+        fc.integer({ min: 0, max: 12 }),
+        (frames, fromBins, extra) => {
+          const toBins = fromBins + extra;
+          const src = new Float32Array(frames * fromBins);
+          for (let i = 0; i < src.length; i++) src[i] = i + 1;
+          const out = padBinsToFull(src, frames, fromBins, toBins);
+          expect(out.length).toBe(frames * toBins);
           for (let f = 0; f < frames; f++) {
-            for (let b = 0; b < bins; b++) {
-              const over = cqtBinFrequency(fmin, bpo, b) > fmax;
-              expect(mags[f * bins + b]).toBe(over ? 0 : orig[f * bins + b]!);
+            for (let b = 0; b < toBins; b++) {
+              expect(out[f * toBins + b]).toBe(b < fromBins ? src[f * fromBins + b]! : 0);
             }
           }
         },

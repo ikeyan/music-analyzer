@@ -232,21 +232,20 @@ export async function computeCqt(
   return { magnitudes: out, frames, bins };
 }
 
-// center freq > fmaxHz の bin は decode Nyquist 付近で信頼できないので 0 に潰す。frame-major in-place
-export function zeroBinsAboveFmax(
+// 低域 fromBins 本の frame-major magnitudes を full (toBins) バッファに移し、高域を 0 で残す。
+// harmonic plane の安全な octave 分だけ計算し、Nyquist 超の高域 octave を 0 にするため
+export function padBinsToFull(
   mags: Float32Array<ArrayBuffer>,
   frames: number,
-  bins: number,
-  fminHz: number,
-  binsPerOctave: number,
-  fmaxHz: number,
-): void {
-  let cutoff = 0;
-  while (cutoff < bins && cqtBinFrequency(fminHz, binsPerOctave, cutoff) <= fmaxHz) cutoff++;
-  if (cutoff >= bins) return;
+  fromBins: number,
+  toBins: number,
+): Float32Array<ArrayBuffer> {
+  if (fromBins >= toBins) return mags;
+  const out = new Float32Array(frames * toBins);
   for (let f = 0; f < frames; f++) {
-    for (let b = cutoff; b < bins; b++) mags[f * bins + b] = 0;
+    out.set(mags.subarray(f * fromBins, (f + 1) * fromBins), f * toBins);
   }
+  return out;
 }
 
 // dB スケール [dbMin, dbMax] → Uint8 [0, 255]

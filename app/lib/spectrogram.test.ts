@@ -8,6 +8,7 @@ import {
   cqtRangeFromCenter,
   levelCount,
   parseHarmonics,
+  safeCqtOctaves,
   sliceTile,
   tileCount,
 } from "./spectrogram";
@@ -102,6 +103,29 @@ describe("cqtRangeFromCenter", () => {
         },
       ),
       { numRuns: 20 },
+    );
+  });
+});
+
+describe("safeCqtOctaves", () => {
+  // 性質: safe∈[0,octaves]、safe>=1 なら最上位 octave 上端 fmin*2^safe <= fmax、
+  // base が収まる (fmin*2^octaves<=fmax) なら octaves をそのまま返す
+  // 入力: fmin∈[8,4000], octaves∈[1,10], fmax∈[8,20000]
+  it("最上位 octave が fmax 以下になる octave 数を返す", () => {
+    fc.assert(
+      fc.property(
+        fc.integer({ min: 8, max: 4000 }),
+        fc.integer({ min: 1, max: 10 }),
+        fc.integer({ min: 8, max: 20000 }),
+        (fmin, octaves, fmax) => {
+          const safe = safeCqtOctaves(fmin, octaves, fmax);
+          expect(safe).toBeGreaterThanOrEqual(0);
+          expect(safe).toBeLessThanOrEqual(octaves);
+          if (safe >= 1) expect(fmin * 2 ** safe).toBeLessThanOrEqual(fmax);
+          if (fmin * 2 ** octaves <= fmax) expect(safe).toBe(octaves);
+        },
+      ),
+      { numRuns: 30 },
     );
   });
 });
