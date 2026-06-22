@@ -108,21 +108,23 @@ describe("cqtRangeFromCenter", () => {
 });
 
 describe("safeCqtOctaves", () => {
-  // 性質: safe∈[0,octaves]、safe>=1 なら最上位 octave 上端 fmin*2^safe <= fmax、
-  // base が収まる (fmin*2^octaves<=fmax) なら octaves をそのまま返す
-  // 入力: fmin∈[8,4000], octaves∈[1,10], fmax∈[8,20000]
-  it("最上位 octave が fmax 以下になる octave 数を返す", () => {
+  // 性質: safe∈[0,octaves]、safe>=1 なら最上位 bin fmin*2^(safe-1/B) <= fmax、
+  // 全 octave の最上位 bin が収まるなら octaves をそのまま返す
+  // 入力: fmin∈[8,4000], B∈[12,48], octaves∈[1,10], fmax∈[8,20000]
+  it("最上位 bin が fmax 以下になる octave 数を返す", () => {
     fc.assert(
       fc.property(
         fc.integer({ min: 8, max: 4000 }),
+        fc.integer({ min: 12, max: 48 }),
         fc.integer({ min: 1, max: 10 }),
         fc.integer({ min: 8, max: 20000 }),
-        (fmin, octaves, fmax) => {
-          const safe = safeCqtOctaves(fmin, octaves, fmax);
+        (fmin, bpo, octaves, fmax) => {
+          const safe = safeCqtOctaves(fmin, bpo, octaves, fmax);
           expect(safe).toBeGreaterThanOrEqual(0);
           expect(safe).toBeLessThanOrEqual(octaves);
-          if (safe >= 1) expect(fmin * 2 ** safe).toBeLessThanOrEqual(fmax);
-          if (fmin * 2 ** octaves <= fmax) expect(safe).toBe(octaves);
+          if (safe >= 1)
+            expect(fmin * 2 ** (safe - 1 / bpo)).toBeLessThanOrEqual(fmax * (1 + 1e-9));
+          if (fmin * 2 ** (octaves - 1 / bpo) <= fmax * (1 - 1e-9)) expect(safe).toBe(octaves);
         },
       ),
       { numRuns: 30 },

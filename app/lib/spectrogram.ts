@@ -50,12 +50,17 @@ export function cqtRangeFromCenter(
   return { fminHz: centerHz / 2 ** octavesDown, octaves: octavesDown + octavesUp };
 }
 
-// harmonic plane (最低周波数 fminHz) を fmaxHz 以下で表せる octave 数。computeCqt は最上位
-// octave のカーネルを全 octave で使い回すため、最上位 octave が Nyquist を超えると全 octave が
-// aliasing する。これを超える octave は計算せず 0 padding する
-export function safeCqtOctaves(fminHz: number, octaves: number, fmaxHz: number): number {
+// harmonic plane (最低周波数 fminHz) の最上位 bin fmin*2^((N*B-1)/B) が fmaxHz 以下に収まる
+// 最大 octave 数 N。computeCqt は最上位 octave のカーネルを全 octave で使い回すため、最上位
+// octave が Nyquist を超えると全 octave が aliasing する。N を超える octave は計算せず 0 padding する
+export function safeCqtOctaves(
+  fminHz: number,
+  binsPerOctave: number,
+  octaves: number,
+  fmaxHz: number,
+): number {
   if (!(fminHz < fmaxHz)) return 0;
-  return Math.min(octaves, Math.floor(Math.log2(fmaxHz / fminHz)));
+  return Math.min(octaves, Math.floor(Math.log2(fmaxHz / fminHz) + 1 / binsPerOctave));
 }
 
 export function parseHarmonics(json: string): number[] {
