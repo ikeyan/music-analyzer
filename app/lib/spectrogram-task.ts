@@ -78,7 +78,7 @@ export async function runSpectrogramTask(
   }
   // 各 harmonic plane で kernel が aliasing しない octave 数。超える高域 octave は 0 padding する
   const planeOctaves = harmonics.map((h) =>
-    safeCqtOctaves(spec.fminHz * h, spec.octaves, MAX_SPECTROGRAM_FMAX_HZ),
+    safeCqtOctaves(spec.fminHz * h, spec.binsPerOctave, spec.octaves, MAX_SPECTROGRAM_FMAX_HZ),
   );
   // 低周波 × 高 bins はカーネルが伸びて演算量が爆発するので compute 予算でもゲートする
   let estOps = 0;
