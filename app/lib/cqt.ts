@@ -208,6 +208,15 @@ export async function computeCqt(
     throw new Error(`cqt: hop ${p.hop} must be divisible by 2^(octaves-1)`);
   }
   const bins = p.binsPerOctave * p.octaves;
+  // 最上位 octave のカーネルを全 octave で使い回すので、最上位 bin が Nyquist 超だと
+  // plane 全体が aliasing する。caller は safeCqtOctaves で octave を絞ること
+  const topBinHz = cqtBinFrequency(p.fminHz, p.binsPerOctave, bins - 1);
+  if (topBinHz > p.sampleRate / 2) {
+    throw new Error(
+      `cqt: top bin ${Math.round(topBinHz)}Hz exceeds Nyquist ${p.sampleRate / 2}Hz ` +
+        `(kernel aliases every octave; clamp octaves via safeCqtOctaves)`,
+    );
+  }
   const frames = Math.max(1, Math.floor(samples.length / p.hop) + 1);
   const out = new Float32Array(frames * bins);
   const kernel = designTopOctaveKernel(p);
