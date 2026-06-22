@@ -1,9 +1,11 @@
 import { type CSSProperties, useEffect, useRef, useState } from "react";
 import type { ApiAudio, ApiSpectrogram } from "../api/types";
+import { loadLocal, saveLocal } from "../lib/local-store";
 import {
   MAX_SPECTROGRAM_BINS,
   MAX_SPECTROGRAM_FMAX_HZ,
   type SpectrogramMeta,
+  cqtRangeFromCenter,
 } from "../lib/spectrogram";
 
 // audio track ごとに表示する spectrogram の選択。mode は "h{n}" (単一 harmonic) か
@@ -329,7 +331,7 @@ export type LensHover = {
   clientY: number;
 };
 
-const LENS_AXIS_W = 44;
+const LENS_AXIS_W = 58;
 const LENS_STRIPE_W = 16;
 const LENS_LABEL_H = 14;
 
@@ -469,11 +471,12 @@ export function HarmonicLens({
     ctx.textAlign = "right";
     for (let o = 0; o <= spec.octaves; o++) {
       const y = Math.round(displayH * (1 - (o * spec.binsPerOctave) / bins));
+      const f = spec.fminHz * 2 ** o;
       ctx.beginPath();
       ctx.moveTo(LENS_AXIS_W, y + 0.5);
       ctx.lineTo(canvasW, y + 0.5);
       ctx.stroke();
-      ctx.fillText(formatHz(spec.fminHz * 2 ** o), LENS_AXIS_W - 4, Math.max(6, y));
+      ctx.fillText(`${noteName(f)} ${formatHz(f)}`, LENS_AXIS_W - 4, Math.max(6, y));
     }
     ctx.textAlign = "center";
     ctx.fillStyle = "#ccc";
@@ -500,6 +503,8 @@ export function HarmonicLens({
   const top = Math.max(8, Math.min(window.innerHeight - panelH - 8, anchorY - panelH / 2));
 
   const f0 = binSel === null ? null : spec.fminHz * 2 ** (binSel / spec.binsPerOctave);
+  const stepOct = binSel === null ? null : Math.floor(binSel / spec.binsPerOctave);
+  const stepInOct = binSel === null ? null : binSel % spec.binsPerOctave;
   return (
     <div
       aria-hidden="true"
@@ -525,7 +530,9 @@ export function HarmonicLens({
           whiteSpace: "nowrap",
         }}
       >
-        t={srcT.toFixed(2)}s{f0 !== null && ` / f0候補 ${f0.toFixed(1)}Hz ${noteName(f0)}`}
+        t={srcT.toFixed(2)}s
+        {f0 !== null &&
+          ` · step ${binSel} (${stepOct}oct +${stepInOct}/${spec.binsPerOctave}) · ${f0.toFixed(1)}Hz ${noteName(f0)}`}
       </div>
       <canvas ref={canvasRef} style={{ width: canvasW, height: canvasH, display: "block" }} />
     </div>
@@ -556,50 +563,83 @@ function statusBadge(status: ApiSpectrogram["status"]): { label: string; color: 
   }
 }
 
-// ModalShell (project-detail 側) の中身として描く。表示選択は audio ごとに 1 つ
+type CqtForm = {
+  binsPerOctave: string;
+  centerHz: string;
+  octavesDown: string;
+  octavesUp: string;
+  harmonics: number[];
+};
+
+const DEFAULT_CQT_FORM: CqtForm = {
+  binsPerOctave: "12",
+  centerHz: "440",
+  octavesDown: "4",
+  octavesUp: "4",
+  harmonics: [1],
+};
+
+// ModalShell (project-detail 側) の中身として描く。表示選択は audio ごとに 1 つ。
+// 生成フォームの値は projectId 単位で localStorage に保存して次回も引き継ぐ
 export function SpectrogramDialogBody({
+  projectId,
   audio,
   view,
   onChangeView,
   onCreate,
   onDelete,
 }: {
+  projectId: string;
   audio: ApiAudio;
   view: SpectrogramSelection | null;
   onChangeView: (v: SpectrogramSelection | null) => void;
   onCreate: (p: SpectrogramCreateParams) => Promise<{ ok: true } | { error: string }>;
   onDelete: (specId: string) => Promise<{ ok: true } | { error: string }>;
 }) {
-  const [binsPerOctave, setBinsPerOctave] = useState("12");
-  const [octaves, setOctaves] = useState("7");
-  const [fminHz, setFminHz] = useState("32.703");
-  const [harmonics, setHarmonics] = useState<number[]>([1]);
+  const formKey = `cqtForm:${projectId}`;
+  const [form, setForm] = useState<CqtForm>(() => ({
+    ...DEFAULT_CQT_FORM,
+    ...loadLocal<Partial<CqtForm>>(formKey, {}),
+  }));
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
+  useEffect(() => {
+    saveLocal(formKey, form);
+  }, [formKey, form]);
+
+  const setField = <K extends keyof CqtForm>(k: K, v: CqtForm[K]): void =>
+    setForm((f) => ({ ...f, [k]: v }));
+
   async function create(): Promise<void> {
-    const b = Number(binsPerOctave);
-    const o = Number(octaves);
-    const f = Number(fminHz);
-    if (!Number.isInteger(b) || b < 1 || !Number.isInteger(o) || o < 1) {
-      setError("binsPerOctave / octaves は正の整数で指定してください");
+    const b = Number(form.binsPerOctave);
+    const center = Number(form.centerHz);
+    const down = Number(form.octavesDown);
+    const up = Number(form.octavesUp);
+    if (!Number.isInteger(b) || b < 1) {
+      setError("bins/octave は正の整数で指定してください");
       return;
     }
-    if (!Number.isFinite(f) || f <= 0) {
-      setError("fmin は正の有限数で指定してください");
+    if (!Number.isInteger(down) || down < 0 || !Number.isInteger(up) || up < 0 || down + up < 1) {
+      setError("オクターブ数は 0 以上の整数、上下合計 1 以上で指定してください");
       return;
     }
-    if (f * 2 ** o > MAX_SPECTROGRAM_FMAX_HZ) {
-      setError(`基本レンジ上端 fmin×2^octaves は ${MAX_SPECTROGRAM_FMAX_HZ}Hz 以下にしてください`);
+    if (!Number.isFinite(center) || center <= 0) {
+      setError("中心周波数は正の有限数で指定してください");
       return;
     }
-    if (harmonics.length === 0) {
+    if (center * 2 ** up > MAX_SPECTROGRAM_FMAX_HZ) {
+      setError(`基本レンジ上端 (中心×2^上) は ${MAX_SPECTROGRAM_FMAX_HZ}Hz 以下にしてください`);
+      return;
+    }
+    if (form.harmonics.length === 0) {
       setError("harmonics を 1 つ以上選択してください");
       return;
     }
+    const { fminHz, octaves } = cqtRangeFromCenter(center, down, up);
     setBusy("create");
     setError(null);
-    const result = await onCreate({ binsPerOctave: b, octaves: o, fminHz: f, harmonics });
+    const result = await onCreate({ binsPerOctave: b, octaves, fminHz, harmonics: form.harmonics });
     setBusy(null);
     if ("error" in result) setError(result.error);
   }
@@ -614,9 +654,26 @@ export function SpectrogramDialogBody({
     else if (view?.specId === specId) onChangeView(null);
   }
 
-  const baseTopHz = Number(fminHz) * 2 ** Number(octaves);
-  const baseTopValid = Number.isFinite(baseTopHz) && baseTopHz > 0;
-  const baseTopOver = baseTopValid && baseTopHz > MAX_SPECTROGRAM_FMAX_HZ;
+  const b = Number(form.binsPerOctave);
+  const center = Number(form.centerHz);
+  const down = Number(form.octavesDown);
+  const up = Number(form.octavesUp);
+  const formValid =
+    Number.isInteger(b) &&
+    b >= 1 &&
+    Number.isInteger(down) &&
+    down >= 0 &&
+    Number.isInteger(up) &&
+    up >= 0 &&
+    down + up >= 1 &&
+    Number.isFinite(center) &&
+    center > 0;
+  const { fminHz: derivedFmin, octaves: derivedOct } = formValid
+    ? cqtRangeFromCenter(center, down, up)
+    : { fminHz: Number.NaN, octaves: Number.NaN };
+  const maxBinHz = formValid ? derivedFmin * 2 ** ((b * derivedOct - 1) / b) : Number.NaN;
+  const baseTopHz = formValid ? center * 2 ** up : Number.NaN;
+  const baseTopOver = formValid && baseTopHz > MAX_SPECTROGRAM_FMAX_HZ;
 
   return (
     <div>
@@ -709,59 +766,70 @@ export function SpectrogramDialogBody({
               max="96"
               step="1"
               list="bins-per-octave-presets"
-              value={binsPerOctave}
-              onChange={(e) => setBinsPerOctave(e.target.value)}
+              value={form.binsPerOctave}
+              onChange={(e) => setField("binsPerOctave", e.target.value)}
               disabled={busy !== null}
               style={{ width: 80 }}
             />
             <datalist id="bins-per-octave-presets">
-              {[12, 19, 24, 31, 36, 41, 48, 53, 62, 72, 82].map((b) => (
-                <option key={b} value={String(b)} />
+              {[12, 19, 24, 31, 36, 41, 48, 53, 62, 72, 82].map((bpo) => (
+                <option key={bpo} value={String(bpo)} />
               ))}
             </datalist>
           </label>
           <label style={specLabelStyle}>
-            octaves
+            中心周波数 (Hz)
             <input
               type="number"
               min="1"
-              max="10"
-              step="1"
-              value={octaves}
-              onChange={(e) => setOctaves(e.target.value)}
-              disabled={busy !== null}
-              style={{ width: 64 }}
-            />
-          </label>
-          <label style={specLabelStyle}>
-            fmin (Hz)
-            <input
-              type="number"
-              min="8"
               step="0.001"
-              value={fminHz}
-              onChange={(e) => setFminHz(e.target.value)}
+              value={form.centerHz}
+              onChange={(e) => setField("centerHz", e.target.value)}
               disabled={busy !== null}
               style={{ width: 100 }}
             />
           </label>
+          <label style={specLabelStyle}>
+            ↓ oct
+            <input
+              type="number"
+              min="0"
+              max="10"
+              step="1"
+              value={form.octavesDown}
+              onChange={(e) => setField("octavesDown", e.target.value)}
+              disabled={busy !== null}
+              style={{ width: 56 }}
+            />
+          </label>
+          <label style={specLabelStyle}>
+            ↑ oct
+            <input
+              type="number"
+              min="0"
+              max="10"
+              step="1"
+              value={form.octavesUp}
+              onChange={(e) => setField("octavesUp", e.target.value)}
+              disabled={busy !== null}
+              style={{ width: 56 }}
+            />
+          </label>
         </div>
-        <p style={{ fontSize: 11, color: "#666", margin: "0.4rem 0 0" }}>
-          n 平均律は bins/octave に n（細かくするならその倍数）を指定。最大 96、 bins/octave ×
-          octaves ≤ {MAX_SPECTROGRAM_BINS}。
-        </p>
-        {baseTopValid && (
+        {formValid && (
           <p
-            style={{
-              fontSize: 11,
-              margin: "0.2rem 0 0",
-              color: baseTopOver ? "crimson" : "#666",
-            }}
+            style={{ fontSize: 11, margin: "0.3rem 0 0", color: baseTopOver ? "crimson" : "#666" }}
           >
-            基本レンジ上端 fmin×2^octaves ≈ {formatHz(baseTopHz)}Hz
-            {baseTopOver && ` — ${MAX_SPECTROGRAM_FMAX_HZ}Hz 以下にしてください`}
+            範囲 {formatHz(derivedFmin)}Hz {noteName(derivedFmin)} 〜 {formatHz(maxBinHz)}Hz{" "}
+            {noteName(maxBinHz)}（中心 {formatHz(center)}Hz {noteName(center)}、{derivedOct}oct ×{" "}
+            {b}bins = {b * derivedOct} bins）
+            {baseTopOver && ` — 上端 ${formatHz(baseTopHz)}Hz が ${MAX_SPECTROGRAM_FMAX_HZ}Hz 超`}
           </p>
         )}
+        <p style={{ fontSize: 11, color: "#666", margin: "0.2rem 0 0" }}>
+          n 平均律は bins/octave に n（細かくするならその倍数）を指定。最大 96、 bins/octave ×
+          octaves ≤ {MAX_SPECTROGRAM_BINS}。オクターブ線は中心から上下に並びます。
+        </p>
         <div style={{ ...specRowStyle, marginTop: "0.5rem" }}>
           <span style={{ fontSize: 12, color: "#444" }}>harmonics:</span>
           {HARMONIC_CHOICES.map((h) => (
@@ -771,12 +839,13 @@ export function SpectrogramDialogBody({
             >
               <input
                 type="checkbox"
-                checked={harmonics.includes(h)}
+                checked={form.harmonics.includes(h)}
                 onChange={(e) =>
-                  setHarmonics((prev) =>
+                  setField(
+                    "harmonics",
                     e.target.checked
-                      ? [...prev, h].toSorted((a, b) => a - b)
-                      : prev.filter((x) => x !== h),
+                      ? [...form.harmonics, h].toSorted((a, x) => a - x)
+                      : form.harmonics.filter((x) => x !== h),
                   )
                 }
                 disabled={busy !== null}
@@ -786,11 +855,15 @@ export function SpectrogramDialogBody({
           ))}
         </div>
         <p style={{ fontSize: 11, color: "#666", margin: "0.4rem 0" }}>
-          harmonic CQT は選んだ各倍音 (fmin×h) ごとに CQT を計算します。複数選ぶと RGB
-          合成表示が使えます。fmin×h が {MAX_SPECTROGRAM_FMAX_HZ}Hz
+          harmonic CQT は選んだ各倍音 (中心×h) ごとに CQT を計算します。複数選ぶと RGB
+          合成表示が使えます。{MAX_SPECTROGRAM_FMAX_HZ}Hz
           を超える高域は自動で黒く（クランプ）表示されます。
         </p>
-        <button type="button" onClick={create} disabled={busy !== null || baseTopOver}>
+        <button
+          type="button"
+          onClick={create}
+          disabled={busy !== null || baseTopOver || !formValid}
+        >
           {busy === "create" ? "開始中…" : "生成開始"}
         </button>
       </section>

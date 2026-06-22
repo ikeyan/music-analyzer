@@ -5,6 +5,7 @@ import {
   SPECTROGRAM_TILE_FRAMES,
   buildPyramid,
   chooseHop,
+  cqtRangeFromCenter,
   levelCount,
   parseHarmonics,
   sliceTile,
@@ -78,6 +79,26 @@ describe("buildPyramid / sliceTile", () => {
           let total = 0;
           for (let i = 0; i < tileCount(frames); i++) total += sliceTile(level, bins, i).length;
           expect(total).toBe(frames * bins);
+        },
+      ),
+      { numRuns: 20 },
+    );
+  });
+});
+
+describe("cqtRangeFromCenter", () => {
+  // 性質: octaves = down+up、中心は最低 bin の octavesDown 上 (fmin*2^down == center)
+  // 入力: center∈[8,4000], down/up∈[0,8]
+  it("中心と上下オクターブから fmin/octaves を導く", () => {
+    fc.assert(
+      fc.property(
+        fc.integer({ min: 8, max: 4000 }),
+        fc.integer({ min: 0, max: 8 }),
+        fc.integer({ min: 0, max: 8 }),
+        (center, down, up) => {
+          const { fminHz, octaves } = cqtRangeFromCenter(center, down, up);
+          expect(octaves).toBe(down + up);
+          expect(fminHz * 2 ** down).toBeCloseTo(center, 6);
         },
       ),
       { numRuns: 20 },

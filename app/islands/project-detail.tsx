@@ -26,6 +26,7 @@ import {
 } from "../components/spectrogram";
 import { apiClient } from "../lib/api-client";
 import { chunkedUpload } from "../lib/chunked-upload";
+import { loadLocal, saveLocal } from "../lib/local-store";
 
 export type Thumb = ApiThumbnail;
 export type VideoItem = ApiVideo;
@@ -36,6 +37,7 @@ export type ProjectDetailData = ApiProjectDetail;
 const TASK_POLL_INTERVAL_MS = 1000;
 
 type Track = { kind: "video"; data: VideoItem } | { kind: "audio"; data: AudioItem };
+type ShownSpec = { spec: ApiSpectrogram; mode: string; audio: AudioItem };
 
 const TRACK_HEIGHT = 64;
 const TRACK_GAP = 8;
@@ -63,6 +65,28 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
   const [specViews, setSpecViews] = useState<Record<string, SpectrogramSelection | undefined>>({});
   // harmonic CQT lens: spectrogram 表示中の audio 行を hover している間だけ出す
   const [lens, setLens] = useState<(LensHover & { audioId: string }) | null>(null);
+  // 再生位置レンズ: ON の間は hover ではなく再生ヘッド時刻で各表示行にレンズを出す
+  const [playbackLens, setPlaybackLens] = useState(false);
+  const rowsRef = useRef<HTMLDivElement | null>(null);
+
+  // 表示状態 (specViews) と再生位置レンズの ON/OFF を project 単位で localStorage に保存。
+  // hydration mismatch を避けるため初期値は空で mount 後に読み込む。save effect を load より
+  // 先に定義することで、mount commit では restoredRef=false で save が skip され、初期空値で
+  // 保存データを潰さない (load が state を当てた次の commit から保存が効く)
+  const viewsKey = `cqtViews:${data.id}`;
+  const lensKey = `cqtPlaybackLens:${data.id}`;
+  const restoredRef = useRef(false);
+  useEffect(() => {
+    if (restoredRef.current) saveLocal(viewsKey, specViews);
+  }, [viewsKey, specViews]);
+  useEffect(() => {
+    if (restoredRef.current) saveLocal(lensKey, playbackLens);
+  }, [lensKey, playbackLens]);
+  useEffect(() => {
+    setSpecViews(loadLocal(viewsKey, {} as Record<string, SpectrogramSelection | undefined>));
+    setPlaybackLens(loadLocal(lensKey, false));
+    restoredRef.current = true;
+  }, [viewsKey, lensKey]);
 
   const tracks: Track[] = useMemo(() => {
     const all: Track[] = [
@@ -370,7 +394,7 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
   type RowInfo = {
     top: number;
     height: number;
-    shownSpec: { spec: ApiSpectrogram; mode: string; audio: AudioItem } | null;
+    shownSpec: ShownSpec | null;
   };
   const rowInfos: RowInfo[] = useMemo(() => {
     let top = 0;
@@ -468,6 +492,17 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
         <span style={{ fontVariantNumeric: "tabular-nums" }}>
           {formatTime(currentTime)} / {formatTime(playEnd)}
         </span>
+        <label
+          style={{ display: "flex", alignItems: "center", gap: "0.3rem", fontSize: 13 }}
+          title="ON の間はマウスではなく再生ヘッドの時刻で各 spectrogram 行に CQT レンズを出します"
+        >
+          <input
+            type="checkbox"
+            checked={playbackLens}
+            onChange={(e) => setPlaybackLens(e.target.checked)}
+          />
+          再生位置レンズ
+        </label>
         <label style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: "0.4rem" }}>
           ズーム
           <input
@@ -503,6 +538,7 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
         >
           <TimeRuler duration={displayDuration} pxPerSec={pxPerSec} />
           <div
+            ref={rowsRef}
             style={{
               position: "relative",
               height: tracksTotalHeight,
@@ -530,9 +566,19 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
                   onTrim={() => setTrimming({ kind: t.kind, id: t.data.id })}
                   onSpectrogram={t.kind === "audio" ? () => setSpecDialog(t.data.id) : undefined}
                   onLensHover={
-                    shown ? (h) => setLens(h ? { ...h, audioId: t.data.id } : null) : undefined
+                    shown && !playbackLens
+                      ? (h) => setLens(h ? { ...h, audioId: t.data.id } : null)
+                      : undefined
                   }
-                  lensProjT={shown && lens?.audioId === t.data.id ? lens.projT : null}
+                  lensProjT={
+                    shown
+                      ? playbackLens
+                        ? currentTime
+                        : lens?.audioId === t.data.id
+                          ? lens.projT
+                          : null
+                      : null
+                  }
                   attachRef={(el) => {
                     if (el) mediaRefs.current.set(trackKey(t), el);
                     else mediaRefs.current.delete(trackKey(t));
@@ -589,6 +635,7 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
           onClose={() => setSpecDialog(null)}
         >
           <SpectrogramDialogBody
+            projectId={data.id}
             audio={specDialogAudio}
             view={specViews[specDialogAudio.id] ?? null}
             onChangeView={(v) =>
@@ -599,7 +646,7 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
           />
         </ModalShell>
       )}
-      {lens && lensTarget && (
+      {!playbackLens && lens && lensTarget && (
         <HarmonicLens
           spec={lensTarget.spec}
           audio={lensTarget.audio}
@@ -609,7 +656,42 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
           anchorY={lens.clientY}
         />
       )}
+      {playbackLens &&
+        playbackLenses(rowsRef.current, tracks, rowInfos, currentTime, pxPerSec, viewport)}
     </div>
+  );
+}
+
+// 再生位置レンズ: 表示中の各 spectrogram 行に、再生ヘッド時刻 (yRatio=null) の
+// レンズを再生ヘッドの画面座標で出す。rowsRef は水平スクロールに追従するので
+// その rect を原点に anchor を求める
+function playbackLenses(
+  rows: HTMLDivElement | null,
+  tracks: Track[],
+  rowInfos: { top: number; height: number; shownSpec: ShownSpec | null }[],
+  currentTime: number,
+  pxPerSec: number,
+  viewport: { left: number; width: number },
+): ReactNode {
+  if (!rows) return null;
+  const rect = rows.getBoundingClientRect();
+  const boxLeft = rect.left + viewport.left;
+  const anchorX = Math.max(
+    boxLeft + 4,
+    Math.min(boxLeft + viewport.width - 4, rect.left + currentTime * pxPerSec),
+  );
+  return rowInfos.map((info, idx) =>
+    info.shownSpec ? (
+      <HarmonicLens
+        key={trackKey(tracks[idx]!)}
+        spec={info.shownSpec.spec}
+        audio={info.shownSpec.audio}
+        projT={currentTime}
+        yRatio={null}
+        anchorX={anchorX}
+        anchorY={rect.top + info.top + info.height / 2}
+      />
+    ) : null,
   );
 }
 

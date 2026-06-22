@@ -39,6 +39,16 @@ export type SpectrogramMeta = {
   durationSec: number;
 };
 
+// 中心周波数 centerHz を基準に octavesDown 下・octavesUp 上を解析範囲とし
+// (fminHz, octaves) を導く。UI は中心 + 上下オクターブで指定する
+export function cqtRangeFromCenter(
+  centerHz: number,
+  octavesDown: number,
+  octavesUp: number,
+): { fminHz: number; octaves: number } {
+  return { fminHz: centerHz / 2 ** octavesDown, octaves: octavesDown + octavesUp };
+}
+
 export function parseHarmonics(json: string): number[] {
   const parsed: unknown = JSON.parse(json);
   if (
