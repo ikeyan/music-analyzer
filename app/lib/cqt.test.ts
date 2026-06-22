@@ -54,6 +54,19 @@ describe("computeCqt", () => {
     expect(magnitudes[mid * bins + bin]!).toBeLessThan(1.1);
   });
 
+  it("最上位 bin が Nyquist 超だと throw (kernel aliasing 防止)", () => {
+    // top bin 3000*2^(23/12) ≈ 11.3kHz > Nyquist 4kHz
+    expect(
+      computeCqt(new Float32Array(512), {
+        sampleRate: FS,
+        binsPerOctave: B,
+        octaves: 2,
+        fminHz: 3000,
+        hop: 64,
+      }),
+    ).rejects.toThrow(/Nyquist/);
+  });
+
   it("hop が 2^(octaves-1) の倍数でないと throw", () => {
     expect(
       computeCqt(new Float32Array(256), {
