@@ -216,6 +216,8 @@ describe("cqt spectrogram task", () => {
       json: { binsPerOctave: 12, octaves: 7, fminHz: 32.7, harmonics: [1, 5] },
     });
     expect(res.status).toBe(201);
+    // background task を drain してから抜ける (次 test の clearDb と race させない)
+    await waitForInflightTasks();
   });
 
   it("pending 中の DELETE は 409", async () => {
