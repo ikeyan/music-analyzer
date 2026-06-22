@@ -1,7 +1,13 @@
 import { Either } from "effect";
 import { join } from "node:path";
 import type { Task } from "../generated/prisma/client";
-import { computeCqt, estimateCqtOps, magnitudesToU8, makeCooperativeYield } from "./cqt";
+import {
+  computeCqt,
+  estimateCqtOps,
+  magnitudesToU8,
+  makeCooperativeYield,
+  padBinsToFull,
+} from "./cqt";
 import { decodeAudioPcm } from "./ffmpeg";
 import { markPrefixForDeletion } from "./gc";
 import { prisma } from "./prisma";
@@ -9,6 +15,7 @@ import { getS3 } from "./s3";
 import {
   MAX_ANALYSIS_BYTES,
   MAX_ANALYSIS_OPS,
+  MAX_SPECTROGRAM_FMAX_HZ,
   SPECTROGRAM_DB_MAX,
   SPECTROGRAM_DB_MIN,
   SPECTROGRAM_TILE_FRAMES,
@@ -18,6 +25,7 @@ import {
   chooseHop,
   estimateAnalysisBytes,
   parseHarmonics,
+  safeCqtOctaves,
   sliceTile,
   tileCount,
 } from "./spectrogram";
@@ -68,13 +76,19 @@ export async function runSpectrogramTask(
         `${MAX_ANALYSIS_BYTES / 2 ** 20}MB. Reduce octaves / fmin / binsPerOctave / harmonics.`,
     );
   }
+  // 各 harmonic plane で kernel が aliasing しない octave 数。超える高域 octave は 0 padding する
+  const planeOctaves = harmonics.map((h) =>
+    safeCqtOctaves(spec.fminHz * h, spec.binsPerOctave, spec.octaves, MAX_SPECTROGRAM_FMAX_HZ),
+  );
   // 低周波 × 高 bins はカーネルが伸びて演算量が爆発するので compute 予算でもゲートする
   let estOps = 0;
-  for (const h of harmonics) {
+  for (const [hi, h] of harmonics.entries()) {
+    const oct = planeOctaves[hi]!;
+    if (oct < 1) continue;
     estOps += estimateCqtOps(estSamples, {
       sampleRate,
       binsPerOctave: spec.binsPerOctave,
-      octaves: spec.octaves,
+      octaves: oct,
       fminHz: spec.fminHz * h,
       hop: estHop,
     });
@@ -93,6 +107,7 @@ export async function runSpectrogramTask(
   if (samples.length === 0) return Either.left("decoded audio is empty");
 
   const hop = chooseHop(sampleRate, spec.octaves, samples.length);
+  const frames0 = Math.max(1, Math.floor(samples.length / hop) + 1);
 
   const prefix = spectrogramPrefix(audio.projectId, audio.id, spec.id);
   await markPrefixForDeletion(prefix, graceMs);
@@ -101,22 +116,31 @@ export async function runSpectrogramTask(
   let levels = 0;
   // DSP は in-process で走るので、協調 yield で event loop を塞がないようにする
   const maybeYield = makeCooperativeYield();
-  for (const h of harmonics) {
-    const result = await computeCqt(
-      samples,
-      {
-        sampleRate,
-        binsPerOctave: spec.binsPerOctave,
-        octaves: spec.octaves,
-        fminHz: spec.fminHz * h,
-        hop,
-      },
-      maybeYield,
-    );
-    frames = result.frames;
+  for (const [hi, h] of harmonics.entries()) {
+    const oct = planeOctaves[hi]!;
+    // 安全な低域 octave だけ計算し、上限超の高域 octave は 0 padding する (kernel aliasing 回避)
+    let magnitudes: Float32Array<ArrayBuffer>;
+    if (oct >= 1) {
+      const result = await computeCqt(
+        samples,
+        {
+          sampleRate,
+          binsPerOctave: spec.binsPerOctave,
+          octaves: oct,
+          fminHz: spec.fminHz * h,
+          hop,
+        },
+        maybeYield,
+      );
+      frames = result.frames;
+      magnitudes = padBinsToFull(result.magnitudes, result.frames, spec.binsPerOctave * oct, bins);
+    } else {
+      frames = frames0;
+      magnitudes = new Float32Array(frames0 * bins);
+    }
     const pyramid = await buildPyramid(
-      await magnitudesToU8(result.magnitudes, SPECTROGRAM_DB_MIN, SPECTROGRAM_DB_MAX, maybeYield),
-      result.frames,
+      await magnitudesToU8(magnitudes, SPECTROGRAM_DB_MIN, SPECTROGRAM_DB_MAX, maybeYield),
+      frames,
       bins,
       SPECTROGRAM_TILE_FRAMES,
       maybeYield,

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import * as fc from "fast-check";
-import { computeCqt, cqtBinFrequency, downsample2, magnitudesToU8 } from "./cqt";
+import { computeCqt, cqtBinFrequency, downsample2, magnitudesToU8, padBinsToFull } from "./cqt";
 
 const FS = 8000;
 const B = 12;
@@ -91,6 +91,33 @@ describe("downsample2", () => {
         expect((await downsample2(new Float32Array(n))).length).toBe(Math.ceil(n / 2));
       }),
       { numRuns: 20 },
+    );
+  });
+});
+
+describe("padBinsToFull", () => {
+  // 性質: 低域 fromBins 本はそのまま、残り (toBins-fromBins) は 0、frame-major で配置
+  // 入力: frames∈[1,5], fromBins∈[1,12], extra∈[0,12]
+  it("低域を保ち高域を 0 padding する", () => {
+    fc.assert(
+      fc.property(
+        fc.integer({ min: 1, max: 5 }),
+        fc.integer({ min: 1, max: 12 }),
+        fc.integer({ min: 0, max: 12 }),
+        (frames, fromBins, extra) => {
+          const toBins = fromBins + extra;
+          const src = new Float32Array(frames * fromBins);
+          for (let i = 0; i < src.length; i++) src[i] = i + 1;
+          const out = padBinsToFull(src, frames, fromBins, toBins);
+          expect(out.length).toBe(frames * toBins);
+          for (let f = 0; f < frames; f++) {
+            for (let b = 0; b < toBins; b++) {
+              expect(out[f * toBins + b]).toBe(b < fromBins ? src[f * fromBins + b]! : 0);
+            }
+          }
+        },
+      ),
+      { numRuns: 30 },
     );
   });
 });

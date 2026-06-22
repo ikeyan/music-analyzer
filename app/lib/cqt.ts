@@ -232,6 +232,22 @@ export async function computeCqt(
   return { magnitudes: out, frames, bins };
 }
 
+// 低域 fromBins 本の frame-major magnitudes を full (toBins) バッファに移し、高域を 0 で残す。
+// harmonic plane の安全な octave 分だけ計算し、Nyquist 超の高域 octave を 0 にするため
+export function padBinsToFull(
+  mags: Float32Array<ArrayBuffer>,
+  frames: number,
+  fromBins: number,
+  toBins: number,
+): Float32Array<ArrayBuffer> {
+  if (fromBins >= toBins) return mags;
+  const out = new Float32Array(frames * toBins);
+  for (let f = 0; f < frames; f++) {
+    out.set(mags.subarray(f * fromBins, (f + 1) * fromBins), f * toBins);
+  }
+  return out;
+}
+
 // dB スケール [dbMin, dbMax] → Uint8 [0, 255]
 export async function magnitudesToU8(
   mags: Float32Array<ArrayBuffer>,

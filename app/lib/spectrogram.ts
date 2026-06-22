@@ -7,7 +7,9 @@ import type { MaybeYield } from "./cqt";
 export const SPECTROGRAM_DB_MIN = -80;
 export const SPECTROGRAM_DB_MAX = 0;
 export const SPECTROGRAM_TILE_FRAMES = 2048;
-// 最上位 bin (fmin * 2^octaves * max(harmonics)) の許容上限。decode fs の Nyquist を保証する
+// 表示帯域の上限 Hz。基本レンジ fmin*2^octaves はこれ以下に制限する。各 harmonic plane は
+// この周波数を超えない octave 数だけ計算し、超える高域 octave は 0 padding する (最上位
+// octave のカーネルを全 octave で使い回すので、それが Nyquist を超えると全 octave が aliasing する)
 export const MAX_SPECTROGRAM_FMAX_HZ = 20000;
 // fminHz * harmonic の解析下限。窓長が極端に伸びるのを防ぐ
 export const MIN_SPECTROGRAM_FMIN_HZ = 8;
@@ -37,6 +39,29 @@ export type SpectrogramMeta = {
   dbMax: number;
   durationSec: number;
 };
+
+// 中心周波数 centerHz を基準に octavesDown 下・octavesUp 上を解析範囲とし
+// (fminHz, octaves) を導く。UI は中心 + 上下オクターブで指定する
+export function cqtRangeFromCenter(
+  centerHz: number,
+  octavesDown: number,
+  octavesUp: number,
+): { fminHz: number; octaves: number } {
+  return { fminHz: centerHz / 2 ** octavesDown, octaves: octavesDown + octavesUp };
+}
+
+// harmonic plane (最低周波数 fminHz) の最上位 bin fmin*2^((N*B-1)/B) が fmaxHz 以下に収まる
+// 最大 octave 数 N。computeCqt は最上位 octave のカーネルを全 octave で使い回すため、最上位
+// octave が Nyquist を超えると全 octave が aliasing する。N を超える octave は計算せず 0 padding する
+export function safeCqtOctaves(
+  fminHz: number,
+  binsPerOctave: number,
+  octaves: number,
+  fmaxHz: number,
+): number {
+  if (!(fminHz < fmaxHz)) return 0;
+  return Math.min(octaves, Math.floor(Math.log2(fmaxHz / fminHz) + 1 / binsPerOctave));
+}
 
 export function parseHarmonics(json: string): number[] {
   const parsed: unknown = JSON.parse(json);

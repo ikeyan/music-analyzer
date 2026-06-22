@@ -196,14 +196,28 @@ describe("cqt spectrogram task", () => {
     expect(doneTask.error).toContain("estimated compute");
   });
 
-  it("fmax 超過パラメータは 400", async () => {
+  it("基本レンジ fmin*2^octaves が上限超過なら 400", async () => {
     const client = makeClient();
     const { projectId, audioId } = await seedAudio(client);
+    // 100*2^10 = 102400 > 20000
     const res = await client.projects[":id"].audios[":audioId"].spectrograms.$post({
       param: { id: projectId, audioId },
-      json: { binsPerOctave: 12, octaves: 10, fminHz: 100, harmonics: [4] },
+      json: { binsPerOctave: 12, octaves: 10, fminHz: 100, harmonics: [1] },
     });
     expect(res.status).toBe(400);
+  });
+
+  it("基本レンジは上限内で harmonic だけ上限超過なら受理 (高域は clamp)", async () => {
+    const client = makeClient();
+    const { projectId, audioId } = await seedAudio(client);
+    // 32.7*2^7 = 4185.6 <= 20000 だが ×5 倍音 = 20928 > 20000
+    const res = await client.projects[":id"].audios[":audioId"].spectrograms.$post({
+      param: { id: projectId, audioId },
+      json: { binsPerOctave: 12, octaves: 7, fminHz: 32.7, harmonics: [1, 5] },
+    });
+    expect(res.status).toBe(201);
+    // background task を drain してから抜ける (次 test の clearDb と race させない)
+    await waitForInflightTasks();
   });
 
   it("pending 中の DELETE は 409", async () => {

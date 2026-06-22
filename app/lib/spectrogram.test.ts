@@ -5,8 +5,10 @@ import {
   SPECTROGRAM_TILE_FRAMES,
   buildPyramid,
   chooseHop,
+  cqtRangeFromCenter,
   levelCount,
   parseHarmonics,
+  safeCqtOctaves,
   sliceTile,
   tileCount,
 } from "./spectrogram";
@@ -81,6 +83,51 @@ describe("buildPyramid / sliceTile", () => {
         },
       ),
       { numRuns: 20 },
+    );
+  });
+});
+
+describe("cqtRangeFromCenter", () => {
+  // 性質: octaves = down+up、中心は最低 bin の octavesDown 上 (fmin*2^down == center)
+  // 入力: center∈[8,4000], down/up∈[0,8]
+  it("中心と上下オクターブから fmin/octaves を導く", () => {
+    fc.assert(
+      fc.property(
+        fc.integer({ min: 8, max: 4000 }),
+        fc.integer({ min: 0, max: 8 }),
+        fc.integer({ min: 0, max: 8 }),
+        (center, down, up) => {
+          const { fminHz, octaves } = cqtRangeFromCenter(center, down, up);
+          expect(octaves).toBe(down + up);
+          expect(fminHz * 2 ** down).toBeCloseTo(center, 6);
+        },
+      ),
+      { numRuns: 20 },
+    );
+  });
+});
+
+describe("safeCqtOctaves", () => {
+  // 性質: safe∈[0,octaves]、safe>=1 なら最上位 bin fmin*2^(safe-1/B) <= fmax、
+  // 全 octave の最上位 bin が収まるなら octaves をそのまま返す
+  // 入力: fmin∈[8,4000], B∈[12,48], octaves∈[1,10], fmax∈[8,20000]
+  it("最上位 bin が fmax 以下になる octave 数を返す", () => {
+    fc.assert(
+      fc.property(
+        fc.integer({ min: 8, max: 4000 }),
+        fc.integer({ min: 12, max: 48 }),
+        fc.integer({ min: 1, max: 10 }),
+        fc.integer({ min: 8, max: 20000 }),
+        (fmin, bpo, octaves, fmax) => {
+          const safe = safeCqtOctaves(fmin, bpo, octaves, fmax);
+          expect(safe).toBeGreaterThanOrEqual(0);
+          expect(safe).toBeLessThanOrEqual(octaves);
+          if (safe >= 1)
+            expect(fmin * 2 ** (safe - 1 / bpo)).toBeLessThanOrEqual(fmax * (1 + 1e-9));
+          if (fmin * 2 ** (octaves - 1 / bpo) <= fmax * (1 - 1e-9)) expect(safe).toBe(octaves);
+        },
+      ),
+      { numRuns: 30 },
     );
   });
 });
