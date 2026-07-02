@@ -4,8 +4,11 @@ import honox from "honox/vite";
 import { defineConfig } from "vite";
 
 export default defineConfig(({ mode }) => {
+  // built 出力でも識別子を読めるよう mangle 無効化 (whitespace/syntax は縮小する)
+  const esbuild = { minifyIdentifiers: false };
   if (mode === "client") {
     return {
+      esbuild,
       build: {
         rollupOptions: {
           input: ["/app/client.ts"],
@@ -22,6 +25,7 @@ export default defineConfig(({ mode }) => {
   }
 
   return {
+    esbuild,
     ssr: {
       external: [
         "@prisma/client",

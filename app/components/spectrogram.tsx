@@ -357,13 +357,18 @@ export function HarmonicLens({
   yRatio,
   anchorX,
   anchorY,
+  placement = "float",
+  title,
 }: {
   spec: ApiSpectrogram;
   audio: ApiAudio;
   projT: number;
   yRatio: number | null;
-  anchorX: number;
-  anchorY: number;
+  // placement="float" では anchor 座標に fixed 配置、"inline" では親の flで横並び
+  anchorX?: number;
+  anchorY?: number;
+  placement?: "float" | "inline";
+  title?: string;
 }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const [meta, setMeta] = useState<SpectrogramMeta | null>(null);
@@ -498,9 +503,18 @@ export function HarmonicLens({
 
   const panelW = canvasW + 18;
   const panelH = canvasH + 40;
-  let left = anchorX + 18;
-  if (left + panelW > window.innerWidth - 8) left = anchorX - panelW - 12;
-  const top = Math.max(8, Math.min(window.innerHeight - panelH - 8, anchorY - panelH / 2));
+  const floatStyle: CSSProperties =
+    placement === "float"
+      ? (() => {
+          let left = (anchorX ?? 0) + 18;
+          if (left + panelW > window.innerWidth - 8) left = (anchorX ?? 0) - panelW - 12;
+          const top = Math.max(
+            8,
+            Math.min(window.innerHeight - panelH - 8, (anchorY ?? 0) - panelH / 2),
+          );
+          return { position: "fixed", left, top, zIndex: 50 };
+        })()
+      : { position: "relative", flex: "0 0 auto" };
 
   const f0 = binSel === null ? null : spec.fminHz * 2 ** (binSel / spec.binsPerOctave);
   const stepOct = binSel === null ? null : Math.floor(binSel / spec.binsPerOctave);
@@ -509,10 +523,7 @@ export function HarmonicLens({
     <div
       aria-hidden="true"
       style={{
-        position: "fixed",
-        left,
-        top,
-        zIndex: 50,
+        ...floatStyle,
         background: "rgba(17,17,17,0.95)",
         border: "1px solid #444",
         borderRadius: 6,
@@ -521,6 +532,22 @@ export function HarmonicLens({
         boxShadow: "0 4px 16px rgba(0,0,0,0.4)",
       }}
     >
+      {title && (
+        <div
+          style={{
+            color: "#fff",
+            fontSize: 11,
+            fontWeight: 600,
+            marginBottom: 2,
+            maxWidth: canvasW,
+            whiteSpace: "nowrap",
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+          }}
+        >
+          {title}
+        </div>
+      )}
       <div
         style={{
           color: "#ddd",
