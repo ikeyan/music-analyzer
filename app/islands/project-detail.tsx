@@ -43,6 +43,12 @@ type ShownSpec = { spec: ApiSpectrogram; mode: string; audio: AudioItem };
 // 緑の clip 帯は info とサムネイルだけ持たせて低く保つ
 const TRACK_HEIGHT = 56;
 const TRACK_GAP = 8;
+
+// ソロ再生中の clip を脈動する光輪で強調する
+const SOLO_HALO_KEYFRAMES = `@keyframes soloHalo {
+  0%, 100% { box-shadow: 0 0 0 2px #d97706, 0 0 6px 2px rgba(217,119,6,0.5); }
+  50% { box-shadow: 0 0 0 2px #f59e0b, 0 0 18px 6px rgba(245,158,11,0.9); }
+}`;
 const PIXELS_PER_SECOND_DEFAULT = 40;
 const SYNC_DRIFT_TOLERANCE = 0.25;
 
@@ -465,6 +471,7 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
 
   return (
     <div>
+      <style>{SOLO_HALO_KEYFRAMES}</style>
       <header style={{ display: "flex", alignItems: "baseline", gap: "1rem" }}>
         <a href="/projects">← 一覧</a>
         <h1 style={{ margin: 0 }}>{data.name}</h1>
@@ -611,6 +618,7 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
                   onTrim={() => setTrimming({ kind: t.kind, id: t.data.id })}
                   onSpectrogram={t.kind === "audio" ? () => setSpecDialog(t.data.id) : undefined}
                   soloed={activeSolo?.kind === t.kind && activeSolo.id === t.data.id}
+                  soloActive={activeSolo !== null}
                   onSolo={() =>
                     setSolo((cur) =>
                       cur && cur.kind === t.kind && cur.id === t.data.id
@@ -904,6 +912,7 @@ function TrackRow({
   onTrim,
   onSpectrogram,
   soloed,
+  soloActive,
   onSolo,
   onLensHover,
   lensProjT,
@@ -923,6 +932,7 @@ function TrackRow({
   onTrim: () => void;
   onSpectrogram?: () => void;
   soloed: boolean;
+  soloActive: boolean;
   onSolo: () => void;
   onLensHover?: (h: LensHover | null) => void;
   lensProjT?: number | null;
@@ -960,6 +970,8 @@ function TrackRow({
           const bounds = parent.getBoundingClientRect();
           const x = e.clientX - bounds.left + parent.scrollLeft;
           onSeek(x / pxPerSec);
+          // ソロ再生中に別 track をクリックしたら solo 対象をその track に入れ替える
+          if (soloActive && !soloed) onSolo();
         }}
         onPointerMove={
           onLensHover
@@ -1016,7 +1028,10 @@ function TrackRow({
           borderRadius: 4,
           padding: "2px 6px",
           overflow: "hidden",
-          boxShadow: "0 1px 2px rgba(0,0,0,0.15)",
+          boxShadow: soloed
+            ? "0 0 0 2px #d97706, 0 0 14px 4px rgba(217,119,6,0.75)"
+            : "0 1px 2px rgba(0,0,0,0.15)",
+          animation: soloed ? "soloHalo 1.4s ease-in-out infinite" : undefined,
           fontSize: 12,
           pointerEvents: "none",
         }}
