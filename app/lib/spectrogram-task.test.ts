@@ -177,14 +177,15 @@ describe("cqt spectrogram task", () => {
   it("低周波 × 高 bins の演算量見積もりが予算超過なら decode せずに failed になる", async () => {
     const client = makeClient();
     const { projectId, audioId } = await seedAudio(client);
-    // fmin=8/oct=1/B=96 は fs 床 3kHz でカーネル ~50k サンプルになり ops が爆発する
+    // VQT が低域の窓長を頭打ちにするので単一 plane では ops が膨らみにくい。
+    // 高 bins × 8 harmonic plane × 長尺で全 plane 合算が予算を超える構成にする
     await prisma.audio.update({
       where: { id: audioId },
       data: { durationSec: 3600, srcEndSec: 3600, projEndSec: 3600 },
     });
     const created = await client.projects[":id"].audios[":audioId"].spectrograms.$post({
       param: { id: projectId, audioId },
-      json: { binsPerOctave: 96, octaves: 1, fminHz: 8, harmonics: [1] },
+      json: { binsPerOctave: 96, octaves: 4, fminHz: 8, harmonics: [1, 2, 3, 4, 5, 6, 7, 8] },
     });
     expect(created.status).toBe(201);
     if (!created.ok) throw new Error("unreachable");

@@ -31,6 +31,8 @@ export type SpectrogramMeta = {
   harmonics: number[];
   sampleRate: number;
   hop: number;
+  /** VQT 帯域幅下限 (Hz)。旧 meta には無い場合がある (純 CQT = 0 相当) */
+  gamma?: number;
   frames: number;
   bins: number;
   tileFrames: number;

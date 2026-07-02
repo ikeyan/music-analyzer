@@ -2,6 +2,7 @@ import { Either } from "effect";
 import { join } from "node:path";
 import type { Task } from "../generated/prisma/client";
 import {
+  autoGamma,
   computeCqt,
   estimateCqtOps,
   magnitudesToU8,
@@ -66,6 +67,9 @@ export async function runSpectrogramTask(
   const fmaxHz = spec.fminHz * 2 ** spec.octaves * Math.max(...harmonics);
   const sampleRate = analysisSampleRate(fmaxHz);
   const bins = spec.binsPerOctave * spec.octaves;
+  // VQT: 低域の窓長を頭打ちにして onset/offset の時間分解能を上げる (純 CQT だと
+  // 低域ほど窓 = Q/f が伸びて時間方向に大きく滲む)。binsPerOctave から ERB 準拠で導出
+  const gamma = autoGamma(spec.binsPerOctave);
   // decode 前に PCM + magnitudes + タイル列の合計ピークを見積もってゲートする
   const estSamples = Math.ceil(sampleRate * audio.durationSec);
   const estHop = chooseHop(sampleRate, spec.octaves, estSamples);
@@ -91,6 +95,7 @@ export async function runSpectrogramTask(
       octaves: oct,
       fminHz: spec.fminHz * h,
       hop: estHop,
+      gamma,
     });
   }
   if (estOps > MAX_ANALYSIS_OPS) {
@@ -129,6 +134,7 @@ export async function runSpectrogramTask(
           octaves: oct,
           fminHz: spec.fminHz * h,
           hop,
+          gamma,
         },
         maybeYield,
       );
@@ -170,6 +176,7 @@ export async function runSpectrogramTask(
     harmonics,
     sampleRate,
     hop,
+    gamma,
     frames,
     bins,
     tileFrames: SPECTROGRAM_TILE_FRAMES,
