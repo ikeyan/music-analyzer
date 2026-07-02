@@ -408,8 +408,8 @@ describe("ProjectDetail (frontend)", () => {
     expect(audio.projEndSec - audio.projStartSec).toBeCloseTo(0.3, 3);
   }, 60_000);
 
-  it("反転 track を含む状態で並び替えても向きを保ち back-to-back に並ぶ", async () => {
-    const id = await createProject("reorder-flip-test");
+  it("並び替えは表示順だけ変え、各 media の時間軸位置 (timing) は動かさない", async () => {
+    const id = await createProject("reorder-timing-test");
     await goto(`/projects/${id}`);
     await waitHydrated('input[type=file][accept="audio/*"]');
     await injectFileToInput(getMedia().audioMp3, "audio/*", "rev.mp3", "audio/mpeg");
@@ -440,9 +440,25 @@ describe("ProjectDetail (frontend)", () => {
       }),
     });
     expect(flipRes.ok).toBe(true);
-    // rev を下に移動 (rev.mp3 が order 0、fwd.mp3 が order 1 から、swap で fwd→rev に)
+    // 並び替え直前の各 timing を控える (UI state に反映させるため再取得)
+    await goto(`/projects/${id}`);
+    await waitHydrated('input[type=file][accept="audio/*"]');
+    await webview().evaluate(`new Promise((res, rej) => {
+      const start = Date.now();
+      const tick = () => {
+        if (document.querySelectorAll('audio').length >= 2) return res();
+        if (Date.now() - start > 30000) return rej(new Error("audio timeout"));
+        setTimeout(tick, 100);
+      };
+      tick();
+    })`);
+    const mid = (await fetch(`${server()}/api/projects/${id}`).then((r) => r.json())) as {
+      project: { audios: { name: string; projStartSec: number; projEndSec: number }[] };
+    };
+    const midFwd = mid.project.audios.find((a) => a.name === "fwd.mp3")!;
+    const midRev = mid.project.audios.find((a) => a.name === "rev.mp3")!;
+    // rev を下に移動 (rev order 0、fwd order 1 から swap で表示順 fwd→rev に)
     await webview().click('button[aria-label="rev.mp3 を下に移動"]');
-    // refresh を待ってから検証
     await webview().evaluate(`new Promise((res, rej) => {
       const start = Date.now();
       const tick = () => {
@@ -460,12 +476,12 @@ describe("ProjectDetail (frontend)", () => {
     };
     const afterFwd = after.project.audios.find((a) => a.name === "fwd.mp3")!;
     const afterRev = after.project.audios.find((a) => a.name === "rev.mp3")!;
-    // fwd は order 0 で 0 から、rev は反転を維持しつつ fwd の直後に置かれる
-    expect(afterFwd.projStartSec).toBeCloseTo(0, 3);
-    expect(afterFwd.projEndSec).toBeGreaterThan(0);
+    // 表示順は変わったが timing は据え置き (反転も維持)
+    expect(afterFwd.projStartSec).toBeCloseTo(midFwd.projStartSec, 3);
+    expect(afterFwd.projEndSec).toBeCloseTo(midFwd.projEndSec, 3);
+    expect(afterRev.projStartSec).toBeCloseTo(midRev.projStartSec, 3);
+    expect(afterRev.projEndSec).toBeCloseTo(midRev.projEndSec, 3);
     expect(afterRev.projStartSec).toBeGreaterThan(afterRev.projEndSec);
-    expect(afterRev.projEndSec).toBeCloseTo(afterFwd.projEndSec, 3);
-    expect(afterRev.projStartSec).toBeGreaterThanOrEqual(afterFwd.projEndSec);
   }, 90_000);
 
   it("反転 target に「終了直後」を適用すると visually anchor の直後に置かれる", async () => {

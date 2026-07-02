@@ -384,7 +384,7 @@ export const projects = new Hono()
                           }
                           seen.add(key);
                         }
-                        // 単体 timing edit と整合するよう reorder 後の合計でも cap を保証
+                        // reorder は timing を動かさないが、既存合計が cap 内である不変条件は保証する
                         const totalAbsDur =
                           videos.reduce((s, r) => s + Math.abs(r.projEndSec - r.projStartSec), 0) +
                           audios.reduce((s, r) => s + Math.abs(r.projEndSec - r.projStartSec), 0);
@@ -405,18 +405,10 @@ export const projects = new Hono()
                               tx.audio.update({ where: { id: t.id }, data }),
                             );
                         }
-                        let cursor = 0;
+                        // ↑↓ は project 内の並び順だけを変える。timing (時間軸上の
+                        // 位置) は動かさないので projStart/End は据え置く
                         for (const [i, t] of newOrder.entries()) {
-                          const row = (t.kind === "video" ? videoMap : audioMap).get(t.id);
-                          if (!row) throw new Error("unreachable");
-                          // 反転 (projEnd < projStart) は absDur で詰めて向きだけ保つ
-                          const absDur = Math.abs(row.projEndSec - row.projStartSec);
-                          const reversed = row.projEndSec < row.projStartSec;
-                          const data = {
-                            order: i,
-                            projStartSec: reversed ? cursor + absDur : cursor,
-                            projEndSec: reversed ? cursor : cursor + absDur,
-                          };
+                          const data = { order: i };
                           if (t.kind === "video")
                             yield* Effect.promise(() =>
                               tx.video.update({ where: { id: t.id }, data }),
@@ -425,7 +417,6 @@ export const projects = new Hono()
                             yield* Effect.promise(() =>
                               tx.audio.update({ where: { id: t.id }, data }),
                             );
-                          cursor += absDur;
                         }
                       }),
                     ),

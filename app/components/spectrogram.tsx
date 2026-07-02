@@ -424,13 +424,26 @@ export function HarmonicLens({
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
     ctx.imageSmoothingEnabled = false;
-    ctx.fillStyle = "#111";
-    ctx.fillRect(0, 0, canvasW, canvasH);
 
     const fps0 = meta.sampleRate / meta.hop;
     const frame = Math.min(meta.frames - 1, Math.max(0, Math.round(srcT * fps0)));
     const tileIdx = Math.floor(frame / meta.tileFrames);
     const offset = (frame - tileIdx * meta.tileFrames) * meta.bins;
+
+    // 全 harmonic のタイルを先に集める。1 つでも未取得なら再描画せず前フレームを保持する。
+    // 再生中にタイル境界を跨ぐと未 cache タイルが一瞬灰色にちらつくのを防ぐ (getTileBytes が
+    // fetch を蹴るので、到着時に tilesVersion が上がって再描画される)
+    const tiles: (Uint8Array | null)[] = [];
+    let anyMissing = false;
+    for (let hi = 0; hi < numH; hi++) {
+      const b = getTileBytes(`${spec.tileUrlBase}/${meta.harmonics[hi]}/0/${tileIdx}`);
+      tiles.push(b);
+      if (!b) anyMissing = true;
+    }
+    if (anyMissing) return;
+
+    ctx.fillStyle = "#111";
+    ctx.fillRect(0, 0, canvasW, canvasH);
 
     // 1 harmonic = 1px 列の ImageData を作って横に引き伸ばす
     const off = document.createElement("canvas");
@@ -441,19 +454,13 @@ export function HarmonicLens({
     const img = octx.createImageData(numH, bins);
     const px = img.data;
     for (let hi = 0; hi < numH; hi++) {
-      const bytes = getTileBytes(`${spec.tileUrlBase}/${meta.harmonics[hi]}/0/${tileIdx}`);
+      const bytes = tiles[hi]!;
       for (let b = 0; b < bins; b++) {
         const o = ((bins - 1 - b) * numH + hi) * 4;
-        if (bytes) {
-          const v = bytes[offset + b]!;
-          px[o] = COLORMAP[v * 3]!;
-          px[o + 1] = COLORMAP[v * 3 + 1]!;
-          px[o + 2] = COLORMAP[v * 3 + 2]!;
-        } else {
-          px[o] = 70;
-          px[o + 1] = 70;
-          px[o + 2] = 70;
-        }
+        const v = bytes[offset + b]!;
+        px[o] = COLORMAP[v * 3]!;
+        px[o + 1] = COLORMAP[v * 3 + 1]!;
+        px[o + 2] = COLORMAP[v * 3 + 2]!;
         px[o + 3] = 255;
       }
     }
@@ -628,7 +635,9 @@ export function SpectrogramDialogBody({
     ...DEFAULT_CQT_FORM,
     ...loadLocal<Partial<CqtForm>>(formKey, {}),
   }));
-  const [busy, setBusy] = useState<string | null>(null);
+  // busy は操作単位で分ける: 生成中でも別 CQT の削除/表示切替を妨げないようにする
+  const [creating, setCreating] = useState(false);
+  const [deleting, setDeleting] = useState<ReadonlySet<string>>(() => new Set());
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -664,19 +673,23 @@ export function SpectrogramDialogBody({
       return;
     }
     const { fminHz, octaves } = cqtRangeFromCenter(center, down, up);
-    setBusy("create");
+    setCreating(true);
     setError(null);
     const result = await onCreate({ binsPerOctave: b, octaves, fminHz, harmonics: form.harmonics });
-    setBusy(null);
+    setCreating(false);
     if ("error" in result) setError(result.error);
   }
 
   async function remove(specId: string): Promise<void> {
     if (!confirm("この spectrogram を削除しますか？")) return;
-    setBusy(specId);
+    setDeleting((d) => new Set(d).add(specId));
     setError(null);
     const result = await onDelete(specId);
-    setBusy(null);
+    setDeleting((d) => {
+      const n = new Set(d);
+      n.delete(specId);
+      return n;
+    });
     if ("error" in result) setError(result.error);
     else if (view?.specId === specId) onChangeView(null);
   }
@@ -744,7 +757,8 @@ export function SpectrogramDialogBody({
               >
                 <span style={{ fontFamily: "monospace" }}>{specLabel(spec)}</span>
                 <span style={{ color: badge.color, fontWeight: 600 }}>{badge.label}</span>
-                {spec.status === "ready" && (
+                {/* 生成中 (pending) でも表示を先に選べる: ready になった瞬間に反映される */}
+                {spec.status !== "failed" && (
                   <label style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
                     表示
                     <select
@@ -753,7 +767,6 @@ export function SpectrogramDialogBody({
                         const mode = e.target.value;
                         onChangeView(mode === "" ? null : { specId: spec.id, mode });
                       }}
-                      disabled={busy !== null}
                     >
                       <option value="">非表示</option>
                       {spec.harmonics.map((h) => (
@@ -772,9 +785,9 @@ export function SpectrogramDialogBody({
                 <button
                   type="button"
                   onClick={() => remove(spec.id)}
-                  disabled={busy !== null || spec.status === "pending"}
+                  disabled={deleting.has(spec.id) || spec.status === "pending"}
                 >
-                  {busy === spec.id ? "削除中…" : "削除"}
+                  {deleting.has(spec.id) ? "削除中…" : "削除"}
                 </button>
               </li>
             );
@@ -795,7 +808,7 @@ export function SpectrogramDialogBody({
               list="bins-per-octave-presets"
               value={form.binsPerOctave}
               onChange={(e) => setField("binsPerOctave", e.target.value)}
-              disabled={busy !== null}
+              disabled={creating}
               style={{ width: 80 }}
             />
             <datalist id="bins-per-octave-presets">
@@ -812,7 +825,7 @@ export function SpectrogramDialogBody({
               step="0.001"
               value={form.centerHz}
               onChange={(e) => setField("centerHz", e.target.value)}
-              disabled={busy !== null}
+              disabled={creating}
               style={{ width: 100 }}
             />
           </label>
@@ -825,7 +838,7 @@ export function SpectrogramDialogBody({
               step="1"
               value={form.octavesDown}
               onChange={(e) => setField("octavesDown", e.target.value)}
-              disabled={busy !== null}
+              disabled={creating}
               style={{ width: 56 }}
             />
           </label>
@@ -838,7 +851,7 @@ export function SpectrogramDialogBody({
               step="1"
               value={form.octavesUp}
               onChange={(e) => setField("octavesUp", e.target.value)}
-              disabled={busy !== null}
+              disabled={creating}
               style={{ width: 56 }}
             />
           </label>
@@ -875,7 +888,7 @@ export function SpectrogramDialogBody({
                       : form.harmonics.filter((x) => x !== h),
                   )
                 }
-                disabled={busy !== null}
+                disabled={creating}
               />
               ×{h}
             </label>
@@ -886,12 +899,8 @@ export function SpectrogramDialogBody({
           合成表示が使えます。{MAX_SPECTROGRAM_FMAX_HZ}Hz
           を超える高域は自動で黒く（クランプ）表示されます。
         </p>
-        <button
-          type="button"
-          onClick={create}
-          disabled={busy !== null || baseTopOver || !formValid}
-        >
-          {busy === "create" ? "開始中…" : "生成開始"}
+        <button type="button" onClick={create} disabled={creating || baseTopOver || !formValid}>
+          {creating ? "開始中…" : "生成開始"}
         </button>
       </section>
     </div>
