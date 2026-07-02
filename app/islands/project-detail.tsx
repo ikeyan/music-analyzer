@@ -79,6 +79,8 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
   const [autoScroll, setAutoScroll] = useState(false);
   // ソロ再生: 指定 track だけ鳴らし、再生位置レンズもその track だけ出す
   const [solo, setSolo] = useState<TrackRef | null>(null);
+  // mute: 指定 track を無音化。solo と mute が両方付いた track は solo が勝つ (鳴る)
+  const [muted, setMuted] = useState<ReadonlySet<string>>(() => new Set());
   const rowsRef = useRef<HTMLDivElement | null>(null);
 
   // 表示状態 (specViews) と再生位置レンズの ON/OFF を project 単位で localStorage に保存。
@@ -122,6 +124,12 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
     (t: Track) =>
       activeSolo !== null && !(activeSolo.kind === t.kind && activeSolo.id === t.data.id),
     [activeSolo],
+  );
+  // 音を出さない track: solo 中は solo 対象以外、solo 無しなら mute された track。
+  // solo 対象は mute されていても solo が勝って鳴る (isSoloedOut=false のまま)
+  const isSilenced = useCallback(
+    (t: Track) => isSoloedOut(t) || (activeSolo === null && muted.has(trackKey(t))),
+    [isSoloedOut, activeSolo, muted],
   );
 
   // playEnd で再生停止、displayDuration (>=60s) で ruler の最低幅を確保
@@ -221,8 +229,8 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
       if (unlockingRef.current.has(key)) continue;
       const el = mediaRefs.current.get(key);
       if (!el) continue;
-      // solo 中は対象外の track を鳴らさない (音は止めるが seek 追従は不要)
-      if (isSoloedOut(t)) {
+      // 無音 track (solo 対象外 / mute) は鳴らさない (音は止めるが seek 追従は不要)
+      if (isSilenced(t)) {
         if (!el.paused) el.pause();
         continue;
       }
@@ -233,7 +241,7 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
         );
       });
     }
-  }, [tracks, currentTime, playing, isSoloedOut]);
+  }, [tracks, currentTime, playing, isSilenced]);
 
   const projectId = data.id;
   const refresh = useCallback(async () => {
@@ -287,6 +295,10 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
   // user-gesture 内で play().then(pause) して全 track を unlock。範囲外は mute で音漏れを防ぐ。
   // 範囲外要素は unlocking フラグで syncMediaElement の同期 pause から除外する
   function startPlayback() {
+    // 末尾まで再生済み (currentTime==playEnd) なら先頭から再生し直す。
+    // そのまま start すると tick が即 next>=playEnd で停止してしまう
+    const from = currentTime >= playEnd ? 0 : currentTime;
+    if (from !== currentTime) setCurrentTime(from);
     let blocked = false;
     for (const t of tracks) {
       const key = trackKey(t);
@@ -294,7 +306,7 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
       if (!el) continue;
       const projLow = Math.min(t.data.projStartSec, t.data.projEndSec);
       const projHigh = Math.max(t.data.projStartSec, t.data.projEndSec);
-      const inRange = !isSoloedOut(t) && currentTime >= projLow && currentTime <= projHigh;
+      const inRange = !isSilenced(t) && from >= projLow && from <= projHigh;
       const wasMuted = el.muted;
       if (!inRange) {
         el.muted = true;
@@ -626,6 +638,15 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
                         : { kind: t.kind, id: t.data.id },
                     )
                   }
+                  muted={muted.has(trackKey(t))}
+                  onMute={() =>
+                    setMuted((cur) => {
+                      const n = new Set(cur);
+                      if (n.has(trackKey(t))) n.delete(trackKey(t));
+                      else n.add(trackKey(t));
+                      return n;
+                    })
+                  }
                   onLensHover={
                     shown && !playbackLens
                       ? (h) => setLens(h ? { ...h, audioId: t.data.id } : null)
@@ -914,6 +935,8 @@ function TrackRow({
   soloed,
   soloActive,
   onSolo,
+  muted,
+  onMute,
   onLensHover,
   lensProjT,
   attachRef,
@@ -934,6 +957,8 @@ function TrackRow({
   soloed: boolean;
   soloActive: boolean;
   onSolo: () => void;
+  muted: boolean;
+  onMute: () => void;
   onLensHover?: (h: LensHover | null) => void;
   lensProjT?: number | null;
   attachRef: (el: HTMLMediaElement | null) => void;
@@ -1051,26 +1076,34 @@ function TrackRow({
           zIndex: 4,
           width: "fit-content",
           maxWidth: 280,
-          background: soloed ? "rgba(255,244,214,0.96)" : "rgba(250,250,250,0.94)",
-          border: `1px solid ${soloed ? "#d97706" : color}`,
+          background: soloed
+            ? "rgba(255,237,190,0.98)"
+            : muted
+              ? "rgba(236,236,238,0.94)"
+              : "rgba(250,250,250,0.94)",
+          border: `1.5px solid ${soloed ? "#d97706" : muted ? "#9ca3af" : color}`,
           borderRadius: 4,
           padding: "1px 4px 2px",
+          // solo 中は media 名まわりを脈動する光輪で強調する (clip 側だけだと見えづらい)
+          boxShadow: soloed ? "0 0 0 2px #f59e0b, 0 0 16px 5px rgba(245,158,11,0.85)" : undefined,
+          animation: soloed ? "soloHalo 1.4s ease-in-out infinite" : undefined,
         }}
       >
         <span
           title={item.name}
           style={{
             display: "block",
-            fontWeight: 600,
+            fontWeight: soloed ? 700 : 600,
             fontSize: 12,
-            color,
+            color: soloed ? "#b45309" : muted ? "#9ca3af" : color,
+            textDecoration: muted && !soloed ? "line-through" : undefined,
             whiteSpace: "nowrap",
             overflow: "hidden",
             textOverflow: "ellipsis",
             maxWidth: 272,
           }}
         >
-          [{track.kind === "video" ? "V" : "A"}] {item.name}
+          {soloed ? "◉ " : muted ? "🔇 " : ""}[{track.kind === "video" ? "V" : "A"}] {item.name}
         </span>
         <div style={{ display: "flex", gap: 2, marginTop: 2 }}>
           <button
@@ -1147,6 +1180,22 @@ function TrackRow({
             }
           >
             ソロ
+          </button>
+          <button
+            type="button"
+            aria-label={`${item.name} をミュート`}
+            aria-pressed={muted}
+            onClick={(e) => {
+              e.stopPropagation();
+              onMute();
+            }}
+            style={
+              muted
+                ? { ...trackButtonStyle, background: "#6b7280", color: "white" }
+                : trackButtonStyle
+            }
+          >
+            ミュート
           </button>
           <button
             type="button"

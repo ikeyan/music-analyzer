@@ -126,6 +126,53 @@ describe("ProjectDetail (frontend)", () => {
     expect(Math.abs(after.time - before)).toBeLessThan(0.05);
   }, 60_000);
 
+  it("末尾まで再生後に再生ボタンを押すと先頭から再生し直す", async () => {
+    const id = await createProject("replay-test");
+    await goto(`/projects/${id}`);
+    await waitHydrated('input[type=file][accept="audio/*"]');
+    await injectFileToInput(getMedia().audioMp3, "audio/*", "replay.mp3", "audio/mpeg");
+    await waitFor(webview(), "audio source", 30_000);
+    await webview().evaluate(`new Promise((res, rej) => {
+      const a = document.querySelector('audio');
+      if (!a) return rej(new Error("no audio"));
+      if (a.readyState >= 2) return res();
+      const t = setTimeout(() => rej(new Error("canplay timeout")), 5000);
+      a.addEventListener('canplay', () => { clearTimeout(t); res(); }, { once: true });
+      a.load();
+    })`);
+    await webview().click('button[aria-label="play"]');
+    // 末尾到達で自動停止 (aria-label が pause→play に戻る) し、audio が末尾側まで進むのを待つ
+    const endedTime = await webview().evaluate<number>(`new Promise((res, rej) => {
+      const start = Date.now();
+      let wasPlaying = false;
+      const tick = () => {
+        const a = document.querySelector('audio');
+        if (document.querySelector('button[aria-label="pause"]')) wasPlaying = true;
+        if (wasPlaying && document.querySelector('button[aria-label="play"]')) return res(a?.currentTime ?? 0);
+        if (Date.now() - start > 10000) return rej(new Error("playback did not finish"));
+        setTimeout(tick, 50);
+      };
+      tick();
+    })`);
+    // 末尾側まで再生できていた
+    expect(endedTime).toBeGreaterThan(0.4);
+    // もう一度再生 → 先頭に戻って再生し直す
+    await webview().click('button[aria-label="play"]');
+    const minSeen = await webview().evaluate<number>(`new Promise(res => {
+      const a = document.querySelector('audio');
+      const start = Date.now();
+      let m = Infinity;
+      const tick = () => {
+        if (a) m = Math.min(m, a.currentTime);
+        if (Date.now() - start > 1500) return res(m);
+        setTimeout(tick, 30);
+      };
+      tick();
+    })`);
+    // 末尾値ではなく先頭付近から鳴り直している
+    expect(minSeen).toBeLessThan(0.3);
+  }, 60_000);
+
   it("track の ↑↓ ボタンで並び替えると order が入れ替わる", async () => {
     const id = await createProject("reorder-test");
     await goto(`/projects/${id}`);
