@@ -30,19 +30,19 @@ const ensureFfmpeg = async () => {
   await installFfmpeg("/usr/local/bin");
 };
 
-// .bun-version pin に合わせて /root/.bun/bin/bun を入れ替える。bun.com/install は
-// sandbox から 403 になるので GitHub release zip を直接展開
+// .bun-version pin に合わせて /root/.bun/bin/bun を入れ替える。bun.com/install も
+// GitHub release も sandbox の egress policy で 403 になるため、allowlist 済みの
+// npm registry から platform tarball (package/bin/bun) を取る
 const ensureBunVersion = async () => {
   const cwd = process.env.CLAUDE_PROJECT_DIR!;
   const target = (await Bun.file(`${cwd}/.bun-version`).text()).trim();
   if (Bun.version === target) return;
-  const arch = process.arch === "arm64" ? "aarch64" : "x64";
-  const dirName = `bun-linux-${arch}`;
-  const url = `https://github.com/oven-sh/bun/releases/download/bun-v${target}/${dirName}.zip`;
+  const pkg = process.arch === "arm64" ? "bun-linux-aarch64" : "bun-linux-x64";
+  const url = `https://registry.npmjs.org/@oven/${pkg}/-/${pkg}-${target}.tgz`;
   await using td = await tempDir(`bun-upgrade-${target}`);
-  await $`curl -fsSL ${url} -o ${td.path}/bun.zip`.quiet();
-  await $`unzip -q -o ${td.path}/bun.zip -d ${td.path}`.quiet();
-  await $`install -m 755 ${td.path}/${dirName}/bun /root/.bun/bin/bun`.quiet();
+  await $`curl -fsSL ${url} -o ${td.path}/bun.tgz`.quiet();
+  await $`tar xzf ${td.path}/bun.tgz -C ${td.path}`.quiet();
+  await $`install -m 755 ${td.path}/package/bin/bun /root/.bun/bin/bun`.quiet();
 };
 
 // session 跨ぎで残るよう /opt/chrome-for-testing/<version>/ にインストール
@@ -56,8 +56,12 @@ const ensureChrome = async () => {
 
 const installDeps = async () => {
   const cwd = process.env.CLAUDE_PROJECT_DIR!;
-  await $`bun install --frozen-lockfile`.cwd(cwd);
-  await $`bun run db:generate`.cwd(cwd);
+  // Prisma のエンジン取得は proxy 経由の Node https が転送途中で ECONNRESET する。
+  // binaries.prisma.sh は直結が速く確実なのでこのホストだけ proxy を迂回する
+  const noProxy = `binaries.prisma.sh,${process.env.NO_PROXY ?? ""}`;
+  const env = { ...process.env, NO_PROXY: noProxy, no_proxy: noProxy };
+  await $`bun install --frozen-lockfile`.cwd(cwd).env(env);
+  await $`bun run db:generate`.cwd(cwd).env(env);
 };
 
 const pullAgentFiles = async () => {
