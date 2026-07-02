@@ -85,6 +85,31 @@ describe("ProjectDetail (frontend)", () => {
     expect(src).toMatch(/\/api\/projects\/[^/]+\/videos\/[^/]+\/stream$/);
   }, 90_000);
 
+  it("動画表示ボタンで video が monitor 帯に表示される (既定は非表示)", async () => {
+    const id = await createProject("video-show-test");
+    await goto(`/projects/${id}`);
+    await waitHydrated('input[type=file][accept="video/*"]');
+    await injectFileToInput(getMedia().videoMp4, "video/*", "show.mp4", "video/mp4");
+    await waitFor(webview(), "video[src]", 60_000);
+    // 既定では video の親 (monitor 帯 wrapper) は display:none
+    const before = await webview().evaluate<string>(
+      `getComputedStyle(document.querySelector('video').parentElement).display`,
+    );
+    expect(before).toBe("none");
+    await webview().click('button[aria-label="show.mp4 の動画表示"]');
+    const after = await webview().evaluate<string>(`new Promise((res, rej) => {
+      const start = Date.now();
+      const tick = () => {
+        const d = getComputedStyle(document.querySelector('video').parentElement).display;
+        if (d !== "none") return res(d);
+        if (Date.now() - start > 3000) return rej(new Error("video wrapper still hidden"));
+        setTimeout(tick, 50);
+      };
+      tick();
+    })`);
+    expect(after).toBe("block");
+  }, 90_000);
+
   it("音声 upload 後に再生ボタンを押すと audio.currentTime が進み、一時停止で止まる", async () => {
     const id = await createProject("playback-test");
     await goto(`/projects/${id}`);

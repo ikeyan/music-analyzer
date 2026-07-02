@@ -1,5 +1,6 @@
 import {
   type CSSProperties,
+  type PointerEvent as ReactPointerEvent,
   type ReactNode,
   useCallback,
   useEffect,
@@ -43,6 +44,8 @@ type ShownSpec = { spec: ApiSpectrogram; mode: string; audio: AudioItem };
 // 緑の clip 帯は info とサムネイルだけ持たせて低く保つ
 const TRACK_HEIGHT = 56;
 const TRACK_GAP = 8;
+// 動画表示 ON の video 行に足す monitor 帯の高さ
+const VIDEO_STRIP_HEIGHT = 140;
 
 // ソロ再生中の clip を脈動する光輪で強調する
 const SOLO_HALO_KEYFRAMES = `@keyframes soloHalo {
@@ -81,6 +84,8 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
   const [solo, setSolo] = useState<TrackRef | null>(null);
   // mute: 指定 track を無音化。solo と mute が両方付いた track は solo が勝つ (鳴る)
   const [muted, setMuted] = useState<ReadonlySet<string>>(() => new Set());
+  // 動画を行の下に表示する video id 集合 (CQT 表示と同様の行追加)
+  const [shownVideos, setShownVideos] = useState<ReadonlySet<string>>(() => new Set());
   const rowsRef = useRef<HTMLDivElement | null>(null);
 
   // 表示状態 (specViews) と再生位置レンズの ON/OFF を project 単位で localStorage に保存。
@@ -90,6 +95,7 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
   const viewsKey = `cqtViews:${data.id}`;
   const lensKey = `cqtPlaybackLens:${data.id}`;
   const autoScrollKey = `cqtAutoScroll:${data.id}`;
+  const videoShownKey = `videoShown:${data.id}`;
   const restoredRef = useRef(false);
   useEffect(() => {
     if (restoredRef.current) saveLocal(viewsKey, specViews);
@@ -101,11 +107,15 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
     if (restoredRef.current) saveLocal(autoScrollKey, autoScroll);
   }, [autoScrollKey, autoScroll]);
   useEffect(() => {
+    if (restoredRef.current) saveLocal(videoShownKey, [...shownVideos]);
+  }, [videoShownKey, shownVideos]);
+  useEffect(() => {
     setSpecViews(loadLocal(viewsKey, {} as Record<string, SpectrogramSelection | undefined>));
     setPlaybackLens(loadLocal(lensKey, false));
     setAutoScroll(loadLocal(autoScrollKey, false));
+    setShownVideos(new Set(loadLocal<string[]>(videoShownKey, [])));
     restoredRef.current = true;
-  }, [viewsKey, lensKey, autoScrollKey]);
+  }, [viewsKey, lensKey, autoScrollKey, videoShownKey]);
 
   const tracks: Track[] = useMemo(() => {
     const all: Track[] = [
@@ -229,12 +239,13 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
       if (unlockingRef.current.has(key)) continue;
       const el = mediaRefs.current.get(key);
       if (!el) continue;
-      // 無音 track (solo 対象外 / mute) は鳴らさない (音は止めるが seek 追従は不要)
-      if (isSilenced(t)) {
+      const silenced = isSilenced(t);
+      // audio の無音 track は止める。video は無音でも再生し続けて映像を見せる (frame 追従)
+      if (silenced && t.kind === "audio") {
         if (!el.paused) el.pause();
         continue;
       }
-      syncMediaElement(el, t.data, currentTime, playing, () => {
+      syncMediaElement(el, t.data, currentTime, playing, silenced, () => {
         setPlaying(false);
         setError(
           "ブラウザのautoplay制限で再生できませんでした。もう一度再生ボタンを押してください。",
@@ -306,24 +317,29 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
       if (!el) continue;
       const projLow = Math.min(t.data.projStartSec, t.data.projEndSec);
       const projHigh = Math.max(t.data.projStartSec, t.data.projEndSec);
-      const inRange = !isSilenced(t) && from >= projLow && from <= projHigh;
+      const inWindow = from >= projLow && from <= projHigh;
+      const silenced = isSilenced(t);
+      // video は無音でも映像を見せるため再生し続ける。audio の無音は鳴らさない
+      const keepPlaying = inWindow && !(t.kind === "audio" && silenced);
       const wasMuted = el.muted;
-      if (!inRange) {
+      if (!keepPlaying) {
         el.muted = true;
         unlockingRef.current.add(key);
+      } else {
+        el.muted = t.kind === "video" ? silenced : false;
       }
       const promise = el.play();
       if (promise && typeof promise.then === "function") {
         promise
           .then(() => {
-            if (!inRange) {
+            if (!keepPlaying) {
               el.pause();
               el.muted = wasMuted;
               unlockingRef.current.delete(key);
             }
           })
           .catch((err: unknown) => {
-            if (!inRange) {
+            if (!keepPlaying) {
               el.muted = wasMuted;
               unlockingRef.current.delete(key);
             }
@@ -334,7 +350,7 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
               setError("ブラウザのautoplay制限で再生できませんでした。もう一度押してください。");
             }
           });
-      } else if (!inRange) {
+      } else if (!keepPlaying) {
         unlockingRef.current.delete(key);
       }
     }
@@ -450,6 +466,7 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
     top: number;
     height: number;
     shownSpec: ShownSpec | null;
+    shownVideo: boolean;
   };
   const rowInfos: RowInfo[] = useMemo(() => {
     let top = 0;
@@ -462,12 +479,17 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
           shownSpec = { spec, mode: sel.mode, audio: t.data };
         }
       }
-      const height = TRACK_HEIGHT + (shownSpec ? SPECTROGRAM_STRIP_HEIGHT + 4 : 0);
-      const info = { top, height, shownSpec };
-      top += height + TRACK_GAP;
+      const shownVideo = t.kind === "video" && shownVideos.has(t.data.id);
+      const extra = shownSpec
+        ? SPECTROGRAM_STRIP_HEIGHT + 4
+        : shownVideo
+          ? VIDEO_STRIP_HEIGHT + 4
+          : 0;
+      const info = { top, height: TRACK_HEIGHT + extra, shownSpec, shownVideo };
+      top += info.height + TRACK_GAP;
       return info;
     });
-  }, [tracks, specViews]);
+  }, [tracks, specViews, shownVideos]);
   const tracksTotalHeight =
     rowInfos.length === 0
       ? 0
@@ -629,6 +651,18 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
                   onEdit={() => setEditing({ kind: t.kind, id: t.data.id })}
                   onTrim={() => setTrimming({ kind: t.kind, id: t.data.id })}
                   onSpectrogram={t.kind === "audio" ? () => setSpecDialog(t.data.id) : undefined}
+                  showVideo={t.kind === "video" ? shownVideos.has(t.data.id) : undefined}
+                  onToggleVideo={
+                    t.kind === "video"
+                      ? () =>
+                          setShownVideos((cur) => {
+                            const n = new Set(cur);
+                            if (n.has(t.data.id)) n.delete(t.data.id);
+                            else n.add(t.data.id);
+                            return n;
+                          })
+                      : undefined
+                  }
                   soloed={activeSolo?.kind === t.kind && activeSolo.id === t.data.id}
                   soloActive={activeSolo !== null}
                   onSolo={() =>
@@ -739,31 +773,78 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
         />
       )}
       {playbackLens && (
-        <PlaybackLensBar
+        <PlaybackLensPane
           tracks={tracks}
           rowInfos={rowInfos}
           currentTime={currentTime}
           isSoloedOut={isSoloedOut}
+          storageKey={`cqtLensPane:${data.id}`}
         />
       )}
     </div>
   );
 }
 
-// 再生位置レンズ: 表示中の各 spectrogram を再生ヘッド時刻でスライスし、画面下部に
-// 横並びで置く。以前は各レンズを再生ヘッドの座標に fixed 配置していたため縦に折り
-// 重なって読めなかった。solo 中は対象 track だけ出す
-function PlaybackLensBar({
+type PaneGeo = { x: number; y: number; w: number; h: number };
+const LENS_PANE_MIN_W = 220;
+const LENS_PANE_MIN_H = 160;
+
+function defaultPaneGeo(): PaneGeo {
+  const vw = typeof window === "undefined" ? 1200 : window.innerWidth;
+  const vh = typeof window === "undefined" ? 800 : window.innerHeight;
+  const w = Math.min(720, vw - 24);
+  const h = Math.min(300, Math.round(vh * 0.4));
+  return { x: Math.max(12, (vw - w) / 2), y: vh - h - 16, w, h };
+}
+
+// 再生位置レンズ: 表示中の各 spectrogram を再生ヘッド時刻でスライスして 1 つの pane に
+// 横並びで置く。pane はドラッグで移動・右下ハンドルでリサイズでき、中身は overflow:auto
+// なので全 media に届く。solo 中は対象 track だけ出す
+function PlaybackLensPane({
   tracks,
   rowInfos,
   currentTime,
   isSoloedOut,
+  storageKey,
 }: {
   tracks: Track[];
   rowInfos: { top: number; height: number; shownSpec: ShownSpec | null }[];
   currentTime: number;
   isSoloedOut: (t: Track) => boolean;
+  storageKey: string;
 }) {
+  const [geo, setGeo] = useState<PaneGeo>(() => loadLocal(storageKey, defaultPaneGeo()));
+  useEffect(() => {
+    saveLocal(storageKey, geo);
+  }, [storageKey, geo]);
+  const drag = useRef<{ mode: "move" | "resize"; sx: number; sy: number; orig: PaneGeo } | null>(
+    null,
+  );
+  const onDown = (mode: "move" | "resize") => (e: ReactPointerEvent) => {
+    drag.current = { mode, sx: e.clientX, sy: e.clientY, orig: geo };
+    e.currentTarget.setPointerCapture(e.pointerId);
+    e.preventDefault();
+  };
+  const onMove = (e: ReactPointerEvent): void => {
+    const d = drag.current;
+    if (!d) return;
+    const dx = e.clientX - d.sx;
+    const dy = e.clientY - d.sy;
+    if (d.mode === "move") setGeo({ ...d.orig, x: d.orig.x + dx, y: d.orig.y + dy });
+    else
+      setGeo({
+        ...d.orig,
+        w: Math.max(LENS_PANE_MIN_W, d.orig.w + dx),
+        h: Math.max(LENS_PANE_MIN_H, d.orig.h + dy),
+      });
+  };
+  const onUp = (e: ReactPointerEvent): void => {
+    drag.current = null;
+    try {
+      e.currentTarget.releasePointerCapture(e.pointerId);
+    } catch {}
+  };
+
   const shown = rowInfos
     .map((info, idx) => ({ info, track: tracks[idx]! }))
     .filter(({ info, track }) => info.shownSpec && !isSoloedOut(track));
@@ -772,30 +853,80 @@ function PlaybackLensBar({
     <div
       style={{
         position: "fixed",
-        left: 0,
-        right: 0,
-        bottom: 0,
+        left: geo.x,
+        top: geo.y,
+        width: geo.w,
+        height: geo.h,
         display: "flex",
-        flexWrap: "wrap",
-        justifyContent: "center",
-        gap: 8,
-        padding: 8,
-        background: "rgba(0,0,0,0.55)",
-        zIndex: 50,
-        pointerEvents: "none",
+        flexDirection: "column",
+        background: "rgba(10,10,12,0.92)",
+        border: "1px solid #555",
+        borderRadius: 6,
+        zIndex: 60,
+        boxShadow: "0 6px 24px rgba(0,0,0,0.5)",
       }}
     >
-      {shown.map(({ info, track }) => (
-        <HarmonicLens
-          key={trackKey(track)}
-          placement="inline"
-          title={`[${track.kind === "video" ? "V" : "A"}] ${track.data.name}`}
-          spec={info.shownSpec!.spec}
-          audio={info.shownSpec!.audio}
-          projT={currentTime}
-          yRatio={null}
-        />
-      ))}
+      <div
+        onPointerDown={onDown("move")}
+        onPointerMove={onMove}
+        onPointerUp={onUp}
+        style={{
+          cursor: "move",
+          touchAction: "none",
+          userSelect: "none",
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "center",
+          padding: "3px 8px",
+          color: "#ddd",
+          fontSize: 12,
+          borderBottom: "1px solid #555",
+        }}
+      >
+        <span style={{ fontVariantNumeric: "tabular-nums" }}>
+          再生位置レンズ t={currentTime.toFixed(2)}s
+        </span>
+        <span style={{ opacity: 0.7 }}>{shown.length} media · ドラッグで移動 / 右下で拡縮</span>
+      </div>
+      <div
+        style={{
+          flex: 1,
+          overflow: "auto",
+          display: "flex",
+          gap: 8,
+          padding: 8,
+          alignItems: "flex-start",
+        }}
+      >
+        {shown.map(({ info, track }) => (
+          <HarmonicLens
+            key={trackKey(track)}
+            placement="inline"
+            title={`[${track.kind === "video" ? "V" : "A"}] ${track.data.name}`}
+            spec={info.shownSpec!.spec}
+            audio={info.shownSpec!.audio}
+            projT={currentTime}
+            yRatio={null}
+          />
+        ))}
+      </div>
+      <div
+        onPointerDown={onDown("resize")}
+        onPointerMove={onMove}
+        onPointerUp={onUp}
+        aria-hidden="true"
+        style={{
+          position: "absolute",
+          right: 0,
+          bottom: 0,
+          width: 18,
+          height: 18,
+          cursor: "nwse-resize",
+          touchAction: "none",
+          background: "linear-gradient(135deg, transparent 50%, #888 50%)",
+          borderBottomRightRadius: 6,
+        }}
+      />
     </div>
   );
 }
@@ -809,6 +940,7 @@ function syncMediaElement(
   item: VideoItem | AudioItem,
   projTime: number,
   playing: boolean,
+  muted: boolean,
   onPlayError?: (err: unknown) => void,
 ): void {
   const projLow = Math.min(item.projStartSec, item.projEndSec);
@@ -818,6 +950,7 @@ function syncMediaElement(
     if (!el.paused) el.pause();
     return;
   }
+  el.muted = muted;
   const dProj = item.projEndSec - item.projStartSec;
   const dSrc = item.srcEndSec - item.srcStartSec;
   if (dProj === 0 || dSrc === 0) {
@@ -932,6 +1065,8 @@ function TrackRow({
   onEdit,
   onTrim,
   onSpectrogram,
+  showVideo,
+  onToggleVideo,
   soloed,
   soloActive,
   onSolo,
@@ -954,6 +1089,8 @@ function TrackRow({
   onEdit: () => void;
   onTrim: () => void;
   onSpectrogram?: () => void;
+  showVideo?: boolean;
+  onToggleVideo?: () => void;
   soloed: boolean;
   soloActive: boolean;
   onSolo: () => void;
@@ -1165,6 +1302,24 @@ function TrackRow({
               CQT
             </button>
           )}
+          {onToggleVideo && (
+            <button
+              type="button"
+              aria-label={`${item.name} の動画表示`}
+              aria-pressed={showVideo}
+              onClick={(e) => {
+                e.stopPropagation();
+                onToggleVideo();
+              }}
+              style={
+                showVideo
+                  ? { ...trackButtonStyle, background: "#2563eb", color: "white" }
+                  : trackButtonStyle
+              }
+            >
+              動画
+            </button>
+          )}
           <button
             type="button"
             aria-label={`${item.name} をソロ再生`}
@@ -1211,15 +1366,41 @@ function TrackRow({
         </div>
       </div>
       {track.kind === "video" ? (
-        <video
-          ref={attachRef as (el: HTMLVideoElement | null) => void}
-          src={(item as VideoItem).streamUrl}
-          preload="metadata"
-          style={{ display: "none" }}
-          aria-hidden="true"
+        // 表示 ON なら行下の monitor 帯に現在フレームを出す。band は絶対配置で縦位置を固定し、
+        // 中の video を sticky-left で横スクロールしても画面内に残す。常に mount したまま
+        // display で出し分けて、toggle での再 mount (再生位置リセット) を避ける
+        <div
+          style={{
+            position: "absolute",
+            left: 0,
+            right: 0,
+            top: TRACK_HEIGHT + 2,
+            height: VIDEO_STRIP_HEIGHT,
+            pointerEvents: "none",
+            display: showVideo ? "block" : "none",
+            zIndex: 3,
+          }}
         >
-          <track kind="captions" />
-        </video>
+          <video
+            ref={attachRef as (el: HTMLVideoElement | null) => void}
+            src={(item as VideoItem).streamUrl}
+            preload="metadata"
+            aria-hidden="true"
+            style={{
+              position: "sticky",
+              left: 4,
+              display: "block",
+              height: VIDEO_STRIP_HEIGHT,
+              width: "auto",
+              maxWidth: "60vw",
+              borderRadius: 4,
+              background: "#000",
+              boxShadow: "0 1px 3px rgba(0,0,0,0.3)",
+            }}
+          >
+            <track kind="captions" />
+          </video>
+        </div>
       ) : (
         <audio
           ref={attachRef as (el: HTMLAudioElement | null) => void}
