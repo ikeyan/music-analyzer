@@ -108,6 +108,18 @@ const COLORMAP: Uint8Array = (() => {
   return map;
 })();
 
+// swap 表示 (color=harmonic, 横位置=振幅) で harmonic ごとに割り当てる固定色
+const HARMONIC_RGB: [number, number, number][] = [
+  [255, 255, 255],
+  [56, 189, 248],
+  [250, 204, 21],
+  [244, 114, 182],
+  [74, 222, 128],
+  [251, 146, 60],
+  [167, 139, 250],
+  [248, 113, 113],
+];
+
 function modeHarmonics(meta: SpectrogramMeta, mode: string): number[] {
   if (mode === "rgb") return meta.harmonics.slice(0, 3);
   const h = Number(mode.slice(1));
@@ -360,6 +372,9 @@ export function HarmonicLens({
   placement = "float",
   title,
   fillHeight,
+  swap = false,
+  onToggleSwap,
+  interactive = false,
 }: {
   spec: ApiSpectrogram;
   audio: ApiAudio;
@@ -372,6 +387,11 @@ export function HarmonicLens({
   title?: string;
   // inline で pane 高さに合わせて縦に伸ばす CQT 描画高さ (px)
   fillHeight?: number;
+  // swap: color=harmony・横位置(bar長)=振幅 に入れ替える (既定は color=振幅)
+  swap?: boolean;
+  onToggleSwap?: () => void;
+  // float で pointer 操作を許可する (Ctrl/Cmd で追従停止して触れるようにするとき)
+  interactive?: boolean;
 }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const [meta, setMeta] = useState<SpectrogramMeta | null>(null);
@@ -448,27 +468,55 @@ export function HarmonicLens({
     ctx.fillStyle = "#111";
     ctx.fillRect(0, 0, canvasW, canvasH);
 
-    // 1 harmonic = 1px 列の ImageData を作って横に引き伸ばす
+    // CQT 本体。通常は color=振幅 (harmonic ごとに 1px 列→引き伸ばし)。swap では
+    // color=harmonic (固定色)・横方向の bar 長=振幅 にして、振幅を位置で読めるようにする
     const off = document.createElement("canvas");
-    off.width = numH;
-    off.height = bins;
     const octx = off.getContext("2d");
     if (!octx) return;
-    const img = octx.createImageData(numH, bins);
-    const px = img.data;
-    for (let hi = 0; hi < numH; hi++) {
-      const bytes = tiles[hi]!;
-      for (let b = 0; b < bins; b++) {
-        const o = ((bins - 1 - b) * numH + hi) * 4;
-        const v = bytes[offset + b]!;
-        px[o] = COLORMAP[v * 3]!;
-        px[o + 1] = COLORMAP[v * 3 + 1]!;
-        px[o + 2] = COLORMAP[v * 3 + 2]!;
-        px[o + 3] = 255;
+    if (swap) {
+      const W = LENS_STRIPE_W;
+      off.width = numH * W;
+      off.height = bins;
+      const img = octx.createImageData(numH * W, bins);
+      const px = img.data;
+      for (let hi = 0; hi < numH; hi++) {
+        const bytes = tiles[hi]!;
+        const c = HARMONIC_RGB[hi % HARMONIC_RGB.length]!;
+        for (let b = 0; b < bins; b++) {
+          const v = bytes[offset + b]!;
+          const barLen = Math.round((v / 255) * W);
+          const row = bins - 1 - b;
+          for (let x = 0; x < W; x++) {
+            const o = (row * numH * W + hi * W + x) * 4;
+            const inBar = x < barLen;
+            px[o] = inBar ? c[0] : 12;
+            px[o + 1] = inBar ? c[1] : 12;
+            px[o + 2] = inBar ? c[2] : 12;
+            px[o + 3] = 255;
+          }
+        }
       }
+      octx.putImageData(img, 0, 0);
+      ctx.drawImage(off, 0, 0, numH * W, bins, LENS_AXIS_W, 0, numH * W, displayH);
+    } else {
+      off.width = numH;
+      off.height = bins;
+      const img = octx.createImageData(numH, bins);
+      const px = img.data;
+      for (let hi = 0; hi < numH; hi++) {
+        const bytes = tiles[hi]!;
+        for (let b = 0; b < bins; b++) {
+          const o = ((bins - 1 - b) * numH + hi) * 4;
+          const v = bytes[offset + b]!;
+          px[o] = COLORMAP[v * 3]!;
+          px[o + 1] = COLORMAP[v * 3 + 1]!;
+          px[o + 2] = COLORMAP[v * 3 + 2]!;
+          px[o + 3] = 255;
+        }
+      }
+      octx.putImageData(img, 0, 0);
+      ctx.drawImage(off, 0, 0, numH, bins, LENS_AXIS_W, 0, numH * LENS_STRIPE_W, displayH);
     }
-    octx.putImageData(img, 0, 0);
-    ctx.drawImage(off, 0, 0, numH, bins, LENS_AXIS_W, 0, numH * LENS_STRIPE_W, displayH);
 
     // 列区切り + オクターブ目盛 + harmonic ラベル
     ctx.strokeStyle = "rgba(0,0,0,0.5)";
@@ -508,8 +556,23 @@ export function HarmonicLens({
       const y = displayH * (1 - (binSel + 1) / bins);
       ctx.strokeStyle = "#fff";
       ctx.strokeRect(LENS_AXIS_W + 0.5, y + 0.5, numH * LENS_STRIPE_W - 1, Math.max(1, rowH));
+      // 白線の左に 2 段ラベル: 上=step, 下=note + Hz
+      const fSel = spec.fminHz * 2 ** (binSel / spec.binsPerOctave);
+      const l1 = `${Math.floor(binSel / spec.binsPerOctave)}oct +${binSel % spec.binsPerOctave}/${spec.binsPerOctave}`;
+      const l2 = `${noteName(fSel)} ${formatHz(fSel)}Hz`;
+      const yc = y + rowH / 2;
+      ctx.font = "8px system-ui, sans-serif";
+      ctx.textAlign = "right";
+      ctx.textBaseline = "alphabetic";
+      const tw = Math.max(ctx.measureText(l1).width, ctx.measureText(l2).width);
+      const rx = LENS_AXIS_W - 3;
+      ctx.fillStyle = "rgba(0,0,0,0.82)";
+      ctx.fillRect(rx - tw - 2, yc - 10, tw + 4, 20);
+      ctx.fillStyle = "#fff";
+      ctx.fillText(l1, rx, yc - 1);
+      ctx.fillText(l2, rx, yc + 8);
     }
-  }, [meta, spec, srcT, binSel, tilesVersion, numH, bins, displayH, canvasW, canvasH]);
+  }, [meta, spec, srcT, binSel, tilesVersion, numH, bins, displayH, canvasW, canvasH, swap]);
 
   const panelW = canvasW + 18;
   const panelH = canvasH + 40;
@@ -526,9 +589,6 @@ export function HarmonicLens({
         })()
       : { position: "relative", flex: "0 0 auto" };
 
-  const f0 = binSel === null ? null : spec.fminHz * 2 ** (binSel / spec.binsPerOctave);
-  const stepOct = binSel === null ? null : Math.floor(binSel / spec.binsPerOctave);
-  const stepInOct = binSel === null ? null : binSel % spec.binsPerOctave;
   return (
     <div
       aria-hidden="true"
@@ -538,10 +598,29 @@ export function HarmonicLens({
         border: "1px solid #444",
         borderRadius: 6,
         padding: "4px 8px 6px",
-        pointerEvents: "none",
+        pointerEvents: placement === "inline" || interactive ? "auto" : "none",
         boxShadow: "0 4px 16px rgba(0,0,0,0.4)",
       }}
     >
+      {onToggleSwap && (
+        <input
+          type="checkbox"
+          aria-label="振幅を位置で表示 (color↔harmony)"
+          checked={swap}
+          onChange={onToggleSwap}
+          onPointerDown={(e) => e.stopPropagation()}
+          style={{
+            position: "absolute",
+            top: 3,
+            right: 3,
+            margin: 0,
+            width: 12,
+            height: 12,
+            cursor: "pointer",
+            zIndex: 2,
+          }}
+        />
+      )}
       {title && (
         <div
           style={{
@@ -549,7 +628,7 @@ export function HarmonicLens({
             fontSize: 11,
             fontWeight: 600,
             marginBottom: 2,
-            maxWidth: canvasW,
+            maxWidth: canvasW - 14,
             whiteSpace: "nowrap",
             overflow: "hidden",
             textOverflow: "ellipsis",
@@ -558,19 +637,19 @@ export function HarmonicLens({
           {title}
         </div>
       )}
-      <div
-        style={{
-          color: "#ddd",
-          fontSize: 11,
-          fontVariantNumeric: "tabular-nums",
-          marginBottom: 2,
-          whiteSpace: "nowrap",
-        }}
-      >
-        t={srcT.toFixed(2)}s
-        {f0 !== null &&
-          ` · step ${binSel} (${stepOct}oct +${stepInOct}/${spec.binsPerOctave}) · ${f0.toFixed(1)}Hz ${noteName(f0)}`}
-      </div>
+      {placement === "float" && (
+        <div
+          style={{
+            color: "#ddd",
+            fontSize: 11,
+            fontVariantNumeric: "tabular-nums",
+            marginBottom: 2,
+            whiteSpace: "nowrap",
+          }}
+        >
+          t={srcT.toFixed(2)}s
+        </div>
+      )}
       <canvas ref={canvasRef} style={{ width: canvasW, height: canvasH, display: "block" }} />
     </div>
   );

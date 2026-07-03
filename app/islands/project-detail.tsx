@@ -92,6 +92,12 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
   const [speed, setSpeed] = useState(1);
   // CQT / 動画 band の行ごとの高さ override (trackKey → px)
   const [bandHeights, setBandHeights] = useState<ReadonlyMap<string, number>>(() => new Map());
+  // CQT レンズの color↔harmony 入れ替え表示
+  const [swapLens, setSwapLens] = useState(false);
+  // hover レンズを Ctrl/Cmd (or マルチタッチ) で追従停止して触れる状態にする
+  const [lensFrozen, setLensFrozen] = useState(false);
+  const frozenRef = useRef(false);
+  frozenRef.current = lensFrozen;
   const rowsRef = useRef<HTMLDivElement | null>(null);
 
   // 表示状態 (specViews) と再生位置レンズの ON/OFF を project 単位で localStorage に保存。
@@ -118,8 +124,8 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
     if (restoredRef.current) saveLocal(videoShownKey, [...shownVideos]);
   }, [videoShownKey, shownVideos]);
   useEffect(() => {
-    if (restoredRef.current) saveLocal(mixKey, { volume, speed });
-  }, [mixKey, volume, speed]);
+    if (restoredRef.current) saveLocal(mixKey, { volume, speed, swapLens });
+  }, [mixKey, volume, speed, swapLens]);
   useEffect(() => {
     if (restoredRef.current) saveLocal(bandHeightsKey, [...bandHeights]);
   }, [bandHeightsKey, bandHeights]);
@@ -128,9 +134,10 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
     setPlaybackLens(loadLocal(lensKey, false));
     setAutoScroll(loadLocal(autoScrollKey, false));
     setShownVideos(new Set(loadLocal<string[]>(videoShownKey, [])));
-    const mix = loadLocal(mixKey, { volume: 1, speed: 1 });
+    const mix = loadLocal(mixKey, { volume: 1, speed: 1, swapLens: false });
     setVolume(mix.volume);
     setSpeed(mix.speed);
+    setSwapLens(mix.swapLens ?? false);
     setBandHeights(new Map(loadLocal<[string, number][]>(bandHeightsKey, [])));
     restoredRef.current = true;
   }, [viewsKey, lensKey, autoScrollKey, videoShownKey, mixKey, bandHeightsKey]);
@@ -266,6 +273,39 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
       Math.min(max, el.scrollLeft + currentTimeRef.current * (pxPerSec - oldPx)),
     );
   }, [pxPerSec]);
+
+  // Ctrl/Cmd 押下中 (or 2 本指タッチ中) は hover レンズの追従を止めて触れるようにする。
+  // 解除時はレンズを畳む (mouse が strip から外れている可能性があるため)
+  useEffect(() => {
+    const unfreeze = () => {
+      setLensFrozen(false);
+      setLens(null);
+    };
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Control" || e.key === "Meta") setLensFrozen(true);
+    };
+    const onKeyUp = (e: KeyboardEvent) => {
+      if (e.key === "Control" || e.key === "Meta") unfreeze();
+    };
+    const onTouchStart = (e: TouchEvent) => {
+      if (e.touches.length >= 2) setLensFrozen(true);
+    };
+    const onTouchEnd = (e: TouchEvent) => {
+      if (e.touches.length < 2 && frozenRef.current) unfreeze();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    window.addEventListener("keyup", onKeyUp);
+    window.addEventListener("blur", unfreeze);
+    window.addEventListener("touchstart", onTouchStart, { passive: true });
+    window.addEventListener("touchend", onTouchEnd);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("keyup", onKeyUp);
+      window.removeEventListener("blur", unfreeze);
+      window.removeEventListener("touchstart", onTouchStart);
+      window.removeEventListener("touchend", onTouchEnd);
+    };
+  }, []);
 
   useEffect(() => {
     for (const t of tracks) {
@@ -767,7 +807,12 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
                       : undefined
                   }
                   onLensHover={
-                    shown ? (h) => setLens(h ? { ...h, audioId: t.data.id } : null) : undefined
+                    shown
+                      ? (h) => {
+                          if (frozenRef.current) return;
+                          setLens(h ? { ...h, audioId: t.data.id } : null);
+                        }
+                      : undefined
                   }
                   lensProjT={
                     shown
@@ -853,6 +898,9 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
           yRatio={lens.yRatio}
           anchorX={lens.clientX}
           anchorY={lens.clientY}
+          swap={swapLens}
+          onToggleSwap={() => setSwapLens((v) => !v)}
+          interactive={lensFrozen}
         />
       )}
       {playbackLens && (
@@ -862,6 +910,8 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
           currentTime={currentTime}
           isSoloedOut={isSoloedOut}
           hoverFreqHz={hoverFreqHz}
+          swap={swapLens}
+          onToggleSwap={() => setSwapLens((v) => !v)}
           storageKey={`cqtLensPane:${data.id}`}
         />
       )}
@@ -898,6 +948,8 @@ function PlaybackLensPane({
   currentTime,
   isSoloedOut,
   hoverFreqHz,
+  swap,
+  onToggleSwap,
   storageKey,
 }: {
   tracks: Track[];
@@ -905,6 +957,8 @@ function PlaybackLensPane({
   currentTime: number;
   isSoloedOut: (t: Track) => boolean;
   hoverFreqHz: number | null;
+  swap: boolean;
+  onToggleSwap: () => void;
   storageKey: string;
 }) {
   const [geo, setGeo] = useState<PaneGeo>(() => loadLocal(storageKey, defaultPaneGeo()));
@@ -998,7 +1052,6 @@ function PlaybackLensPane({
         <span style={{ fontVariantNumeric: "tabular-nums" }}>
           再生位置レンズ t={currentTime.toFixed(2)}s
         </span>
-        <span style={{ opacity: 0.7 }}>{shown.length} media · ドラッグで移動 / 右下で拡縮</span>
       </div>
       <div style={{ flex: 1, overflow: "auto", padding: 8 }}>
         <div ref={innerRef} style={{ display: "flex", gap: 8, width: "max-content" }}>
@@ -1007,6 +1060,8 @@ function PlaybackLensPane({
               key={trackKey(track)}
               placement="inline"
               fillHeight={lensHeight}
+              swap={swap}
+              onToggleSwap={onToggleSwap}
               title={`[${track.kind === "video" ? "V" : "A"}] ${track.data.name}`}
               spec={info.shownSpec!.spec}
               audio={info.shownSpec!.audio}
