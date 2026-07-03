@@ -4,6 +4,7 @@ import {
   type ReactNode,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -86,6 +87,11 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
   const [muted, setMuted] = useState<ReadonlySet<string>>(() => new Set());
   // 動画を行の下に表示する video id 集合 (CQT 表示と同様の行追加)
   const [shownVideos, setShownVideos] = useState<ReadonlySet<string>>(() => new Set());
+  // 全体ボリューム (0..1) と再生速度 (倍率)
+  const [volume, setVolume] = useState(1);
+  const [speed, setSpeed] = useState(1);
+  // CQT / 動画 band の行ごとの高さ override (trackKey → px)
+  const [bandHeights, setBandHeights] = useState<ReadonlyMap<string, number>>(() => new Map());
   const rowsRef = useRef<HTMLDivElement | null>(null);
 
   // 表示状態 (specViews) と再生位置レンズの ON/OFF を project 単位で localStorage に保存。
@@ -96,6 +102,8 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
   const lensKey = `cqtPlaybackLens:${data.id}`;
   const autoScrollKey = `cqtAutoScroll:${data.id}`;
   const videoShownKey = `videoShown:${data.id}`;
+  const mixKey = `mix:${data.id}`;
+  const bandHeightsKey = `bandHeights:${data.id}`;
   const restoredRef = useRef(false);
   useEffect(() => {
     if (restoredRef.current) saveLocal(viewsKey, specViews);
@@ -110,12 +118,22 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
     if (restoredRef.current) saveLocal(videoShownKey, [...shownVideos]);
   }, [videoShownKey, shownVideos]);
   useEffect(() => {
+    if (restoredRef.current) saveLocal(mixKey, { volume, speed });
+  }, [mixKey, volume, speed]);
+  useEffect(() => {
+    if (restoredRef.current) saveLocal(bandHeightsKey, [...bandHeights]);
+  }, [bandHeightsKey, bandHeights]);
+  useEffect(() => {
     setSpecViews(loadLocal(viewsKey, {} as Record<string, SpectrogramSelection | undefined>));
     setPlaybackLens(loadLocal(lensKey, false));
     setAutoScroll(loadLocal(autoScrollKey, false));
     setShownVideos(new Set(loadLocal<string[]>(videoShownKey, [])));
+    const mix = loadLocal(mixKey, { volume: 1, speed: 1 });
+    setVolume(mix.volume);
+    setSpeed(mix.speed);
+    setBandHeights(new Map(loadLocal<[string, number][]>(bandHeightsKey, [])));
     restoredRef.current = true;
-  }, [viewsKey, lensKey, autoScrollKey, videoShownKey]);
+  }, [viewsKey, lensKey, autoScrollKey, videoShownKey, mixKey, bandHeightsKey]);
 
   const tracks: Track[] = useMemo(() => {
     const all: Track[] = [
@@ -207,7 +225,7 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
       const dt = (ts - last) / 1000;
       lastTickRef.current = ts;
       setCurrentTime((prev) => {
-        const next = prev + dt;
+        const next = prev + dt * speed;
         if (next >= playEnd) {
           setPlaying(false);
           return playEnd;
@@ -220,7 +238,7 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
     return () => {
       if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
     };
-  }, [playing, playEnd]);
+  }, [playing, playEnd, speed]);
 
   // 自動スクロール: 再生中は currentTime が毎フレーム更新されるので、その度に
   // 再生ヘッドを viewport 中央に置く scrollLeft を書いて連続的に追従する
@@ -231,6 +249,23 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
     const max = Math.max(0, el.scrollWidth - el.clientWidth);
     el.scrollLeft = Math.max(0, Math.min(max, currentTime * pxPerSec - el.clientWidth / 2));
   }, [playing, autoScroll, currentTime, pxPerSec]);
+
+  // ズーム変更で再生ヘッド (赤線) の画面上の位置が動かないよう scrollLeft を補正する。
+  // currentTime は毎フレーム変わるので ref 経由で読み、pxPerSec 変化時だけ走らせる
+  const currentTimeRef = useRef(currentTime);
+  currentTimeRef.current = currentTime;
+  const prevPxRef = useRef(pxPerSec);
+  useLayoutEffect(() => {
+    const el = scrollBoxRef.current;
+    const oldPx = prevPxRef.current;
+    prevPxRef.current = pxPerSec;
+    if (!el || oldPx === pxPerSec) return;
+    const max = Math.max(0, el.scrollWidth - el.clientWidth);
+    el.scrollLeft = Math.max(
+      0,
+      Math.min(max, el.scrollLeft + currentTimeRef.current * (pxPerSec - oldPx)),
+    );
+  }, [pxPerSec]);
 
   useEffect(() => {
     for (const t of tracks) {
@@ -245,14 +280,14 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
         if (!el.paused) el.pause();
         continue;
       }
-      syncMediaElement(el, t.data, currentTime, playing, silenced, () => {
+      syncMediaElement(el, t.data, currentTime, playing, silenced, volume, speed, () => {
         setPlaying(false);
         setError(
           "ブラウザのautoplay制限で再生できませんでした。もう一度再生ボタンを押してください。",
         );
       });
     }
-  }, [tracks, currentTime, playing, isSilenced]);
+  }, [tracks, currentTime, playing, isSilenced, volume, speed]);
 
   const projectId = data.id;
   const refresh = useCallback(async () => {
@@ -467,6 +502,8 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
     height: number;
     shownSpec: ShownSpec | null;
     shownVideo: boolean;
+    /** CQT / 動画 band の高さ (band が無い行は 0) */
+    bandHeight: number;
   };
   const rowInfos: RowInfo[] = useMemo(() => {
     let top = 0;
@@ -480,16 +517,15 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
         }
       }
       const shownVideo = t.kind === "video" && shownVideos.has(t.data.id);
-      const extra = shownSpec
-        ? SPECTROGRAM_STRIP_HEIGHT + 4
-        : shownVideo
-          ? VIDEO_STRIP_HEIGHT + 4
-          : 0;
-      const info = { top, height: TRACK_HEIGHT + extra, shownSpec, shownVideo };
+      const hasBand = shownSpec !== null || shownVideo;
+      const defaultBand = shownSpec ? SPECTROGRAM_STRIP_HEIGHT : VIDEO_STRIP_HEIGHT;
+      const bandHeight = hasBand ? (bandHeights.get(trackKey(t)) ?? defaultBand) : 0;
+      const extra = hasBand ? bandHeight + 4 : 0;
+      const info = { top, height: TRACK_HEIGHT + extra, shownSpec, shownVideo, bandHeight };
       top += info.height + TRACK_GAP;
       return info;
     });
-  }, [tracks, specViews, shownVideos]);
+  }, [tracks, specViews, shownVideos, bandHeights]);
   const tracksTotalHeight =
     rowInfos.length === 0
       ? 0
@@ -502,6 +538,13 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
   const lensTarget = lens
     ? (rowInfos.find((i) => i.shownSpec?.audio.id === lens.audioId)?.shownSpec ?? null)
     : null;
+
+  // hover 中の CQT 上のカーソル周波数。再生位置レンズ pane 側で同じ周波数に白線を出す用。
+  // yRatio=0 が上端 (最高周波数)、bin = (1-yRatio)*bins なので f = fmin*2^((1-yRatio)*octaves)
+  const hoverFreqHz =
+    lens && lens.yRatio !== null && lensTarget
+      ? lensTarget.spec.fminHz * 2 ** ((1 - lens.yRatio) * lensTarget.spec.octaves)
+      : null;
 
   return (
     <div>
@@ -570,6 +613,37 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
         <span style={{ fontVariantNumeric: "tabular-nums" }}>
           {formatTime(currentTime)} / {formatTime(playEnd)}
         </span>
+        <label
+          style={{ display: "flex", alignItems: "center", gap: "0.3rem", fontSize: 13 }}
+          title="全 media の音量"
+        >
+          🔊
+          <input
+            type="range"
+            min={0}
+            max={1}
+            step={0.01}
+            value={volume}
+            onChange={(e) => setVolume(Number(e.target.value))}
+            style={{ width: 80 }}
+          />
+        </label>
+        <label
+          style={{ display: "flex", alignItems: "center", gap: "0.3rem", fontSize: 13 }}
+          title="再生速度 (0.25〜4x)"
+        >
+          速度
+          <input
+            type="range"
+            min={0.25}
+            max={4}
+            step={0.05}
+            value={speed}
+            onChange={(e) => setSpeed(Number(e.target.value))}
+            style={{ width: 90 }}
+          />
+          <span style={{ fontVariantNumeric: "tabular-nums" }}>{speed.toFixed(2)}x</span>
+        </label>
         <label
           style={{ display: "flex", alignItems: "center", gap: "0.3rem", fontSize: 13 }}
           title="ON の間はマウスではなく再生ヘッドの時刻で各 spectrogram 行に CQT レンズを出します"
@@ -681,10 +755,19 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
                       return n;
                     })
                   }
-                  onLensHover={
-                    shown && !playbackLens
-                      ? (h) => setLens(h ? { ...h, audioId: t.data.id } : null)
+                  bandHeight={info.bandHeight}
+                  onBandResize={
+                    info.shownSpec || info.shownVideo
+                      ? (h) =>
+                          setBandHeights((cur) => {
+                            const n = new Map(cur);
+                            n.set(trackKey(t), h);
+                            return n;
+                          })
                       : undefined
+                  }
+                  onLensHover={
+                    shown ? (h) => setLens(h ? { ...h, audioId: t.data.id } : null) : undefined
                   }
                   lensProjT={
                     shown
@@ -709,7 +792,7 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
                         viewportLeft={viewport.left}
                         viewportWidth={viewport.width}
                         top={TRACK_HEIGHT + 2}
-                        height={SPECTROGRAM_STRIP_HEIGHT}
+                        height={info.bandHeight}
                       />
                     )
                   }
@@ -778,6 +861,7 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
           rowInfos={rowInfos}
           currentTime={currentTime}
           isSoloedOut={isSoloedOut}
+          hoverFreqHz={hoverFreqHz}
           storageKey={`cqtLensPane:${data.id}`}
         />
       )}
@@ -800,23 +884,45 @@ function defaultPaneGeo(): PaneGeo {
 // 再生位置レンズ: 表示中の各 spectrogram を再生ヘッド時刻でスライスして 1 つの pane に
 // 横並びで置く。pane はドラッグで移動・右下ハンドルでリサイズでき、中身は overflow:auto
 // なので全 media に届く。solo 中は対象 track だけ出す
+// hoverFreqHz を spec の縦位置 (yRatio, 0=上端) に変換。範囲外なら null
+function freqToYRatio(spec: ApiSpectrogram, freqHz: number): number | null {
+  const yr = 1 - Math.log2(freqHz / spec.fminHz) / spec.octaves;
+  return yr >= 0 && yr <= 1 ? yr : null;
+}
+
+const LENS_PANE_HEADER_H = 26;
+
 function PlaybackLensPane({
   tracks,
   rowInfos,
   currentTime,
   isSoloedOut,
+  hoverFreqHz,
   storageKey,
 }: {
   tracks: Track[];
   rowInfos: { top: number; height: number; shownSpec: ShownSpec | null }[];
   currentTime: number;
   isSoloedOut: (t: Track) => boolean;
+  hoverFreqHz: number | null;
   storageKey: string;
 }) {
   const [geo, setGeo] = useState<PaneGeo>(() => loadLocal(storageKey, defaultPaneGeo()));
   useEffect(() => {
     saveLocal(storageKey, geo);
   }, [storageKey, geo]);
+  // 中身を横に並べた自然幅 (max-content) を測り、pane 幅の最大値にする
+  const innerRef = useRef<HTMLDivElement | null>(null);
+  const [contentW, setContentW] = useState<number | null>(null);
+  useEffect(() => {
+    const el = innerRef.current;
+    if (!el) return;
+    const measure = () => setContentW(el.offsetWidth + 18);
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
   const drag = useRef<{ mode: "move" | "resize"; sx: number; sy: number; orig: PaneGeo } | null>(
     null,
   );
@@ -831,12 +937,14 @@ function PlaybackLensPane({
     const dx = e.clientX - d.sx;
     const dy = e.clientY - d.sy;
     if (d.mode === "move") setGeo({ ...d.orig, x: d.orig.x + dx, y: d.orig.y + dy });
-    else
+    else {
+      const maxW = contentW ?? Number.POSITIVE_INFINITY;
       setGeo({
         ...d.orig,
-        w: Math.max(LENS_PANE_MIN_W, d.orig.w + dx),
+        w: Math.min(maxW, Math.max(LENS_PANE_MIN_W, d.orig.w + dx)),
         h: Math.max(LENS_PANE_MIN_H, d.orig.h + dy),
       });
+    }
   };
   const onUp = (e: ReactPointerEvent): void => {
     drag.current = null;
@@ -849,14 +957,18 @@ function PlaybackLensPane({
     .map((info, idx) => ({ info, track: tracks[idx]! }))
     .filter(({ info, track }) => info.shownSpec && !isSoloedOut(track));
   if (shown.length === 0) return null;
+  // pane 幅は中身幅を超えない。中身の縦幅は pane 高さから header/padding を引いて充填する
+  const paneW = contentW != null ? Math.min(geo.w, contentW) : geo.w;
+  const lensHeight = Math.max(120, geo.h - LENS_PANE_HEADER_H - 16 - 44);
   return (
     <div
       style={{
         position: "fixed",
         left: geo.x,
         top: geo.y,
-        width: geo.w,
+        width: paneW,
         height: geo.h,
+        maxWidth: contentW ?? undefined,
         display: "flex",
         flexDirection: "column",
         background: "rgba(10,10,12,0.92)",
@@ -888,27 +1000,21 @@ function PlaybackLensPane({
         </span>
         <span style={{ opacity: 0.7 }}>{shown.length} media · ドラッグで移動 / 右下で拡縮</span>
       </div>
-      <div
-        style={{
-          flex: 1,
-          overflow: "auto",
-          display: "flex",
-          gap: 8,
-          padding: 8,
-          alignItems: "flex-start",
-        }}
-      >
-        {shown.map(({ info, track }) => (
-          <HarmonicLens
-            key={trackKey(track)}
-            placement="inline"
-            title={`[${track.kind === "video" ? "V" : "A"}] ${track.data.name}`}
-            spec={info.shownSpec!.spec}
-            audio={info.shownSpec!.audio}
-            projT={currentTime}
-            yRatio={null}
-          />
-        ))}
+      <div style={{ flex: 1, overflow: "auto", padding: 8 }}>
+        <div ref={innerRef} style={{ display: "flex", gap: 8, width: "max-content" }}>
+          {shown.map(({ info, track }) => (
+            <HarmonicLens
+              key={trackKey(track)}
+              placement="inline"
+              fillHeight={lensHeight}
+              title={`[${track.kind === "video" ? "V" : "A"}] ${track.data.name}`}
+              spec={info.shownSpec!.spec}
+              audio={info.shownSpec!.audio}
+              projT={currentTime}
+              yRatio={hoverFreqHz != null ? freqToYRatio(info.shownSpec!.spec, hoverFreqHz) : null}
+            />
+          ))}
+        </div>
       </div>
       <div
         onPointerDown={onDown("resize")}
@@ -941,6 +1047,8 @@ function syncMediaElement(
   projTime: number,
   playing: boolean,
   muted: boolean,
+  volume: number,
+  speed: number,
   onPlayError?: (err: unknown) => void,
 ): void {
   const projLow = Math.min(item.projStartSec, item.projEndSec);
@@ -951,13 +1059,14 @@ function syncMediaElement(
     return;
   }
   el.muted = muted;
+  el.volume = Math.max(0, Math.min(1, volume));
   const dProj = item.projEndSec - item.projStartSec;
   const dSrc = item.srcEndSec - item.srcStartSec;
   if (dProj === 0 || dSrc === 0) {
     if (!el.paused) el.pause();
     return;
   }
-  const rate = dSrc / dProj;
+  const rate = (dSrc / dProj) * speed;
   const mediaT = item.srcStartSec + ((projTime - item.projStartSec) / dProj) * dSrc;
   if (Math.abs(el.currentTime - mediaT) > SYNC_DRIFT_TOLERANCE) {
     el.currentTime = mediaT;
@@ -1072,6 +1181,8 @@ function TrackRow({
   onSolo,
   muted,
   onMute,
+  bandHeight,
+  onBandResize,
   onLensHover,
   lensProjT,
   attachRef,
@@ -1096,11 +1207,14 @@ function TrackRow({
   onSolo: () => void;
   muted: boolean;
   onMute: () => void;
+  bandHeight: number;
+  onBandResize?: (h: number) => void;
   onLensHover?: (h: LensHover | null) => void;
   lensProjT?: number | null;
   attachRef: (el: HTMLMediaElement | null) => void;
   spectrogram?: ReactNode;
 }) {
+  const bandDrag = useRef<{ sy: number; orig: number } | null>(null);
   const item = track.data;
   const projLow = Math.min(item.projStartSec, item.projEndSec);
   const projHigh = Math.max(item.projStartSec, item.projEndSec);
@@ -1144,10 +1258,7 @@ function TrackRow({
                 const yIn = e.clientY - bounds.top - (TRACK_HEIGHT + 2);
                 onLensHover({
                   projT: (e.clientX - bounds.left) / pxPerSec,
-                  yRatio:
-                    yIn >= 0 && yIn < SPECTROGRAM_STRIP_HEIGHT
-                      ? yIn / SPECTROGRAM_STRIP_HEIGHT
-                      : null,
+                  yRatio: yIn >= 0 && yIn < bandHeight ? yIn / bandHeight : null,
                   clientX: e.clientX,
                   clientY: e.clientY,
                 });
@@ -1206,6 +1317,38 @@ function TrackRow({
         )}
       </div>
       {spectrogram}
+      {onBandResize && (
+        <div
+          aria-hidden="true"
+          onPointerDown={(e) => {
+            bandDrag.current = { sy: e.clientY, orig: bandHeight };
+            e.currentTarget.setPointerCapture(e.pointerId);
+            e.preventDefault();
+            e.stopPropagation();
+          }}
+          onPointerMove={(e) => {
+            const d = bandDrag.current;
+            if (!d) return;
+            onBandResize(Math.max(48, Math.min(600, d.orig + (e.clientY - d.sy))));
+          }}
+          onPointerUp={(e) => {
+            bandDrag.current = null;
+            try {
+              e.currentTarget.releasePointerCapture(e.pointerId);
+            } catch {}
+          }}
+          style={{
+            position: "absolute",
+            left: 0,
+            right: 0,
+            top: TRACK_HEIGHT + 2 + bandHeight - 4,
+            height: 9,
+            cursor: "ns-resize",
+            zIndex: 5,
+            touchAction: "none",
+          }}
+        />
+      )}
       <div
         style={{
           position: "sticky",
@@ -1375,7 +1518,7 @@ function TrackRow({
             left: 0,
             right: 0,
             top: TRACK_HEIGHT + 2,
-            height: VIDEO_STRIP_HEIGHT,
+            height: bandHeight,
             pointerEvents: "none",
             display: showVideo ? "block" : "none",
             zIndex: 3,
@@ -1390,7 +1533,7 @@ function TrackRow({
               position: "sticky",
               left: 4,
               display: "block",
-              height: VIDEO_STRIP_HEIGHT,
+              height: bandHeight,
               width: "auto",
               maxWidth: "60vw",
               borderRadius: 4,

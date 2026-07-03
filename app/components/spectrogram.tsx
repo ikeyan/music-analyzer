@@ -359,6 +359,7 @@ export function HarmonicLens({
   anchorY,
   placement = "float",
   title,
+  fillHeight,
 }: {
   spec: ApiSpectrogram;
   audio: ApiAudio;
@@ -369,6 +370,8 @@ export function HarmonicLens({
   anchorY?: number;
   placement?: "float" | "inline";
   title?: string;
+  // inline で pane 高さに合わせて縦に伸ばす CQT 描画高さ (px)
+  fillHeight?: number;
 }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const [meta, setMeta] = useState<SpectrogramMeta | null>(null);
@@ -397,7 +400,7 @@ export function HarmonicLens({
   // layout は spec だけで決まる (meta 到着前にパネル寸法が変わらないように)
   const numH = spec.harmonics.length;
   const bins = spec.binsPerOctave * spec.octaves;
-  const displayH = Math.min(320, Math.max(144, bins * 2));
+  const displayH = fillHeight ?? Math.min(320, Math.max(144, bins * 2));
   const canvasW = LENS_AXIS_W + numH * LENS_STRIPE_W;
   const canvasH = displayH + LENS_LABEL_H;
 
