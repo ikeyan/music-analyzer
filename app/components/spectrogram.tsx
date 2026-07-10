@@ -464,40 +464,38 @@ export function HarmonicLens({
     const tileIdx = Math.floor(frame / meta.tileFrames);
     const offset = (frame - tileIdx * meta.tileFrames) * meta.bins;
 
-    // 表示倍音 (h=1..numH) ごとに、最近傍の計算済み plane と bin shift を決める。
-    // 未計算の倍数は log 周波数上の平行移動 (bin shift = B*log2(h/h0)) で近似する
-    const disp: { h0: number; shift: number }[] = [];
+    // 各表示倍音 h の候補 source を「サブ bin 丸め誤差」昇順で並べる。描画時に bin ごとに
+    // カバーできる最小誤差の source を選ぶ。harmonic plane は同一 VQT を log 周波数で
+    // ずらしたものなので値はほぼ厳密に一致し、誤差は bin 丸めのみ。計算済み倍音は誤差0、
+    // 低域は plane1 等が自然に埋める (shift=B*log2(h/h0))
+    const candidates: { h0: number; shift: number; err: number }[][] = [];
     for (let hi = 0; hi < numH; hi++) {
       const h = hi + 1;
-      let h0 = meta.harmonics[0]!;
-      let best = Number.POSITIVE_INFINITY;
-      for (const hc of meta.harmonics) {
-        const d = Math.abs(Math.log2(h / hc));
-        if (d < best) {
-          best = d;
-          h0 = hc;
-        }
-      }
-      disp.push({ h0, shift: Math.round(spec.binsPerOctave * Math.log2(h / h0)) });
+      const cs = meta.harmonics.map((h0) => {
+        const s = spec.binsPerOctave * Math.log2(h / h0);
+        const shift = Math.round(s);
+        return { h0, shift, err: Math.abs(s - shift) };
+      });
+      cs.sort((a, b) => a.err - b.err);
+      candidates.push(cs);
     }
 
-    // 必要な source plane のタイルを集める (dedup)。1 つでも未取得なら前フレーム保持
+    // 計算済み plane のタイルを集める。1 つでも未取得なら前フレーム保持
     const srcTiles = new Map<number, Uint8Array | null>();
     let anyMissing = false;
-    for (const { h0 } of disp) {
-      if (!srcTiles.has(h0)) {
-        const b = getTileBytes(`${spec.tileUrlBase}/${h0}/0/${tileIdx}`);
-        srcTiles.set(h0, b);
-        if (!b) anyMissing = true;
-      }
+    for (const h0 of meta.harmonics) {
+      const b = getTileBytes(`${spec.tileUrlBase}/${h0}/0/${tileIdx}`);
+      srcTiles.set(h0, b);
+      if (!b) anyMissing = true;
     }
     if (anyMissing) return;
 
     const sampleAt = (hi: number, b: number): number => {
-      const d = disp[hi]!;
-      const sb = b + d.shift;
-      if (sb < 0 || sb >= meta.bins) return 0;
-      return srcTiles.get(d.h0)![offset + sb]!;
+      for (const c of candidates[hi]!) {
+        const rb = b + c.shift;
+        if (rb >= 0 && rb < meta.bins) return srcTiles.get(c.h0)![offset + rb]!;
+      }
+      return 0;
     };
 
     ctx.fillStyle = "#111";
@@ -576,8 +574,8 @@ export function HarmonicLens({
     }
     ctx.textAlign = "center";
     for (let hi = 0; hi < numH; hi++) {
-      // 計算済み倍音は明るく、近似 (shift≠0 か非計算) は暗めで区別する
-      const approx = disp[hi]!.shift !== 0 || !meta.harmonics.includes(hi + 1);
+      // 計算済み倍音は明るく、近似 (非計算 = shift で補間) は暗めで区別する
+      const approx = !meta.harmonics.includes(hi + 1);
       ctx.fillStyle = approx ? "#7a7a7a" : "#ccc";
       ctx.fillText(
         `×${hi + 1}${approx ? "~" : ""}`,
@@ -841,9 +839,11 @@ export function SpectrogramDialogBody({
       return;
     }
     const { fminHz, octaves } = cqtRangeFromCenter(center, down, up);
+    // h=1 は低域近似元として常に含める
+    const harmonics = Array.from(new Set([1, ...form.harmonics])).toSorted((a, x) => a - x);
     setCreating(true);
     setError(null);
-    const result = await onCreate({ binsPerOctave: b, octaves, fminHz, harmonics: form.harmonics });
+    const result = await onCreate({ binsPerOctave: b, octaves, fminHz, harmonics });
     setCreating(false);
     if ("error" in result) setError(result.error);
   }
@@ -1047,7 +1047,7 @@ export function SpectrogramDialogBody({
             >
               <input
                 type="checkbox"
-                checked={form.harmonics.includes(h)}
+                checked={h === 1 || form.harmonics.includes(h)}
                 onChange={(e) =>
                   setField(
                     "harmonics",
@@ -1056,7 +1056,8 @@ export function SpectrogramDialogBody({
                       : form.harmonics.filter((x) => x !== h),
                   )
                 }
-                disabled={creating}
+                // h=1 は低域の近似元として常に計算する (off 不可)
+                disabled={creating || h === 1}
               />
               ×{h}
             </label>
@@ -1064,8 +1065,9 @@ export function SpectrogramDialogBody({
         </div>
         <p style={{ fontSize: 11, color: "#666", margin: "0.4rem 0" }}>
           harmonic CQT は選んだ各倍音 (中心×h) ごとに CQT を計算します。複数選ぶと RGB
-          合成表示が使えます。{MAX_SPECTROGRAM_FMAX_HZ}Hz
-          を超える高域は自動で黒く（クランプ）表示されます。
+          合成表示が使えます。×1 は低域の近似元として常に計算します。レンズでは未計算の
+          倍数も、計算済み plane を bin 方向に平行移動して近似表示します。
+          {MAX_SPECTROGRAM_FMAX_HZ}Hz を超える高域は自動で黒く（クランプ）表示されます。
         </p>
         <button type="button" onClick={create} disabled={creating || baseTopOver || !formValid}>
           {creating ? "開始中…" : "生成開始"}
