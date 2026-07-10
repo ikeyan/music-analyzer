@@ -94,6 +94,10 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
   const [bandHeights, setBandHeights] = useState<ReadonlyMap<string, number>>(() => new Map());
   // CQT レンズの color↔harmony 入れ替え表示
   const [swapLens, setSwapLens] = useState(false);
+  // float hover レンズの高さ override (null = 既定)
+  const [floatLensHeight, setFloatLensHeight] = useState<number | null>(null);
+  // CQT レンズで表示する倍音の上限 (spec ごと)
+  const [lensMaxHarmonic, setLensMaxHarmonic] = useState<Record<string, number>>({});
   // hover レンズを Ctrl/Cmd (or マルチタッチ) で追従停止して触れる状態にする
   const [lensFrozen, setLensFrozen] = useState(false);
   const frozenRef = useRef(false);
@@ -110,6 +114,7 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
   const videoShownKey = `videoShown:${data.id}`;
   const mixKey = `mix:${data.id}`;
   const bandHeightsKey = `bandHeights:${data.id}`;
+  const lensMaxHKey = `lensMaxH:${data.id}`;
   const restoredRef = useRef(false);
   useEffect(() => {
     if (restoredRef.current) saveLocal(viewsKey, specViews);
@@ -124,23 +129,33 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
     if (restoredRef.current) saveLocal(videoShownKey, [...shownVideos]);
   }, [videoShownKey, shownVideos]);
   useEffect(() => {
-    if (restoredRef.current) saveLocal(mixKey, { volume, speed, swapLens });
-  }, [mixKey, volume, speed, swapLens]);
+    if (restoredRef.current) saveLocal(mixKey, { volume, speed, swapLens, floatLensHeight });
+  }, [mixKey, volume, speed, swapLens, floatLensHeight]);
   useEffect(() => {
     if (restoredRef.current) saveLocal(bandHeightsKey, [...bandHeights]);
   }, [bandHeightsKey, bandHeights]);
+  useEffect(() => {
+    if (restoredRef.current) saveLocal(lensMaxHKey, lensMaxHarmonic);
+  }, [lensMaxHKey, lensMaxHarmonic]);
   useEffect(() => {
     setSpecViews(loadLocal(viewsKey, {} as Record<string, SpectrogramSelection | undefined>));
     setPlaybackLens(loadLocal(lensKey, false));
     setAutoScroll(loadLocal(autoScrollKey, false));
     setShownVideos(new Set(loadLocal<string[]>(videoShownKey, [])));
-    const mix = loadLocal(mixKey, { volume: 1, speed: 1, swapLens: false });
+    const mix = loadLocal(mixKey, {
+      volume: 1,
+      speed: 1,
+      swapLens: false,
+      floatLensHeight: null as number | null,
+    });
     setVolume(mix.volume);
     setSpeed(mix.speed);
     setSwapLens(mix.swapLens ?? false);
+    setFloatLensHeight(mix.floatLensHeight ?? null);
+    setLensMaxHarmonic(loadLocal<Record<string, number>>(lensMaxHKey, {}));
     setBandHeights(new Map(loadLocal<[string, number][]>(bandHeightsKey, [])));
     restoredRef.current = true;
-  }, [viewsKey, lensKey, autoScrollKey, videoShownKey, mixKey, bandHeightsKey]);
+  }, [viewsKey, lensKey, autoScrollKey, videoShownKey, mixKey, bandHeightsKey, lensMaxHKey]);
 
   const tracks: Track[] = useMemo(() => {
     const all: Track[] = [
@@ -901,6 +916,12 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
           swap={swapLens}
           onToggleSwap={() => setSwapLens((v) => !v)}
           interactive={lensFrozen}
+          fillHeight={floatLensHeight ?? undefined}
+          onHeightResize={(h) => setFloatLensHeight(h)}
+          maxHarmonic={lensMaxHarmonic[lensTarget.spec.id]}
+          onSetMaxHarmonic={(n) =>
+            setLensMaxHarmonic((prev) => ({ ...prev, [lensTarget.spec.id]: n }))
+          }
         />
       )}
       {playbackLens && (
@@ -912,6 +933,8 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
           hoverFreqHz={hoverFreqHz}
           swap={swapLens}
           onToggleSwap={() => setSwapLens((v) => !v)}
+          lensMaxHarmonic={lensMaxHarmonic}
+          onSetMaxHarmonic={(specId, n) => setLensMaxHarmonic((prev) => ({ ...prev, [specId]: n }))}
           storageKey={`cqtLensPane:${data.id}`}
         />
       )}
@@ -950,6 +973,8 @@ function PlaybackLensPane({
   hoverFreqHz,
   swap,
   onToggleSwap,
+  lensMaxHarmonic,
+  onSetMaxHarmonic,
   storageKey,
 }: {
   tracks: Track[];
@@ -959,6 +984,8 @@ function PlaybackLensPane({
   hoverFreqHz: number | null;
   swap: boolean;
   onToggleSwap: () => void;
+  lensMaxHarmonic: Record<string, number>;
+  onSetMaxHarmonic: (specId: string, n: number) => void;
   storageKey: string;
 }) {
   const [geo, setGeo] = useState<PaneGeo>(() => loadLocal(storageKey, defaultPaneGeo()));
@@ -1062,6 +1089,8 @@ function PlaybackLensPane({
               fillHeight={lensHeight}
               swap={swap}
               onToggleSwap={onToggleSwap}
+              maxHarmonic={lensMaxHarmonic[info.shownSpec!.spec.id]}
+              onSetMaxHarmonic={(n) => onSetMaxHarmonic(info.shownSpec!.spec.id, n)}
               title={`[${track.kind === "video" ? "V" : "A"}] ${track.data.name}`}
               spec={info.shownSpec!.spec}
               audio={info.shownSpec!.audio}

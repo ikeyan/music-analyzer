@@ -375,6 +375,9 @@ export function HarmonicLens({
   swap = false,
   onToggleSwap,
   interactive = false,
+  maxHarmonic,
+  onSetMaxHarmonic,
+  onHeightResize,
 }: {
   spec: ApiSpectrogram;
   audio: ApiAudio;
@@ -392,7 +395,13 @@ export function HarmonicLens({
   onToggleSwap?: () => void;
   // float で pointer 操作を許可する (Ctrl/Cmd で追従停止して触れるようにするとき)
   interactive?: boolean;
+  // 表示する倍音の上限。未計算の倍数は最近傍の計算済み plane を bin 方向に平行移動して近似
+  maxHarmonic?: number;
+  onSetMaxHarmonic?: (n: number) => void;
+  // float で高さを変えるハンドル用 (現在の displayH を渡して新しい高さを返す)
+  onHeightResize?: (h: number) => void;
 }) {
+  const heightDrag = useRef<{ sy: number; orig: number } | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const [meta, setMeta] = useState<SpectrogramMeta | null>(null);
   const [tilesVersion, setTilesVersion] = useState(0);
@@ -417,8 +426,10 @@ export function HarmonicLens({
     };
   }, []);
 
-  // layout は spec だけで決まる (meta 到着前にパネル寸法が変わらないように)
-  const numH = spec.harmonics.length;
+  // layout は spec だけで決まる (meta 到着前にパネル寸法が変わらないように)。
+  // 表示倍音は 1..maxH (既定は計算済み最大倍音)。未計算の倍数も列として出す
+  const maxH = Math.max(1, Math.round(maxHarmonic ?? Math.max(...spec.harmonics)));
+  const numH = maxH;
   const bins = spec.binsPerOctave * spec.octaves;
   const displayH = fillHeight ?? Math.min(320, Math.max(144, bins * 2));
   const canvasW = LENS_AXIS_W + numH * LENS_STRIPE_W;
@@ -453,17 +464,41 @@ export function HarmonicLens({
     const tileIdx = Math.floor(frame / meta.tileFrames);
     const offset = (frame - tileIdx * meta.tileFrames) * meta.bins;
 
-    // 全 harmonic のタイルを先に集める。1 つでも未取得なら再描画せず前フレームを保持する。
-    // 再生中にタイル境界を跨ぐと未 cache タイルが一瞬灰色にちらつくのを防ぐ (getTileBytes が
-    // fetch を蹴るので、到着時に tilesVersion が上がって再描画される)
-    const tiles: (Uint8Array | null)[] = [];
-    let anyMissing = false;
+    // 表示倍音 (h=1..numH) ごとに、最近傍の計算済み plane と bin shift を決める。
+    // 未計算の倍数は log 周波数上の平行移動 (bin shift = B*log2(h/h0)) で近似する
+    const disp: { h0: number; shift: number }[] = [];
     for (let hi = 0; hi < numH; hi++) {
-      const b = getTileBytes(`${spec.tileUrlBase}/${meta.harmonics[hi]}/0/${tileIdx}`);
-      tiles.push(b);
-      if (!b) anyMissing = true;
+      const h = hi + 1;
+      let h0 = meta.harmonics[0]!;
+      let best = Number.POSITIVE_INFINITY;
+      for (const hc of meta.harmonics) {
+        const d = Math.abs(Math.log2(h / hc));
+        if (d < best) {
+          best = d;
+          h0 = hc;
+        }
+      }
+      disp.push({ h0, shift: Math.round(spec.binsPerOctave * Math.log2(h / h0)) });
+    }
+
+    // 必要な source plane のタイルを集める (dedup)。1 つでも未取得なら前フレーム保持
+    const srcTiles = new Map<number, Uint8Array | null>();
+    let anyMissing = false;
+    for (const { h0 } of disp) {
+      if (!srcTiles.has(h0)) {
+        const b = getTileBytes(`${spec.tileUrlBase}/${h0}/0/${tileIdx}`);
+        srcTiles.set(h0, b);
+        if (!b) anyMissing = true;
+      }
     }
     if (anyMissing) return;
+
+    const sampleAt = (hi: number, b: number): number => {
+      const d = disp[hi]!;
+      const sb = b + d.shift;
+      if (sb < 0 || sb >= meta.bins) return 0;
+      return srcTiles.get(d.h0)![offset + sb]!;
+    };
 
     ctx.fillStyle = "#111";
     ctx.fillRect(0, 0, canvasW, canvasH);
@@ -480,10 +515,9 @@ export function HarmonicLens({
       const img = octx.createImageData(numH * W, bins);
       const px = img.data;
       for (let hi = 0; hi < numH; hi++) {
-        const bytes = tiles[hi]!;
         const c = HARMONIC_RGB[hi % HARMONIC_RGB.length]!;
         for (let b = 0; b < bins; b++) {
-          const v = bytes[offset + b]!;
+          const v = sampleAt(hi, b);
           const barLen = Math.round((v / 255) * W);
           const row = bins - 1 - b;
           for (let x = 0; x < W; x++) {
@@ -504,10 +538,9 @@ export function HarmonicLens({
       const img = octx.createImageData(numH, bins);
       const px = img.data;
       for (let hi = 0; hi < numH; hi++) {
-        const bytes = tiles[hi]!;
         for (let b = 0; b < bins; b++) {
           const o = ((bins - 1 - b) * numH + hi) * 4;
-          const v = bytes[offset + b]!;
+          const v = sampleAt(hi, b);
           px[o] = COLORMAP[v * 3]!;
           px[o + 1] = COLORMAP[v * 3 + 1]!;
           px[o + 2] = COLORMAP[v * 3 + 2]!;
@@ -542,10 +575,12 @@ export function HarmonicLens({
       ctx.fillText(`${noteName(f)} ${formatHz(f)}`, LENS_AXIS_W - 4, Math.max(6, y));
     }
     ctx.textAlign = "center";
-    ctx.fillStyle = "#ccc";
     for (let hi = 0; hi < numH; hi++) {
+      // 計算済み倍音は明るく、近似 (shift≠0 か非計算) は暗めで区別する
+      const approx = disp[hi]!.shift !== 0 || !meta.harmonics.includes(hi + 1);
+      ctx.fillStyle = approx ? "#7a7a7a" : "#ccc";
       ctx.fillText(
-        `×${meta.harmonics[hi]}`,
+        `×${hi + 1}${approx ? "~" : ""}`,
         LENS_AXIS_W + (hi + 0.5) * LENS_STRIPE_W,
         displayH + LENS_LABEL_H / 2 + 1,
       );
@@ -572,7 +607,7 @@ export function HarmonicLens({
       ctx.fillText(l1, rx, yc - 1);
       ctx.fillText(l2, rx, yc + 8);
     }
-  }, [meta, spec, srcT, binSel, tilesVersion, numH, bins, displayH, canvasW, canvasH, swap]);
+  }, [meta, spec, srcT, binSel, tilesVersion, numH, bins, displayH, canvasW, canvasH, swap, maxH]);
 
   const panelW = canvasW + 18;
   const panelH = canvasH + 40;
@@ -602,24 +637,44 @@ export function HarmonicLens({
         boxShadow: "0 4px 16px rgba(0,0,0,0.4)",
       }}
     >
-      {onToggleSwap && (
-        <input
-          type="checkbox"
-          aria-label="振幅を位置で表示 (color↔harmony)"
-          checked={swap}
-          onChange={onToggleSwap}
+      {(onToggleSwap || onSetMaxHarmonic) && (
+        <div
           onPointerDown={(e) => e.stopPropagation()}
           style={{
             position: "absolute",
-            top: 3,
+            top: 2,
             right: 3,
-            margin: 0,
-            width: 12,
-            height: 12,
-            cursor: "pointer",
+            display: "flex",
+            alignItems: "center",
+            gap: 3,
             zIndex: 2,
           }}
-        />
+        >
+          {onSetMaxHarmonic && (
+            <input
+              type="number"
+              min={1}
+              max={32}
+              value={maxH}
+              aria-label="表示倍音の上限"
+              title="表示する倍音の上限 (未計算の倍数は近似表示)"
+              onChange={(e) => {
+                const n = Math.round(Number(e.target.value));
+                if (Number.isFinite(n)) onSetMaxHarmonic(Math.max(1, Math.min(32, n)));
+              }}
+              style={{ width: 34, height: 15, fontSize: 10, padding: "0 2px" }}
+            />
+          )}
+          {onToggleSwap && (
+            <input
+              type="checkbox"
+              aria-label="振幅を位置で表示 (color↔harmony)"
+              checked={swap}
+              onChange={onToggleSwap}
+              style={{ margin: 0, width: 12, height: 12, cursor: "pointer" }}
+            />
+          )}
+        </div>
       )}
       {title && (
         <div
@@ -628,7 +683,7 @@ export function HarmonicLens({
             fontSize: 11,
             fontWeight: 600,
             marginBottom: 2,
-            maxWidth: canvasW - 14,
+            maxWidth: Math.max(30, canvasW - 56),
             whiteSpace: "nowrap",
             overflow: "hidden",
             textOverflow: "ellipsis",
@@ -651,6 +706,37 @@ export function HarmonicLens({
         </div>
       )}
       <canvas ref={canvasRef} style={{ width: canvasW, height: canvasH, display: "block" }} />
+      {onHeightResize && interactive && (
+        <div
+          aria-hidden="true"
+          onPointerDown={(e) => {
+            heightDrag.current = { sy: e.clientY, orig: displayH };
+            e.currentTarget.setPointerCapture(e.pointerId);
+            e.preventDefault();
+            e.stopPropagation();
+          }}
+          onPointerMove={(e) => {
+            const d = heightDrag.current;
+            if (!d) return;
+            onHeightResize(Math.max(100, Math.min(800, d.orig + (e.clientY - d.sy))));
+          }}
+          onPointerUp={(e) => {
+            heightDrag.current = null;
+            try {
+              e.currentTarget.releasePointerCapture(e.pointerId);
+            } catch {}
+          }}
+          style={{
+            position: "absolute",
+            left: 0,
+            right: 0,
+            bottom: 0,
+            height: 9,
+            cursor: "ns-resize",
+            background: "rgba(255,255,255,0.15)",
+          }}
+        />
+      )}
     </div>
   );
 }
