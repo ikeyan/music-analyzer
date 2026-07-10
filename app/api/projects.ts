@@ -1263,7 +1263,7 @@ export const projects = new Hono()
       const idx = Number(index);
       if (
         !Number.isInteger(h) ||
-        h < 1 ||
+        h < 0 ||
         !Number.isInteger(lv) ||
         lv < 0 ||
         !Number.isInteger(idx) ||
@@ -1276,7 +1276,8 @@ export const projects = new Hono()
         Effect.flatMap((project) => requireAudio(project.id, audioId)),
         Effect.flatMap((audio) => requireReadySpectrogram(audio.id, specId)),
         Effect.flatMap((spec) =>
-          parseHarmonics(spec.harmonics).includes(h)
+          // h=0 は base plane。meta にしか記録されないので存在確認は streamS3 (無ければ 404) に委ねる
+          h === 0 || parseHarmonics(spec.harmonics).includes(h)
             ? Either.right(spec)
             : leftErr({ status: 404, error: `harmonic ${h} not in spectrogram` }),
         ),

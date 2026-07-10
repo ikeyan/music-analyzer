@@ -22,6 +22,7 @@ import {
   SPECTROGRAM_TILE_FRAMES,
   type SpectrogramMeta,
   analysisSampleRate,
+  baseCqtOctaves,
   buildPyramid,
   chooseHop,
   estimateAnalysisBytes,
@@ -70,10 +71,13 @@ export async function runSpectrogramTask(
   // VQT: 低域の窓長を頭打ちにして onset/offset の時間分解能を上げる (純 CQT だと
   // 低域ほど窓 = Q/f が伸びて時間方向に大きく滲む)。binsPerOctave から ERB 準拠で導出
   const gamma = autoGamma(spec.binsPerOctave);
+  // base plane は [fmin, Nyquist] を full 精度で持ち、近似 source の高域切れを無くす
+  const baseOctaves = baseCqtOctaves(spec.fminHz, spec.binsPerOctave, sampleRate);
+  const baseBins = spec.binsPerOctave * baseOctaves;
   // decode 前に PCM + magnitudes + タイル列の合計ピークを見積もってゲートする
   const estSamples = Math.ceil(sampleRate * audio.durationSec);
   const estHop = chooseHop(sampleRate, spec.octaves, estSamples);
-  const estBytes = estimateAnalysisBytes(estSamples, estHop, bins);
+  const estBytes = estimateAnalysisBytes(estSamples, estHop, Math.max(bins, baseBins));
   if (estBytes > MAX_ANALYSIS_BYTES) {
     return Either.left(
       `estimated analysis memory ${Math.round(estBytes / 2 ** 20)}MB exceeds budget ` +
@@ -94,6 +98,16 @@ export async function runSpectrogramTask(
       binsPerOctave: spec.binsPerOctave,
       octaves: oct,
       fminHz: spec.fminHz * h,
+      hop: estHop,
+      gamma,
+    });
+  }
+  if (baseOctaves >= 1) {
+    estOps += estimateCqtOps(estSamples, {
+      sampleRate,
+      binsPerOctave: spec.binsPerOctave,
+      octaves: baseOctaves,
+      fminHz: spec.fminHz,
       hop: estHop,
       gamma,
     });
@@ -168,6 +182,45 @@ export async function runSpectrogramTask(
     await runPool(jobs, UPLOAD_CONCURRENCY);
   }
 
+  // base plane (harmonic=0): [fmin, Nyquist] を覆い、近似 source として高域切れを無くす
+  if (baseOctaves >= 1) {
+    const baseResult = await computeCqt(
+      samples,
+      {
+        sampleRate,
+        binsPerOctave: spec.binsPerOctave,
+        octaves: baseOctaves,
+        fminHz: spec.fminHz,
+        hop,
+        gamma,
+      },
+      maybeYield,
+    );
+    frames = baseResult.frames;
+    const basePyramid = await buildPyramid(
+      await magnitudesToU8(baseResult.magnitudes, SPECTROGRAM_DB_MIN, SPECTROGRAM_DB_MAX, maybeYield),
+      frames,
+      baseBins,
+      SPECTROGRAM_TILE_FRAMES,
+      maybeYield,
+    );
+    levels = basePyramid.length;
+    const baseJobs: (() => Promise<void>)[] = [];
+    for (const [level, levelData] of basePyramid.entries()) {
+      for (let i = 0; i < tileCount(levelData.frames); i++) {
+        const tile = sliceTile(levelData, baseBins, i);
+        baseJobs.push(() =>
+          uploadBytes(
+            spectrogramTileKey(audio.projectId, audio.id, spec.id, 0, level, i),
+            tile,
+            "application/octet-stream",
+          ),
+        );
+      }
+    }
+    await runPool(baseJobs, UPLOAD_CONCURRENCY);
+  }
+
   const meta: SpectrogramMeta = {
     version: 1,
     binsPerOctave: spec.binsPerOctave,
@@ -179,6 +232,7 @@ export async function runSpectrogramTask(
     gamma,
     frames,
     bins,
+    baseBins: baseOctaves >= 1 ? baseBins : undefined,
     tileFrames: SPECTROGRAM_TILE_FRAMES,
     levels,
     dbMin: SPECTROGRAM_DB_MIN,

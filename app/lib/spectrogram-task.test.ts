@@ -88,6 +88,7 @@ describe("cqt spectrogram task", () => {
     const meta = (await metaRes.json()) as {
       frames: number;
       bins: number;
+      baseBins: number;
       levels: number;
       hop: number;
       harmonics: number[];
@@ -96,6 +97,8 @@ describe("cqt spectrogram task", () => {
     expect(meta.harmonics).toEqual([1, 2]);
     expect(meta.frames).toBeGreaterThan(0);
     expect(meta.levels).toBeGreaterThanOrEqual(1);
+    // base plane は [fmin, Nyquist] を覆うので表示 bins より広い
+    expect(meta.baseBins).toBeGreaterThan(meta.bins);
 
     const tileRes = await specsApi[":specId"].tiles[":harmonic"][":level"][":index"].$get({
       param: {
@@ -110,6 +113,21 @@ describe("cqt spectrogram task", () => {
     expect(tileRes.status).toBe(200);
     const tile = new Uint8Array(await tileRes.arrayBuffer());
     expect(tile.length).toBe(Math.min(2048, meta.frames) * meta.bins);
+
+    // base plane (harmonic=0) は取得でき、baseBins 幅を持つ
+    const baseTile = await specsApi[":specId"].tiles[":harmonic"][":level"][":index"].$get({
+      param: {
+        id: projectId,
+        audioId,
+        specId: spectrogram.id,
+        harmonic: "0",
+        level: "0",
+        index: "0",
+      },
+    });
+    expect(baseTile.status).toBe(200);
+    const base = new Uint8Array(await baseTile.arrayBuffer());
+    expect(base.length).toBe(Math.min(2048, meta.frames) * meta.baseBins);
 
     // 持っていない harmonic は 404
     const badTile = await specsApi[":specId"].tiles[":harmonic"][":level"][":index"].$get({

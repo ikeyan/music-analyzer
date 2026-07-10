@@ -35,6 +35,8 @@ export type SpectrogramMeta = {
   gamma?: number;
   frames: number;
   bins: number;
+  /** [fmin, Nyquist] を覆う base plane (harmonic=0) の bins。近似 source の高域切れ回避用。旧 meta には無い */
+  baseBins?: number;
   tileFrames: number;
   levels: number;
   dbMin: number;
@@ -63,6 +65,12 @@ export function safeCqtOctaves(
 ): number {
   if (!(fminHz < fmaxHz)) return 0;
   return Math.min(octaves, Math.floor(Math.log2(fmaxHz / fminHz) + 1 / binsPerOctave));
+}
+
+// base plane (harmonic=0) の octave 数。[fmin, Nyquist] を覆い、baseBins は MAX_SPECTROGRAM_BINS で頭打ち
+export function baseCqtOctaves(fminHz: number, binsPerOctave: number, sampleRate: number): number {
+  const maxOct = Math.floor(MAX_SPECTROGRAM_BINS / binsPerOctave);
+  return safeCqtOctaves(fminHz, binsPerOctave, maxOct, sampleRate / 2);
 }
 
 export function parseHarmonics(json: string): number[] {

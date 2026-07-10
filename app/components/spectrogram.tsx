@@ -462,28 +462,33 @@ export function HarmonicLens({
     const fps0 = meta.sampleRate / meta.hop;
     const frame = Math.min(meta.frames - 1, Math.max(0, Math.round(srcT * fps0)));
     const tileIdx = Math.floor(frame / meta.tileFrames);
-    const offset = (frame - tileIdx * meta.tileFrames) * meta.bins;
+    const frameInTile = frame - tileIdx * meta.tileFrames;
 
     // 各表示倍音 h の候補 source を「サブ bin 丸め誤差」昇順で並べる。描画時に bin ごとに
     // カバーできる最小誤差の source を選ぶ。harmonic plane は同一 VQT を log 周波数で
-    // ずらしたものなので値はほぼ厳密に一致し、誤差は bin 丸めのみ。計算済み倍音は誤差0、
-    // 低域は plane1 等が自然に埋める (shift=B*log2(h/h0))
-    const candidates: { h0: number; shift: number; err: number }[][] = [];
+    // ずらしたものなので値はほぼ厳密に一致し、誤差は bin 丸めのみ (shift=B*log2(h/h0))。
+    // base plane (h0=0, [fmin,Nyquist]) は全表示 bin を覆う fallback で高域切れを無くす
+    const candidates: { h0: number; shift: number; err: number; planeBins: number }[][] = [];
     for (let hi = 0; hi < numH; hi++) {
       const h = hi + 1;
       const cs = meta.harmonics.map((h0) => {
         const s = spec.binsPerOctave * Math.log2(h / h0);
         const shift = Math.round(s);
-        return { h0, shift, err: Math.abs(s - shift) };
+        return { h0, shift, err: Math.abs(s - shift), planeBins: meta.bins };
       });
+      if (meta.baseBins) {
+        const s = spec.binsPerOctave * Math.log2(h);
+        const shift = Math.round(s);
+        cs.push({ h0: 0, shift, err: Math.abs(s - shift), planeBins: meta.baseBins });
+      }
       cs.sort((a, b) => a.err - b.err);
       candidates.push(cs);
     }
 
-    // 計算済み plane のタイルを集める。1 つでも未取得なら前フレーム保持
+    // 計算済み plane + base のタイルを集める。1 つでも未取得なら前フレーム保持
     const srcTiles = new Map<number, Uint8Array | null>();
     let anyMissing = false;
-    for (const h0 of meta.harmonics) {
+    for (const h0 of meta.baseBins ? [0, ...meta.harmonics] : meta.harmonics) {
       const b = getTileBytes(`${spec.tileUrlBase}/${h0}/0/${tileIdx}`);
       srcTiles.set(h0, b);
       if (!b) anyMissing = true;
@@ -493,7 +498,9 @@ export function HarmonicLens({
     const sampleAt = (hi: number, b: number): number => {
       for (const c of candidates[hi]!) {
         const rb = b + c.shift;
-        if (rb >= 0 && rb < meta.bins) return srcTiles.get(c.h0)![offset + rb]!;
+        if (rb >= 0 && rb < c.planeBins) {
+          return srcTiles.get(c.h0)![frameInTile * c.planeBins + rb]!;
+        }
       }
       return 0;
     };
