@@ -657,6 +657,7 @@ export function HarmonicLens({
         border: "1px solid #444",
         borderRadius: 6,
         padding: "4px 8px 6px",
+        cursor: "default",
         pointerEvents: placement === "inline" || interactive ? "auto" : "none",
         boxShadow: "0 4px 16px rgba(0,0,0,0.4)",
       }}
@@ -737,7 +738,7 @@ export function HarmonicLens({
               ? (e) => {
                   const oy = e.nativeEvent.offsetY;
                   onHoverYRatio(
-                    oy >= 0 && oy <= displayH ? Math.min(1, Math.max(0, 1 - oy / displayH)) : null,
+                    oy >= 0 && oy <= displayH ? Math.min(1, Math.max(0, oy / displayH)) : null,
                   );
                 }
               : undefined
@@ -757,7 +758,10 @@ export function HarmonicLens({
             aria-hidden="true"
             onPointerDown={(e) => {
               stripeDrag.current = { sx: e.clientX, orig: stripeW, last: stripeW };
-              e.currentTarget.setPointerCapture(e.pointerId);
+              // synthetic PointerEvent (テスト) では active pointer が無く throw する
+              try {
+                e.currentTarget.setPointerCapture(e.pointerId);
+              } catch {}
               e.preventDefault();
               e.stopPropagation();
             }}
@@ -800,7 +804,9 @@ export function HarmonicLens({
           aria-hidden="true"
           onPointerDown={(e) => {
             heightDrag.current = { sy: e.clientY, orig: displayH };
-            e.currentTarget.setPointerCapture(e.pointerId);
+            try {
+              e.currentTarget.setPointerCapture(e.pointerId);
+            } catch {}
             e.preventDefault();
             e.stopPropagation();
           }}

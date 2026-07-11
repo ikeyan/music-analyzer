@@ -1050,12 +1050,17 @@ function PlaybackLensPane({
   );
   const onDown = (mode: "move" | "resize") => (e: ReactPointerEvent) => {
     drag.current = { mode, sx: e.clientX, sy: e.clientY, orig: geo };
-    e.currentTarget.setPointerCapture(e.pointerId);
+    // synthetic PointerEvent (テスト) では active pointer が無く throw する
+    try {
+      e.currentTarget.setPointerCapture(e.pointerId);
+    } catch {}
     e.preventDefault();
   };
-  // header 以外 (外周マージン) からの move は、子要素の上では開始しない
+  // header 以外 (マージン・CQT 間の隙間) からの move。子要素上と scrollbar 上では開始しない
   const onDownMargin = (e: ReactPointerEvent): void => {
     if (e.target !== e.currentTarget) return;
+    const el = e.currentTarget as HTMLElement;
+    if (e.nativeEvent.offsetX >= el.clientWidth || e.nativeEvent.offsetY >= el.clientHeight) return;
     onDown("move")(e);
   };
   const onMove = (e: ReactPointerEvent): void => {
@@ -1092,6 +1097,8 @@ function PlaybackLensPane({
   const lensHeight = Math.max(120, geo.h - LENS_PANE_HEADER_H - 16 - 44);
   return (
     <div
+      role="group"
+      aria-label="再生位置レンズ"
       onPointerDown={onDownMargin}
       onPointerMove={onMove}
       onPointerUp={onUp}
@@ -1106,6 +1113,7 @@ function PlaybackLensPane({
         flexDirection: "column",
         padding: 2,
         touchAction: "none",
+        cursor: "move",
         background: "rgba(10,10,12,0.92)",
         border: "1px solid #555",
         borderRadius: 6,
@@ -1147,8 +1155,15 @@ function PlaybackLensPane({
           <span style={{ fontSize: 11, color: "#bbb" }}>色↔位置</span>
         </label>
       </div>
-      <div style={{ flex: 1, overflow: "auto", padding: 8 }}>
-        <div ref={innerRef} style={{ display: "flex", gap: 8, width: "max-content" }}>
+      <div
+        onPointerDown={onDownMargin}
+        style={{ flex: 1, overflow: "auto", padding: 8, cursor: "move" }}
+      >
+        <div
+          ref={innerRef}
+          onPointerDown={onDownMargin}
+          style={{ display: "flex", gap: 8, width: "max-content" }}
+        >
           {shown.map(({ info, track }) => (
             <HarmonicLens
               key={trackKey(track)}

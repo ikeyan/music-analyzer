@@ -797,4 +797,127 @@ describe("ProjectDetail (frontend)", () => {
     })`);
     expect(seeked).toBeGreaterThan(0.5);
   }, 60_000);
+
+  it("再生位置レンズ: マージンドラッグ移動・上端clamp・hover白線・幅ハンドル", async () => {
+    const id = await createProject("lens-drag-test");
+    await goto(`/projects/${id}`);
+    await waitHydrated('input[type=file][accept="audio/*"]');
+    await injectFileToInput(getMedia().audioMp3, "audio/*", "lens.mp3", "audio/mpeg");
+    await waitFor(webview(), "audio source", 30_000);
+    const detail = (await fetch(`${server()}/api/projects/${id}`).then((r) => r.json())) as {
+      project: { audios: { id: string }[] };
+    };
+    const audioId = detail.project.audios[0]!.id;
+    const created = await fetch(`${server()}/api/projects/${id}/audios/${audioId}/spectrograms`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ binsPerOctave: 12, octaves: 5, fminHz: 55, harmonics: [1] }),
+    });
+    expect(created.status).toBe(201);
+    const specId = ((await created.json()) as { spectrogram: { id: string } }).spectrogram.id;
+    // spectrogram task の完走を poll
+    await (async () => {
+      const deadline = Date.now() + 30_000;
+      while (Date.now() < deadline) {
+        const d = (await fetch(`${server()}/api/projects/${id}`).then((r) => r.json())) as {
+          project: { audios: { spectrograms: { status: string }[] }[] };
+        };
+        const s = d.project.audios[0]?.spectrograms[0]?.status;
+        if (s === "ready") return;
+        if (s === "failed") throw new Error("spectrogram failed");
+        await Bun.sleep(200);
+      }
+      throw new Error("spectrogram not ready in time");
+    })();
+    // localStorage 経由で CQT 表示 + 再生位置レンズ ON を復元させる
+    await webview().evaluate(`(() => {
+      localStorage.setItem("cqtViews:${id}", JSON.stringify({ "${audioId}": { specId: "${specId}", mode: "h1" } }));
+      localStorage.setItem("cqtPlaybackLens:${id}", "true");
+    })()`);
+    await goto(`/projects/${id}`);
+    await waitFor(webview(), '[aria-label="再生位置レンズ"]', 15_000);
+
+    // CQT 余白 (scroll container) のマージンドラッグで pane が移動し、cursor は move
+    const drag1 = await webview().evaluate<{ cursor: string; dx: number; dy: number }>(`(async () => {
+      const pane = document.querySelector('[aria-label="再生位置レンズ"]');
+      const margin = pane.children[1];
+      const r0 = pane.getBoundingClientRect();
+      const m = margin.getBoundingClientRect();
+      const ev = (t, x, y) => margin.dispatchEvent(new PointerEvent(t, { bubbles: true, pointerId: 1, isPrimary: true, clientX: x, clientY: y }));
+      ev("pointerdown", m.left + 4, m.top + 4);
+      ev("pointermove", m.left + 34, m.top + 24);
+      ev("pointerup", m.left + 34, m.top + 24);
+      for (let i = 0; i < 100 && pane.getBoundingClientRect().left === r0.left; i++) await new Promise(r => setTimeout(r, 20));
+      const r1 = pane.getBoundingClientRect();
+      return { cursor: getComputedStyle(margin).cursor, dx: r1.left - r0.left, dy: r1.top - r0.top };
+    })()`);
+    expect(drag1.cursor).toBe("move");
+    expect(drag1.dx).toBeCloseTo(30, 1);
+    expect(drag1.dy).toBeCloseTo(20, 1);
+
+    // 画面外へ投げても clamp で上端 y=0 に留まる
+    const clampedTop = await webview().evaluate<number>(`(async () => {
+      const pane = document.querySelector('[aria-label="再生位置レンズ"]');
+      const margin = pane.children[1];
+      const m = margin.getBoundingClientRect();
+      const ev = (t, x, y) => margin.dispatchEvent(new PointerEvent(t, { bubbles: true, pointerId: 1, isPrimary: true, clientX: x, clientY: y }));
+      ev("pointerdown", m.left + 4, m.top + 4);
+      ev("pointermove", m.left + 4, m.top - 5000);
+      ev("pointerup", m.left + 4, m.top - 5000);
+      for (let i = 0; i < 100 && pane.getBoundingClientRect().top > 0; i++) await new Promise(r => setTimeout(r, 20));
+      return pane.getBoundingClientRect().top;
+    })()`);
+    expect(clampedTop).toBe(0);
+
+    // レンズ内 CQT hover で白線が hover と同じ高さに出る (上下反転 regression)
+    const line = await webview().evaluate<{ hoverY: number; whiteY: number; displayH: number }>(`(async () => {
+      const pane = document.querySelector('[aria-label="再生位置レンズ"]');
+      const canvas = pane.querySelector('canvas');
+      const ctx = canvas.getContext("2d");
+      for (let i = 0; i < 200 && ctx.getImageData(0, 0, 1, 1).data[3] === 0; i++) await new Promise(r => setTimeout(r, 30));
+      const displayH = canvas.height - 14;
+      const rect = canvas.getBoundingClientRect();
+      const hoverY = Math.round(displayH * 0.3);
+      canvas.dispatchEvent(new PointerEvent("pointermove", { bubbles: true, pointerId: 1, isPrimary: true, clientX: rect.left + 60, clientY: rect.top + hoverY }));
+      // 白線 (純白 #fff) は colormap (max b=164) と区別できる。x=60 列を走査
+      const findWhite = () => {
+        const img = ctx.getImageData(60, 0, 1, displayH).data;
+        for (let y = 0; y < displayH; y++) {
+          if (img[y * 4] >= 250 && img[y * 4 + 1] >= 250 && img[y * 4 + 2] >= 250) return y;
+        }
+        return -1;
+      };
+      let whiteY = -1;
+      for (let i = 0; i < 200 && whiteY < 0; i++) { whiteY = findWhite(); if (whiteY < 0) await new Promise(r => setTimeout(r, 30)); }
+      return { hoverY, whiteY, displayH };
+    })()`);
+    expect(line.whiteY).toBeGreaterThanOrEqual(0);
+    expect(Math.abs(line.whiteY - line.hoverY)).toBeLessThan(line.displayH / 10);
+
+    // 幅ハンドル: ドラッグ中は列 footprint 据え置きで canvas だけ preview、離すと確定
+    const stripe = await webview().evaluate<{
+      duringWrap: number;
+      duringCanvas: number;
+      afterWrap: number;
+    }>(`(async () => {
+      const pane = document.querySelector('[aria-label="再生位置レンズ"]');
+      const handle = pane.querySelector('div[style*="ew-resize"]');
+      const canvas = pane.querySelector('canvas');
+      const wrap = canvas.parentElement;
+      const h = handle.getBoundingClientRect();
+      const ev = (t, x) => handle.dispatchEvent(new PointerEvent(t, { bubbles: true, pointerId: 1, isPrimary: true, clientX: x, clientY: h.top + 10 }));
+      ev("pointerdown", h.left + 3);
+      ev("pointermove", h.left + 3 + 16);
+      for (let i = 0; i < 100 && canvas.getBoundingClientRect().width < 90; i++) await new Promise(r => setTimeout(r, 20));
+      const duringWrap = wrap.getBoundingClientRect().width;
+      const duringCanvas = canvas.getBoundingClientRect().width;
+      ev("pointerup", h.left + 3 + 16);
+      for (let i = 0; i < 100 && wrap.getBoundingClientRect().width < 90; i++) await new Promise(r => setTimeout(r, 20));
+      return { duringWrap, duringCanvas, afterWrap: wrap.getBoundingClientRect().width };
+    })()`);
+    // numH=1, 既定 stripeW=16: footprint 58+16=74、+16px ドラッグで 58+32=90
+    expect(stripe.duringWrap).toBe(74);
+    expect(stripe.duringCanvas).toBe(90);
+    expect(stripe.afterWrap).toBe(90);
+  }, 120_000);
 });
