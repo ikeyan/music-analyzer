@@ -838,7 +838,11 @@ describe("ProjectDetail (frontend)", () => {
     await waitFor(webview(), '[aria-label="再生位置レンズ"]', 15_000);
 
     // CQT 余白 (scroll container) のマージンドラッグで pane が移動し、cursor は move
-    const drag1 = await webview().evaluate<{ cursor: string; dx: number; dy: number }>(`(async () => {
+    const drag1 = await webview().evaluate<{
+      cursor: string;
+      dx: number;
+      dy: number;
+    }>(`(async () => {
       const pane = document.querySelector('[aria-label="再生位置レンズ"]');
       const margin = pane.children[1];
       const r0 = pane.getBoundingClientRect();
@@ -870,7 +874,11 @@ describe("ProjectDetail (frontend)", () => {
     expect(clampedTop).toBe(0);
 
     // レンズ内 CQT hover で白線が hover と同じ高さに出る (上下反転 regression)
-    const line = await webview().evaluate<{ hoverY: number; whiteY: number; displayH: number }>(`(async () => {
+    const line = await webview().evaluate<{
+      hoverY: number;
+      whiteY: number;
+      displayH: number;
+    }>(`(async () => {
       const pane = document.querySelector('[aria-label="再生位置レンズ"]');
       const canvas = pane.querySelector('canvas');
       const ctx = canvas.getContext("2d");

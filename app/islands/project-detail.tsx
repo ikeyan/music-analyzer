@@ -1033,8 +1033,7 @@ function PlaybackLensPane({
     return () => ro.disconnect();
   }, []);
   // pane 幅は中身幅を超えない。wMax なら中身幅に追従、それ以外は固定幅を中身幅で cap
-  const paneW =
-    contentW != null ? (geo.wMax ? contentW : Math.min(geo.w, contentW)) : geo.w;
+  const paneW = contentW != null ? (geo.wMax ? contentW : Math.min(geo.w, contentW)) : geo.w;
   // 保存済みの座標が画面外でも掴めるよう mount 時 + resize 時に clamp する
   useEffect(() => {
     const clamp = () => setGeo((g) => clampPaneGeo(g, paneW));
@@ -1068,7 +1067,8 @@ function PlaybackLensPane({
     if (!d) return;
     const dx = e.clientX - d.sx;
     const dy = e.clientY - d.sy;
-    if (d.mode === "move") setGeo(clampPaneGeo({ ...d.orig, x: d.orig.x + dx, y: d.orig.y + dy }, paneW));
+    if (d.mode === "move")
+      setGeo(clampPaneGeo({ ...d.orig, x: d.orig.x + dx, y: d.orig.y + dy }, paneW));
     else {
       const rawW = Math.max(LENS_PANE_MIN_W, d.orig.w + dx);
       // 中身幅まで引き切ったら「追従」に latch。戻せば固定幅に復帰。

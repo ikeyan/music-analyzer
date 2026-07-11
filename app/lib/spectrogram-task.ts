@@ -198,7 +198,12 @@ export async function runSpectrogramTask(
     );
     frames = baseResult.frames;
     const basePyramid = await buildPyramid(
-      await magnitudesToU8(baseResult.magnitudes, SPECTROGRAM_DB_MIN, SPECTROGRAM_DB_MAX, maybeYield),
+      await magnitudesToU8(
+        baseResult.magnitudes,
+        SPECTROGRAM_DB_MIN,
+        SPECTROGRAM_DB_MAX,
+        maybeYield,
+      ),
       frames,
       baseBins,
       SPECTROGRAM_TILE_FRAMES,

@@ -631,7 +631,20 @@ export function HarmonicLens({
       ctx.fillText(l1, rx, yc - 1);
       ctx.fillText(l2, rx, yc + 8);
     }
-  }, [meta, spec, srcT, binSel, tilesVersion, numH, bins, displayH, drawW, canvasH, swap, effStripeW]);
+  }, [
+    meta,
+    spec,
+    srcT,
+    binSel,
+    tilesVersion,
+    numH,
+    bins,
+    displayH,
+    drawW,
+    canvasH,
+    swap,
+    effStripeW,
+  ]);
 
   const panelW = canvasW + 18;
   const panelH = canvasH + 40;
