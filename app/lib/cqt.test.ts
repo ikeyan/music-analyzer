@@ -84,6 +84,18 @@ describe("computeCqt", () => {
     expect(await riseFrames(autoGamma(B))).toBeLessThan(await riseFrames(0));
   });
 
+  it("窓長が丸めで 2 tap になる高域 bin でも NaN を出さない", async () => {
+    // fs/(alpha*f)=2.29 → 丸めで 2 tap。Hann 窓は両端 0 なので和が 0 になり NaN が出ていた
+    const { magnitudes } = await computeCqt(sine(3500, 0.5, FS), {
+      sampleRate: FS,
+      binsPerOctave: 1,
+      octaves: 1,
+      fminHz: 3500,
+      hop: 64,
+    });
+    expect(magnitudes.every((v) => Number.isFinite(v))).toBe(true);
+  });
+
   it("最上位 bin が Nyquist 超だと throw (kernel aliasing 防止)", () => {
     // top bin 3000*2^(23/12) ≈ 11.3kHz > Nyquist 4kHz
     expect(

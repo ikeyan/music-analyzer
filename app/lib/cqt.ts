@@ -68,7 +68,8 @@ function binTaps(p: CqtParams, gamma: number, o: number, k: number): number {
   const B = p.binsPerOctave;
   const alpha = 2 ** (1 / B) - 1;
   const f = cqtBinFrequency(p.fminHz, B, (p.octaves - 1) * B + k);
-  return Math.max(2, Math.round(p.sampleRate / (alpha * f + gamma * 2 ** o)));
+  // 2 tap だと Hann 窓 (両端 0) の和が 0 になり norm が Infinity → NaN になるので最低 3 tap
+  return Math.max(3, Math.round(p.sampleRate / (alpha * f + gamma * 2 ** o)));
 }
 
 // 直接相関の概算 tap 反復回数 (実測 ~0.5-1G/s)。decode 前の compute 予算ゲート用。
