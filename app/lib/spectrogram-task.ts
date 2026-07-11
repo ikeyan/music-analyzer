@@ -74,9 +74,11 @@ export async function runSpectrogramTask(
   // base plane は [fmin, Nyquist] を full 精度で持ち、近似 source の高域切れを無くす
   const baseOctaves = baseCqtOctaves(spec.fminHz, spec.binsPerOctave, sampleRate);
   const baseBins = spec.binsPerOctave * baseOctaves;
+  // hop の octave 整列 (2^(octaves-1) の倍数) は base plane 含む全 plane で必要
+  const hopOctaves = Math.max(spec.octaves, baseOctaves);
   // decode 前に PCM + magnitudes + タイル列の合計ピークを見積もってゲートする
   const estSamples = Math.ceil(sampleRate * audio.durationSec);
-  const estHop = chooseHop(sampleRate, spec.octaves, estSamples);
+  const estHop = chooseHop(sampleRate, hopOctaves, estSamples);
   const estBytes = estimateAnalysisBytes(estSamples, estHop, Math.max(bins, baseBins));
   if (estBytes > MAX_ANALYSIS_BYTES) {
     return Either.left(
@@ -125,7 +127,7 @@ export async function runSpectrogramTask(
   const samples = await decodeAudioPcm(inputPath, sampleRate);
   if (samples.length === 0) return Either.left("decoded audio is empty");
 
-  const hop = chooseHop(sampleRate, spec.octaves, samples.length);
+  const hop = chooseHop(sampleRate, hopOctaves, samples.length);
   const frames0 = Math.max(1, Math.floor(samples.length / hop) + 1);
 
   const prefix = spectrogramPrefix(audio.projectId, audio.id, spec.id);

@@ -150,6 +150,30 @@ describe("cqt spectrogram task", () => {
     expect(await listPrefix(spectrogramPrefix(projectId, audioId, spectrogram.id))).toEqual([]);
   }, 60_000);
 
+  it("base plane の octave 数が表示 octave 数を超えても hop 整列で完走する", async () => {
+    const client = makeClient();
+    const { projectId, audioId } = await seedAudio(client);
+    // fmax 16Hz → fs=3000, baseOctaves=7 > octaves=1。hop が 2^(baseOctaves-1) に整列しないと
+    // base plane の computeCqt が throw する
+    const created = await client.projects[":id"].audios[":audioId"].spectrograms.$post({
+      param: { id: projectId, audioId },
+      json: { binsPerOctave: 12, octaves: 1, fminHz: 8, harmonics: [1] },
+    });
+    expect(created.status).toBe(201);
+    if (!created.ok) throw new Error("unreachable");
+    const { spectrogram, task } = await created.json();
+
+    await waitForInflightTasks();
+    const doneTask = await prisma.task.findUniqueOrThrow({ where: { id: task.id } });
+    expect(doneTask.status).toBe("succeeded");
+    const metaRes = await client.projects[":id"].audios[":audioId"].spectrograms[
+      ":specId"
+    ].meta.$get({ param: { id: projectId, audioId, specId: spectrogram.id } });
+    const meta = (await metaRes.json()) as { bins: number; baseBins: number };
+    expect(meta.bins).toBe(12);
+    expect(meta.baseBins).toBe(84);
+  }, 60_000);
+
   it("audio 実体が S3 にないと task/spectrogram が failed になり mark も残らない", async () => {
     const client = makeClient();
     const { projectId, audioId } = await seedAudio(client);
