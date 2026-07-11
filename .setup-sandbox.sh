@@ -3,6 +3,12 @@ set -euo pipefail
 
 cd "$(dirname -- "$0")"
 
+# Prisma のエンジン取得は Node の CONNECT トンネル上 TLS を使うが、agent proxy 経由だと
+# 転送が途中で切れる (ECONNRESET)。binaries.prisma.sh へは直結が速く確実なので、この
+# ホストだけ proxy を迂回させて install の postinstall と db:generate を通す
+export NO_PROXY="binaries.prisma.sh,${NO_PROXY:-}"
+export no_proxy="binaries.prisma.sh,${no_proxy:-}"
+
 bun install --frozen-lockfile
 bun run db:generate
 

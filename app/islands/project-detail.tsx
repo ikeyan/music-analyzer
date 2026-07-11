@@ -1,8 +1,10 @@
 import {
   type CSSProperties,
+  type PointerEvent as ReactPointerEvent,
   type ReactNode,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -17,6 +19,7 @@ import type {
 } from "../api/types";
 import {
   HarmonicLens,
+  LENS_STRIPE_DEFAULT_W,
   type LensHover,
   SPECTROGRAM_STRIP_HEIGHT,
   type SpectrogramCreateParams,
@@ -39,8 +42,18 @@ const TASK_POLL_INTERVAL_MS = 1000;
 type Track = { kind: "video"; data: VideoItem } | { kind: "audio"; data: AudioItem };
 type ShownSpec = { spec: ApiSpectrogram; mode: string; audio: AudioItem };
 
-const TRACK_HEIGHT = 64;
+// タイトル + 操作ボタンは行左上に sticky で重ね (縦積み)、横スクロールでも画面内に残す。
+// 緑の clip 帯は info とサムネイルだけ持たせて低く保つ
+const TRACK_HEIGHT = 56;
 const TRACK_GAP = 8;
+// 動画表示 ON の video 行に足す monitor 帯の高さ
+const VIDEO_STRIP_HEIGHT = 140;
+
+// ソロ再生中の clip を脈動する光輪で強調する
+const SOLO_HALO_KEYFRAMES = `@keyframes soloHalo {
+  0%, 100% { box-shadow: 0 0 0 2px #d97706, 0 0 6px 2px rgba(217,119,6,0.5); }
+  50% { box-shadow: 0 0 0 2px #f59e0b, 0 0 18px 6px rgba(245,158,11,0.9); }
+}`;
 const PIXELS_PER_SECOND_DEFAULT = 40;
 const SYNC_DRIFT_TOLERANCE = 0.25;
 
@@ -67,6 +80,31 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
   const [lens, setLens] = useState<(LensHover & { audioId: string }) | null>(null);
   // 再生位置レンズ: ON の間は hover ではなく再生ヘッド時刻で各表示行にレンズを出す
   const [playbackLens, setPlaybackLens] = useState(false);
+  // 再生中に再生ヘッドを画面内に保つよう横スクロールを追従させる
+  const [autoScroll, setAutoScroll] = useState(false);
+  // ソロ再生: 指定 track だけ鳴らし、再生位置レンズもその track だけ出す
+  const [solo, setSolo] = useState<TrackRef | null>(null);
+  // mute: 指定 track を無音化。solo と mute が両方付いた track は solo が勝つ (鳴る)
+  const [muted, setMuted] = useState<ReadonlySet<string>>(() => new Set());
+  // 動画を行の下に表示する video id 集合 (CQT 表示と同様の行追加)
+  const [shownVideos, setShownVideos] = useState<ReadonlySet<string>>(() => new Set());
+  // 全体ボリューム (0..1) と再生速度 (倍率)
+  const [volume, setVolume] = useState(1);
+  const [speed, setSpeed] = useState(1);
+  // CQT / 動画 band の行ごとの高さ override (trackKey → px)
+  const [bandHeights, setBandHeights] = useState<ReadonlyMap<string, number>>(() => new Map());
+  // CQT レンズの color↔harmony 入れ替え表示
+  const [swapLens, setSwapLens] = useState(false);
+  // float hover レンズの高さ override (null = 既定)
+  const [floatLensHeight, setFloatLensHeight] = useState<number | null>(null);
+  // CQT レンズの 1 plane 幅 (project 共通)。ドラッグで内側四角形をリサイズして更新
+  const [lensStripeW, setLensStripeW] = useState(LENS_STRIPE_DEFAULT_W);
+  // CQT レンズで表示する倍音の上限 (spec ごと)
+  const [lensMaxHarmonic, setLensMaxHarmonic] = useState<Record<string, number>>({});
+  // hover レンズを Ctrl/Cmd (or マルチタッチ) で追従停止して触れる状態にする
+  const [lensFrozen, setLensFrozen] = useState(false);
+  const frozenRef = useRef(false);
+  frozenRef.current = lensFrozen;
   const rowsRef = useRef<HTMLDivElement | null>(null);
 
   // 表示状態 (specViews) と再生位置レンズの ON/OFF を project 単位で localStorage に保存。
@@ -75,6 +113,11 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
   // 保存データを潰さない (load が state を当てた次の commit から保存が効く)
   const viewsKey = `cqtViews:${data.id}`;
   const lensKey = `cqtPlaybackLens:${data.id}`;
+  const autoScrollKey = `cqtAutoScroll:${data.id}`;
+  const videoShownKey = `videoShown:${data.id}`;
+  const mixKey = `mix:${data.id}`;
+  const bandHeightsKey = `bandHeights:${data.id}`;
+  const lensMaxHKey = `lensMaxH:${data.id}`;
   const restoredRef = useRef(false);
   useEffect(() => {
     if (restoredRef.current) saveLocal(viewsKey, specViews);
@@ -83,10 +126,42 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
     if (restoredRef.current) saveLocal(lensKey, playbackLens);
   }, [lensKey, playbackLens]);
   useEffect(() => {
+    if (restoredRef.current) saveLocal(autoScrollKey, autoScroll);
+  }, [autoScrollKey, autoScroll]);
+  useEffect(() => {
+    if (restoredRef.current) saveLocal(videoShownKey, [...shownVideos]);
+  }, [videoShownKey, shownVideos]);
+  useEffect(() => {
+    if (restoredRef.current)
+      saveLocal(mixKey, { volume, speed, swapLens, floatLensHeight, lensStripeW });
+  }, [mixKey, volume, speed, swapLens, floatLensHeight, lensStripeW]);
+  useEffect(() => {
+    if (restoredRef.current) saveLocal(bandHeightsKey, [...bandHeights]);
+  }, [bandHeightsKey, bandHeights]);
+  useEffect(() => {
+    if (restoredRef.current) saveLocal(lensMaxHKey, lensMaxHarmonic);
+  }, [lensMaxHKey, lensMaxHarmonic]);
+  useEffect(() => {
     setSpecViews(loadLocal(viewsKey, {} as Record<string, SpectrogramSelection | undefined>));
     setPlaybackLens(loadLocal(lensKey, false));
+    setAutoScroll(loadLocal(autoScrollKey, false));
+    setShownVideos(new Set(loadLocal<string[]>(videoShownKey, [])));
+    const mix = loadLocal(mixKey, {
+      volume: 1,
+      speed: 1,
+      swapLens: false,
+      floatLensHeight: null as number | null,
+      lensStripeW: LENS_STRIPE_DEFAULT_W,
+    });
+    setVolume(mix.volume);
+    setSpeed(mix.speed);
+    setSwapLens(mix.swapLens ?? false);
+    setFloatLensHeight(mix.floatLensHeight ?? null);
+    setLensStripeW(mix.lensStripeW ?? LENS_STRIPE_DEFAULT_W);
+    setLensMaxHarmonic(loadLocal<Record<string, number>>(lensMaxHKey, {}));
+    setBandHeights(new Map(loadLocal<[string, number][]>(bandHeightsKey, [])));
     restoredRef.current = true;
-  }, [viewsKey, lensKey]);
+  }, [viewsKey, lensKey, autoScrollKey, videoShownKey, mixKey, bandHeightsKey, lensMaxHKey]);
 
   const tracks: Track[] = useMemo(() => {
     const all: Track[] = [
@@ -95,6 +170,23 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
     ];
     return all.toSorted((a, b) => a.data.order - b.data.order);
   }, [data]);
+
+  // 削除済み track を指したままの solo は無効化する (全 track が soloed-out で無音になるのを防ぐ)
+  const activeSolo = useMemo(
+    () => (solo && tracks.some((t) => t.kind === solo.kind && t.data.id === solo.id) ? solo : null),
+    [solo, tracks],
+  );
+  const isSoloedOut = useCallback(
+    (t: Track) =>
+      activeSolo !== null && !(activeSolo.kind === t.kind && activeSolo.id === t.data.id),
+    [activeSolo],
+  );
+  // 音を出さない track: solo 中は solo 対象以外、solo 無しなら mute された track。
+  // solo 対象は mute されていても solo が勝って鳴る (isSoloedOut=false のまま)
+  const isSilenced = useCallback(
+    (t: Track) => isSoloedOut(t) || (activeSolo === null && muted.has(trackKey(t))),
+    [isSoloedOut, activeSolo, muted],
+  );
 
   // playEnd で再生停止、displayDuration (>=60s) で ruler の最低幅を確保
   const playEnd = useMemo(
@@ -161,7 +253,7 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
       const dt = (ts - last) / 1000;
       lastTickRef.current = ts;
       setCurrentTime((prev) => {
-        const next = prev + dt;
+        const next = prev + dt * speed;
         if (next >= playEnd) {
           setPlaying(false);
           return playEnd;
@@ -174,7 +266,67 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
     return () => {
       if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
     };
-  }, [playing, playEnd]);
+  }, [playing, playEnd, speed]);
+
+  // 自動スクロール: 再生中は currentTime が毎フレーム更新されるので、その度に
+  // 再生ヘッドを viewport 中央に置く scrollLeft を書いて連続的に追従する
+  useEffect(() => {
+    if (!playing || !autoScroll) return;
+    const el = scrollBoxRef.current;
+    if (!el) return;
+    const max = Math.max(0, el.scrollWidth - el.clientWidth);
+    el.scrollLeft = Math.max(0, Math.min(max, currentTime * pxPerSec - el.clientWidth / 2));
+  }, [playing, autoScroll, currentTime, pxPerSec]);
+
+  // ズーム変更で再生ヘッド (赤線) の画面上の位置が動かないよう scrollLeft を補正する。
+  // currentTime は毎フレーム変わるので ref 経由で読み、pxPerSec 変化時だけ走らせる
+  const currentTimeRef = useRef(currentTime);
+  currentTimeRef.current = currentTime;
+  const prevPxRef = useRef(pxPerSec);
+  useLayoutEffect(() => {
+    const el = scrollBoxRef.current;
+    const oldPx = prevPxRef.current;
+    prevPxRef.current = pxPerSec;
+    if (!el || oldPx === pxPerSec) return;
+    const max = Math.max(0, el.scrollWidth - el.clientWidth);
+    el.scrollLeft = Math.max(
+      0,
+      Math.min(max, el.scrollLeft + currentTimeRef.current * (pxPerSec - oldPx)),
+    );
+  }, [pxPerSec]);
+
+  // Ctrl/Cmd 押下中 (or 2 本指タッチ中) は hover レンズの追従を止めて触れるようにする。
+  // 解除時はレンズを畳む (mouse が strip から外れている可能性があるため)
+  useEffect(() => {
+    const unfreeze = () => {
+      setLensFrozen(false);
+      setLens(null);
+    };
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Control" || e.key === "Meta") setLensFrozen(true);
+    };
+    const onKeyUp = (e: KeyboardEvent) => {
+      if (e.key === "Control" || e.key === "Meta") unfreeze();
+    };
+    const onTouchStart = (e: TouchEvent) => {
+      if (e.touches.length >= 2) setLensFrozen(true);
+    };
+    const onTouchEnd = (e: TouchEvent) => {
+      if (e.touches.length < 2 && frozenRef.current) unfreeze();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    window.addEventListener("keyup", onKeyUp);
+    window.addEventListener("blur", unfreeze);
+    window.addEventListener("touchstart", onTouchStart, { passive: true });
+    window.addEventListener("touchend", onTouchEnd);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("keyup", onKeyUp);
+      window.removeEventListener("blur", unfreeze);
+      window.removeEventListener("touchstart", onTouchStart);
+      window.removeEventListener("touchend", onTouchEnd);
+    };
+  }, []);
 
   useEffect(() => {
     for (const t of tracks) {
@@ -183,14 +335,20 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
       if (unlockingRef.current.has(key)) continue;
       const el = mediaRefs.current.get(key);
       if (!el) continue;
-      syncMediaElement(el, t.data, currentTime, playing, () => {
+      const silenced = isSilenced(t);
+      // audio の無音 track は止める。video は無音でも再生し続けて映像を見せる (frame 追従)
+      if (silenced && t.kind === "audio") {
+        if (!el.paused) el.pause();
+        continue;
+      }
+      syncMediaElement(el, t.data, currentTime, playing, silenced, volume, speed, () => {
         setPlaying(false);
         setError(
           "ブラウザのautoplay制限で再生できませんでした。もう一度再生ボタンを押してください。",
         );
       });
     }
-  }, [tracks, currentTime, playing]);
+  }, [tracks, currentTime, playing, isSilenced, volume, speed]);
 
   const projectId = data.id;
   const refresh = useCallback(async () => {
@@ -244,6 +402,10 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
   // user-gesture 内で play().then(pause) して全 track を unlock。範囲外は mute で音漏れを防ぐ。
   // 範囲外要素は unlocking フラグで syncMediaElement の同期 pause から除外する
   function startPlayback() {
+    // 末尾まで再生済み (currentTime==playEnd) なら先頭から再生し直す。
+    // そのまま start すると tick が即 next>=playEnd で停止してしまう
+    const from = currentTime >= playEnd ? 0 : currentTime;
+    if (from !== currentTime) setCurrentTime(from);
     let blocked = false;
     for (const t of tracks) {
       const key = trackKey(t);
@@ -251,24 +413,29 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
       if (!el) continue;
       const projLow = Math.min(t.data.projStartSec, t.data.projEndSec);
       const projHigh = Math.max(t.data.projStartSec, t.data.projEndSec);
-      const inRange = currentTime >= projLow && currentTime <= projHigh;
+      const inWindow = from >= projLow && from <= projHigh;
+      const silenced = isSilenced(t);
+      // video は無音でも映像を見せるため再生し続ける。audio の無音は鳴らさない
+      const keepPlaying = inWindow && !(t.kind === "audio" && silenced);
       const wasMuted = el.muted;
-      if (!inRange) {
+      if (!keepPlaying) {
         el.muted = true;
         unlockingRef.current.add(key);
+      } else {
+        el.muted = t.kind === "video" ? silenced : false;
       }
       const promise = el.play();
       if (promise && typeof promise.then === "function") {
         promise
           .then(() => {
-            if (!inRange) {
+            if (!keepPlaying) {
               el.pause();
               el.muted = wasMuted;
               unlockingRef.current.delete(key);
             }
           })
           .catch((err: unknown) => {
-            if (!inRange) {
+            if (!keepPlaying) {
               el.muted = wasMuted;
               unlockingRef.current.delete(key);
             }
@@ -279,7 +446,7 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
               setError("ブラウザのautoplay制限で再生できませんでした。もう一度押してください。");
             }
           });
-      } else if (!inRange) {
+      } else if (!keepPlaying) {
         unlockingRef.current.delete(key);
       }
     }
@@ -395,6 +562,9 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
     top: number;
     height: number;
     shownSpec: ShownSpec | null;
+    shownVideo: boolean;
+    /** CQT / 動画 band の高さ (band が無い行は 0) */
+    bandHeight: number;
   };
   const rowInfos: RowInfo[] = useMemo(() => {
     let top = 0;
@@ -407,12 +577,16 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
           shownSpec = { spec, mode: sel.mode, audio: t.data };
         }
       }
-      const height = TRACK_HEIGHT + (shownSpec ? SPECTROGRAM_STRIP_HEIGHT + 4 : 0);
-      const info = { top, height, shownSpec };
-      top += height + TRACK_GAP;
+      const shownVideo = t.kind === "video" && shownVideos.has(t.data.id);
+      const hasBand = shownSpec !== null || shownVideo;
+      const defaultBand = shownSpec ? SPECTROGRAM_STRIP_HEIGHT : VIDEO_STRIP_HEIGHT;
+      const bandHeight = hasBand ? (bandHeights.get(trackKey(t)) ?? defaultBand) : 0;
+      const extra = hasBand ? bandHeight + 4 : 0;
+      const info = { top, height: TRACK_HEIGHT + extra, shownSpec, shownVideo, bandHeight };
+      top += info.height + TRACK_GAP;
       return info;
     });
-  }, [tracks, specViews]);
+  }, [tracks, specViews, shownVideos, bandHeights]);
   const tracksTotalHeight =
     rowInfos.length === 0
       ? 0
@@ -426,8 +600,16 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
     ? (rowInfos.find((i) => i.shownSpec?.audio.id === lens.audioId)?.shownSpec ?? null)
     : null;
 
+  // hover 中の CQT 上のカーソル周波数。再生位置レンズ pane 側で同じ周波数に白線を出す用。
+  // yRatio=0 が上端 (最高周波数)、bin = (1-yRatio)*bins なので f = fmin*2^((1-yRatio)*octaves)
+  const hoverFreqHz =
+    lens && lens.yRatio !== null && lensTarget
+      ? lensTarget.spec.fminHz * 2 ** ((1 - lens.yRatio) * lensTarget.spec.octaves)
+      : null;
+
   return (
     <div>
+      <style>{SOLO_HALO_KEYFRAMES}</style>
       <header style={{ display: "flex", alignItems: "baseline", gap: "1rem" }}>
         <a href="/projects">← 一覧</a>
         <h1 style={{ margin: 0 }}>{data.name}</h1>
@@ -494,6 +676,37 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
         </span>
         <label
           style={{ display: "flex", alignItems: "center", gap: "0.3rem", fontSize: 13 }}
+          title="全 media の音量"
+        >
+          🔊
+          <input
+            type="range"
+            min={0}
+            max={1}
+            step={0.01}
+            value={volume}
+            onChange={(e) => setVolume(Number(e.target.value))}
+            style={{ width: 80 }}
+          />
+        </label>
+        <label
+          style={{ display: "flex", alignItems: "center", gap: "0.3rem", fontSize: 13 }}
+          title="再生速度 (0.25〜4x)"
+        >
+          速度
+          <input
+            type="range"
+            min={0.25}
+            max={4}
+            step={0.05}
+            value={speed}
+            onChange={(e) => setSpeed(Number(e.target.value))}
+            style={{ width: 90 }}
+          />
+          <span style={{ fontVariantNumeric: "tabular-nums" }}>{speed.toFixed(2)}x</span>
+        </label>
+        <label
+          style={{ display: "flex", alignItems: "center", gap: "0.3rem", fontSize: 13 }}
           title="ON の間はマウスではなく再生ヘッドの時刻で各 spectrogram 行に CQT レンズを出します"
         >
           <input
@@ -502,6 +715,17 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
             onChange={(e) => setPlaybackLens(e.target.checked)}
           />
           再生位置レンズ
+        </label>
+        <label
+          style={{ display: "flex", alignItems: "center", gap: "0.3rem", fontSize: 13 }}
+          title="再生中、再生ヘッドを画面内に保つよう横スクロールを追従させます"
+        >
+          <input
+            type="checkbox"
+            checked={autoScroll}
+            onChange={(e) => setAutoScroll(e.target.checked)}
+          />
+          自動スクロール
         </label>
         <label style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: "0.4rem" }}>
           ズーム
@@ -556,18 +780,59 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
                   top={info.top}
                   rowHeight={info.height}
                   pxPerSec={pxPerSec}
-                  onSeek={(time) => {
-                    setPlaying(false);
-                    setCurrentTime(Math.max(0, Math.min(displayDuration, time)));
-                  }}
+                  onSeek={(time) => setCurrentTime(Math.max(0, Math.min(displayDuration, time)))}
                   onDelete={() => deleteTrack(t)}
                   onMove={(dir) => moveTrack(idx, dir)}
                   onEdit={() => setEditing({ kind: t.kind, id: t.data.id })}
                   onTrim={() => setTrimming({ kind: t.kind, id: t.data.id })}
                   onSpectrogram={t.kind === "audio" ? () => setSpecDialog(t.data.id) : undefined}
+                  showVideo={t.kind === "video" ? shownVideos.has(t.data.id) : undefined}
+                  onToggleVideo={
+                    t.kind === "video"
+                      ? () =>
+                          setShownVideos((cur) => {
+                            const n = new Set(cur);
+                            if (n.has(t.data.id)) n.delete(t.data.id);
+                            else n.add(t.data.id);
+                            return n;
+                          })
+                      : undefined
+                  }
+                  soloed={activeSolo?.kind === t.kind && activeSolo.id === t.data.id}
+                  soloActive={activeSolo !== null}
+                  onSolo={() =>
+                    setSolo((cur) =>
+                      cur && cur.kind === t.kind && cur.id === t.data.id
+                        ? null
+                        : { kind: t.kind, id: t.data.id },
+                    )
+                  }
+                  muted={muted.has(trackKey(t))}
+                  onMute={() =>
+                    setMuted((cur) => {
+                      const n = new Set(cur);
+                      if (n.has(trackKey(t))) n.delete(trackKey(t));
+                      else n.add(trackKey(t));
+                      return n;
+                    })
+                  }
+                  bandHeight={info.bandHeight}
+                  onBandResize={
+                    info.shownSpec || info.shownVideo
+                      ? (h) =>
+                          setBandHeights((cur) => {
+                            const n = new Map(cur);
+                            n.set(trackKey(t), h);
+                            return n;
+                          })
+                      : undefined
+                  }
                   onLensHover={
-                    shown && !playbackLens
-                      ? (h) => setLens(h ? { ...h, audioId: t.data.id } : null)
+                    shown
+                      ? (h) => {
+                          if (frozenRef.current) return;
+                          setLens(h ? { ...h, audioId: t.data.id } : null);
+                        }
                       : undefined
                   }
                   lensProjT={
@@ -593,7 +858,7 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
                         viewportLeft={viewport.left}
                         viewportWidth={viewport.width}
                         top={TRACK_HEIGHT + 2}
-                        height={SPECTROGRAM_STRIP_HEIGHT}
+                        height={info.bandHeight}
                       />
                     )
                   }
@@ -654,44 +919,295 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
           yRatio={lens.yRatio}
           anchorX={lens.clientX}
           anchorY={lens.clientY}
+          swap={swapLens}
+          onToggleSwap={() => setSwapLens((v) => !v)}
+          interactive={lensFrozen}
+          fillHeight={floatLensHeight ?? undefined}
+          onHeightResize={(h) => setFloatLensHeight(h)}
+          stripeW={lensStripeW}
+          onSetStripeW={setLensStripeW}
+          maxHarmonic={lensMaxHarmonic[lensTarget.spec.id]}
+          onSetMaxHarmonic={(n) =>
+            setLensMaxHarmonic((prev) => ({ ...prev, [lensTarget.spec.id]: n }))
+          }
         />
       )}
-      {playbackLens &&
-        playbackLenses(rowsRef.current, tracks, rowInfos, currentTime, pxPerSec, viewport)}
+      {playbackLens && (
+        <PlaybackLensPane
+          tracks={tracks}
+          rowInfos={rowInfos}
+          currentTime={currentTime}
+          isSoloedOut={isSoloedOut}
+          hoverFreqHz={hoverFreqHz}
+          swap={swapLens}
+          onToggleSwap={() => setSwapLens((v) => !v)}
+          lensMaxHarmonic={lensMaxHarmonic}
+          onSetMaxHarmonic={(specId, n) => setLensMaxHarmonic((prev) => ({ ...prev, [specId]: n }))}
+          stripeW={lensStripeW}
+          onSetStripeW={setLensStripeW}
+          storageKey={`cqtLensPane:${data.id}`}
+        />
+      )}
     </div>
   );
 }
 
-// 再生位置レンズ: 表示中の各 spectrogram 行に、再生ヘッド時刻 (yRatio=null) の
-// レンズを再生ヘッドの画面座標で出す。rowsRef は水平スクロールに追従するので
-// その rect を原点に anchor を求める
-function playbackLenses(
-  rows: HTMLDivElement | null,
-  tracks: Track[],
-  rowInfos: { top: number; height: number; shownSpec: ShownSpec | null }[],
-  currentTime: number,
-  pxPerSec: number,
-  viewport: { left: number; width: number },
-): ReactNode {
-  if (!rows) return null;
-  const rect = rows.getBoundingClientRect();
-  const boxLeft = rect.left + viewport.left;
-  const anchorX = Math.max(
-    boxLeft + 4,
-    Math.min(boxLeft + viewport.width - 4, rect.left + currentTime * pxPerSec),
+// wMax: 幅を「中身幅に追従」に latch する (CQT 追加で自動拡大)。false は固定幅
+type PaneGeo = { x: number; y: number; w: number; h: number; wMax?: boolean };
+const LENS_PANE_MIN_W = 220;
+const LENS_PANE_MIN_H = 160;
+// pane がどれだけ画面外に出ても、この幅/高さだけは常に画面内に残す (掴めるように)
+const LENS_PANE_KEEP_VISIBLE = 48;
+
+function defaultPaneGeo(): PaneGeo {
+  const vw = typeof window === "undefined" ? 1200 : window.innerWidth;
+  const vh = typeof window === "undefined" ? 800 : window.innerHeight;
+  const w = Math.min(720, vw - 24);
+  const h = Math.min(300, Math.round(vh * 0.4));
+  return { x: Math.max(12, (vw - w) / 2), y: vh - h - 16, w, h };
+}
+
+// pane を画面内に一部残すよう x/y を clamp する。header(上端)は常に見える高さに留める
+function clampPaneGeo(g: PaneGeo, paneW: number): PaneGeo {
+  if (typeof window === "undefined") return g;
+  const vw = window.innerWidth;
+  const vh = window.innerHeight;
+  const k = LENS_PANE_KEEP_VISIBLE;
+  const x = Math.min(vw - k, Math.max(k - paneW, g.x));
+  const y = Math.min(vh - k, Math.max(0, g.y));
+  return x === g.x && y === g.y ? g : { ...g, x, y };
+}
+
+// 再生位置レンズ: 表示中の各 spectrogram を再生ヘッド時刻でスライスして 1 つの pane に
+// 横並びで置く。pane はドラッグで移動・右下ハンドルでリサイズでき、中身は overflow:auto
+// なので全 media に届く。solo 中は対象 track だけ出す
+// hoverFreqHz を spec の縦位置 (yRatio, 0=上端) に変換。範囲外なら null
+function freqToYRatio(spec: ApiSpectrogram, freqHz: number): number | null {
+  const yr = 1 - Math.log2(freqHz / spec.fminHz) / spec.octaves;
+  return yr >= 0 && yr <= 1 ? yr : null;
+}
+
+const LENS_PANE_HEADER_H = 26;
+
+function PlaybackLensPane({
+  tracks,
+  rowInfos,
+  currentTime,
+  isSoloedOut,
+  hoverFreqHz,
+  swap,
+  onToggleSwap,
+  lensMaxHarmonic,
+  onSetMaxHarmonic,
+  stripeW,
+  onSetStripeW,
+  storageKey,
+}: {
+  tracks: Track[];
+  rowInfos: { top: number; height: number; shownSpec: ShownSpec | null }[];
+  currentTime: number;
+  isSoloedOut: (t: Track) => boolean;
+  hoverFreqHz: number | null;
+  swap: boolean;
+  onToggleSwap: () => void;
+  lensMaxHarmonic: Record<string, number>;
+  onSetMaxHarmonic: (specId: string, n: number) => void;
+  stripeW: number;
+  onSetStripeW: (w: number) => void;
+  storageKey: string;
+}) {
+  const [geo, setGeo] = useState<PaneGeo>(() => loadLocal(storageKey, defaultPaneGeo()));
+  useEffect(() => {
+    saveLocal(storageKey, geo);
+  }, [storageKey, geo]);
+  // 中身を横に並べた自然幅 (max-content) を測り、pane 幅の最大値にする
+  const innerRef = useRef<HTMLDivElement | null>(null);
+  const [contentW, setContentW] = useState<number | null>(null);
+  useEffect(() => {
+    const el = innerRef.current;
+    if (!el) return;
+    const measure = () => setContentW(el.offsetWidth + 18);
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+  // pane 幅は中身幅を超えない。wMax なら中身幅に追従、それ以外は固定幅を中身幅で cap
+  const paneW = contentW != null ? (geo.wMax ? contentW : Math.min(geo.w, contentW)) : geo.w;
+  // 保存済みの座標が画面外でも掴めるよう mount 時 + resize 時に clamp する
+  useEffect(() => {
+    const clamp = () => setGeo((g) => clampPaneGeo(g, paneW));
+    clamp();
+    window.addEventListener("resize", clamp);
+    return () => window.removeEventListener("resize", clamp);
+  }, [paneW]);
+  // レンズ内 CQT を hover したときに全 CQT へ出す周波数 (media 行 hover と同じ白線)
+  const [paneHoverFreq, setPaneHoverFreq] = useState<number | null>(null);
+  const effFreq = paneHoverFreq ?? hoverFreqHz;
+  const drag = useRef<{ mode: "move" | "resize"; sx: number; sy: number; orig: PaneGeo } | null>(
+    null,
   );
-  return rowInfos.map((info, idx) =>
-    info.shownSpec ? (
-      <HarmonicLens
-        key={trackKey(tracks[idx]!)}
-        spec={info.shownSpec.spec}
-        audio={info.shownSpec.audio}
-        projT={currentTime}
-        yRatio={null}
-        anchorX={anchorX}
-        anchorY={rect.top + info.top + info.height / 2}
+  const onDown = (mode: "move" | "resize") => (e: ReactPointerEvent) => {
+    drag.current = { mode, sx: e.clientX, sy: e.clientY, orig: geo };
+    // synthetic PointerEvent (テスト) では active pointer が無く throw する
+    try {
+      e.currentTarget.setPointerCapture(e.pointerId);
+    } catch {}
+    e.preventDefault();
+  };
+  // header 以外 (マージン・CQT 間の隙間) からの move。子要素上と scrollbar 上では開始しない
+  const onDownMargin = (e: ReactPointerEvent): void => {
+    if (e.target !== e.currentTarget) return;
+    const el = e.currentTarget as HTMLElement;
+    if (e.nativeEvent.offsetX >= el.clientWidth || e.nativeEvent.offsetY >= el.clientHeight) return;
+    onDown("move")(e);
+  };
+  const onMove = (e: ReactPointerEvent): void => {
+    const d = drag.current;
+    if (!d) return;
+    const dx = e.clientX - d.sx;
+    const dy = e.clientY - d.sy;
+    if (d.mode === "move")
+      setGeo(clampPaneGeo({ ...d.orig, x: d.orig.x + dx, y: d.orig.y + dy }, paneW));
+    else {
+      const rawW = Math.max(LENS_PANE_MIN_W, d.orig.w + dx);
+      // 中身幅まで引き切ったら「追従」に latch。戻せば固定幅に復帰。
+      // latch 時は w を中身幅に留め、掴み直しで即座に固定幅へ戻せるようにする
+      const wMax = contentW != null && rawW >= contentW;
+      setGeo({
+        ...d.orig,
+        w: wMax ? contentW! : rawW,
+        wMax,
+        h: Math.max(LENS_PANE_MIN_H, d.orig.h + dy),
+      });
+    }
+  };
+  const onUp = (e: ReactPointerEvent): void => {
+    drag.current = null;
+    try {
+      e.currentTarget.releasePointerCapture(e.pointerId);
+    } catch {}
+  };
+
+  const shown = rowInfos
+    .map((info, idx) => ({ info, track: tracks[idx]! }))
+    .filter(({ info, track }) => info.shownSpec && !isSoloedOut(track));
+  if (shown.length === 0) return null;
+  // 中身の縦幅は pane 高さから header/padding を引いて充填する
+  const lensHeight = Math.max(120, geo.h - LENS_PANE_HEADER_H - 16 - 44);
+  return (
+    <div
+      role="group"
+      aria-label="再生位置レンズ"
+      onPointerDown={onDownMargin}
+      onPointerMove={onMove}
+      onPointerUp={onUp}
+      style={{
+        position: "fixed",
+        left: geo.x,
+        top: geo.y,
+        width: paneW,
+        height: geo.h,
+        maxWidth: contentW ?? undefined,
+        display: "flex",
+        flexDirection: "column",
+        padding: 2,
+        touchAction: "none",
+        cursor: "move",
+        background: "rgba(10,10,12,0.92)",
+        border: "1px solid #555",
+        borderRadius: 6,
+        zIndex: 60,
+        boxShadow: "0 6px 24px rgba(0,0,0,0.5)",
+      }}
+    >
+      <div
+        onPointerDown={onDown("move")}
+        onPointerMove={onMove}
+        onPointerUp={onUp}
+        style={{
+          cursor: "move",
+          touchAction: "none",
+          userSelect: "none",
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "center",
+          gap: 8,
+          padding: "3px 8px",
+          color: "#ddd",
+          fontSize: 12,
+          borderBottom: "1px solid #555",
+        }}
+      >
+        <span style={{ fontVariantNumeric: "tabular-nums" }}>
+          再生位置レンズ t={currentTime.toFixed(2)}s
+        </span>
+        <label
+          onPointerDown={(e) => e.stopPropagation()}
+          style={{ display: "flex", alignItems: "center", gap: 4, cursor: "pointer" }}
+        >
+          <input
+            type="checkbox"
+            checked={swap}
+            onChange={onToggleSwap}
+            style={{ margin: 0, width: 12, height: 12, cursor: "pointer" }}
+          />
+          <span style={{ fontSize: 11, color: "#bbb" }}>色↔位置</span>
+        </label>
+      </div>
+      <div
+        onPointerDown={onDownMargin}
+        style={{ flex: 1, overflow: "auto", padding: 8, cursor: "move" }}
+      >
+        <div
+          ref={innerRef}
+          onPointerDown={onDownMargin}
+          style={{ display: "flex", gap: 8, width: "max-content" }}
+        >
+          {shown.map(({ info, track }) => (
+            <HarmonicLens
+              key={trackKey(track)}
+              placement="inline"
+              fillHeight={lensHeight}
+              swap={swap}
+              stripeW={stripeW}
+              onSetStripeW={onSetStripeW}
+              onHoverYRatio={(yr) =>
+                setPaneHoverFreq(
+                  yr == null
+                    ? null
+                    : info.shownSpec!.spec.fminHz * 2 ** ((1 - yr) * info.shownSpec!.spec.octaves),
+                )
+              }
+              maxHarmonic={lensMaxHarmonic[info.shownSpec!.spec.id]}
+              onSetMaxHarmonic={(n) => onSetMaxHarmonic(info.shownSpec!.spec.id, n)}
+              title={`[${track.kind === "video" ? "V" : "A"}] ${track.data.name}`}
+              spec={info.shownSpec!.spec}
+              audio={info.shownSpec!.audio}
+              projT={currentTime}
+              yRatio={effFreq != null ? freqToYRatio(info.shownSpec!.spec, effFreq) : null}
+            />
+          ))}
+        </div>
+      </div>
+      <div
+        onPointerDown={onDown("resize")}
+        onPointerMove={onMove}
+        onPointerUp={onUp}
+        aria-hidden="true"
+        style={{
+          position: "absolute",
+          right: 0,
+          bottom: 0,
+          width: 18,
+          height: 18,
+          cursor: "nwse-resize",
+          touchAction: "none",
+          background: "linear-gradient(135deg, transparent 50%, #888 50%)",
+          borderBottomRightRadius: 6,
+        }}
       />
-    ) : null,
+    </div>
   );
 }
 
@@ -704,6 +1220,9 @@ function syncMediaElement(
   item: VideoItem | AudioItem,
   projTime: number,
   playing: boolean,
+  muted: boolean,
+  volume: number,
+  speed: number,
   onPlayError?: (err: unknown) => void,
 ): void {
   const projLow = Math.min(item.projStartSec, item.projEndSec);
@@ -713,13 +1232,15 @@ function syncMediaElement(
     if (!el.paused) el.pause();
     return;
   }
+  el.muted = muted;
+  el.volume = Math.max(0, Math.min(1, volume));
   const dProj = item.projEndSec - item.projStartSec;
   const dSrc = item.srcEndSec - item.srcStartSec;
   if (dProj === 0 || dSrc === 0) {
     if (!el.paused) el.pause();
     return;
   }
-  const rate = dSrc / dProj;
+  const rate = (dSrc / dProj) * speed;
   const mediaT = item.srcStartSec + ((projTime - item.projStartSec) / dProj) * dSrc;
   if (Math.abs(el.currentTime - mediaT) > SYNC_DRIFT_TOLERANCE) {
     el.currentTime = mediaT;
@@ -827,6 +1348,15 @@ function TrackRow({
   onEdit,
   onTrim,
   onSpectrogram,
+  showVideo,
+  onToggleVideo,
+  soloed,
+  soloActive,
+  onSolo,
+  muted,
+  onMute,
+  bandHeight,
+  onBandResize,
   onLensHover,
   lensProjT,
   attachRef,
@@ -844,11 +1374,21 @@ function TrackRow({
   onEdit: () => void;
   onTrim: () => void;
   onSpectrogram?: () => void;
+  showVideo?: boolean;
+  onToggleVideo?: () => void;
+  soloed: boolean;
+  soloActive: boolean;
+  onSolo: () => void;
+  muted: boolean;
+  onMute: () => void;
+  bandHeight: number;
+  onBandResize?: (h: number) => void;
   onLensHover?: (h: LensHover | null) => void;
   lensProjT?: number | null;
   attachRef: (el: HTMLMediaElement | null) => void;
   spectrogram?: ReactNode;
 }) {
+  const bandDrag = useRef<{ sy: number; orig: number } | null>(null);
   const item = track.data;
   const projLow = Math.min(item.projStartSec, item.projEndSec);
   const projHigh = Math.max(item.projStartSec, item.projEndSec);
@@ -880,6 +1420,8 @@ function TrackRow({
           const bounds = parent.getBoundingClientRect();
           const x = e.clientX - bounds.left + parent.scrollLeft;
           onSeek(x / pxPerSec);
+          // ソロ再生中に別 track をクリックしたら solo 対象をその track に入れ替える
+          if (soloActive && !soloed) onSolo();
         }}
         onPointerMove={
           onLensHover
@@ -890,10 +1432,7 @@ function TrackRow({
                 const yIn = e.clientY - bounds.top - (TRACK_HEIGHT + 2);
                 onLensHover({
                   projT: (e.clientX - bounds.left) / pxPerSec,
-                  yRatio:
-                    yIn >= 0 && yIn < SPECTROGRAM_STRIP_HEIGHT
-                      ? yIn / SPECTROGRAM_STRIP_HEIGHT
-                      : null,
+                  yRatio: yIn >= 0 && yIn < bandHeight ? yIn / bandHeight : null,
                   clientX: e.clientX,
                   clientY: e.clientY,
                 });
@@ -936,24 +1475,15 @@ function TrackRow({
           borderRadius: 4,
           padding: "2px 6px",
           overflow: "hidden",
-          boxShadow: "0 1px 2px rgba(0,0,0,0.15)",
+          boxShadow: soloed
+            ? "0 0 0 2px #d97706, 0 0 14px 4px rgba(217,119,6,0.75)"
+            : "0 1px 2px rgba(0,0,0,0.15)",
+          animation: soloed ? "soloHalo 1.4s ease-in-out infinite" : undefined,
           fontSize: 12,
           pointerEvents: "none",
         }}
       >
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-          <span
-            style={{
-              fontWeight: 600,
-              whiteSpace: "nowrap",
-              overflow: "hidden",
-              textOverflow: "ellipsis",
-            }}
-          >
-            [{track.kind === "video" ? "V" : "A"}] {item.name}
-          </span>
-        </div>
-        <div style={{ opacity: 0.85, fontSize: 10 }}>
+        <div style={{ opacity: 0.85, fontSize: 10, textAlign: "right" }}>
           {formatTime(item.durationSec)} / {speed.toFixed(2)}x{reversed ? " (逆)" : ""}
         </div>
         {track.kind === "video" && (
@@ -961,97 +1491,233 @@ function TrackRow({
         )}
       </div>
       {spectrogram}
+      {onBandResize && (
+        <div
+          aria-hidden="true"
+          onPointerDown={(e) => {
+            bandDrag.current = { sy: e.clientY, orig: bandHeight };
+            e.currentTarget.setPointerCapture(e.pointerId);
+            e.preventDefault();
+            e.stopPropagation();
+          }}
+          onPointerMove={(e) => {
+            const d = bandDrag.current;
+            if (!d) return;
+            onBandResize(Math.max(48, Math.min(600, d.orig + (e.clientY - d.sy))));
+          }}
+          onPointerUp={(e) => {
+            bandDrag.current = null;
+            try {
+              e.currentTarget.releasePointerCapture(e.pointerId);
+            } catch {}
+          }}
+          style={{
+            position: "absolute",
+            left: 0,
+            right: 0,
+            top: TRACK_HEIGHT + 2 + bandHeight - 4,
+            height: 9,
+            cursor: "ns-resize",
+            zIndex: 5,
+            touchAction: "none",
+          }}
+        />
+      )}
       <div
         style={{
-          position: "absolute",
+          position: "sticky",
           left: 4,
-          top: 4,
-          display: "flex",
-          gap: 2,
-          zIndex: 1,
+          zIndex: 4,
+          width: "fit-content",
+          maxWidth: 280,
+          background: soloed
+            ? "rgba(255,237,190,0.98)"
+            : muted
+              ? "rgba(236,236,238,0.94)"
+              : "rgba(250,250,250,0.94)",
+          border: `1.5px solid ${soloed ? "#d97706" : muted ? "#9ca3af" : color}`,
+          borderRadius: 4,
+          padding: "1px 4px 2px",
+          // solo 中は media 名まわりを脈動する光輪で強調する (clip 側だけだと見えづらい)
+          boxShadow: soloed ? "0 0 0 2px #f59e0b, 0 0 16px 5px rgba(245,158,11,0.85)" : undefined,
+          animation: soloed ? "soloHalo 1.4s ease-in-out infinite" : undefined,
         }}
       >
-        <button
-          type="button"
-          aria-label={`${item.name} を上に移動`}
-          disabled={index === 0}
-          onClick={(e) => {
-            e.stopPropagation();
-            onMove(-1);
+        <span
+          title={item.name}
+          style={{
+            display: "block",
+            fontWeight: soloed ? 700 : 600,
+            fontSize: 12,
+            color: soloed ? "#b45309" : muted ? "#9ca3af" : color,
+            textDecoration: muted && !soloed ? "line-through" : undefined,
+            whiteSpace: "nowrap",
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+            maxWidth: 272,
           }}
-          style={trackButtonStyle}
         >
-          ↑
-        </button>
-        <button
-          type="button"
-          aria-label={`${item.name} を下に移動`}
-          disabled={index === total - 1}
-          onClick={(e) => {
-            e.stopPropagation();
-            onMove(1);
-          }}
-          style={trackButtonStyle}
-        >
-          ↓
-        </button>
-        <button
-          type="button"
-          aria-label={`${item.name} を編集`}
-          onClick={(e) => {
-            e.stopPropagation();
-            onEdit();
-          }}
-          style={trackButtonStyle}
-        >
-          編集
-        </button>
-        <button
-          type="button"
-          aria-label={`${item.name} をトリミング`}
-          onClick={(e) => {
-            e.stopPropagation();
-            onTrim();
-          }}
-          style={trackButtonStyle}
-        >
-          トリミング
-        </button>
-        {onSpectrogram && (
+          {soloed ? "◉ " : muted ? "🔇 " : ""}[{track.kind === "video" ? "V" : "A"}] {item.name}
+        </span>
+        <div style={{ display: "flex", gap: 2, marginTop: 2 }}>
           <button
             type="button"
-            aria-label={`${item.name} の CQT spectrogram`}
+            aria-label={`${item.name} を上に移動`}
+            disabled={index === 0}
             onClick={(e) => {
               e.stopPropagation();
-              onSpectrogram();
+              onMove(-1);
             }}
             style={trackButtonStyle}
           >
-            CQT
+            ↑
           </button>
-        )}
-        <button
-          type="button"
-          aria-label={`${item.name} を削除`}
-          onClick={(e) => {
-            e.stopPropagation();
-            onDelete();
-          }}
-          style={trackButtonStyle}
-        >
-          ×
-        </button>
+          <button
+            type="button"
+            aria-label={`${item.name} を下に移動`}
+            disabled={index === total - 1}
+            onClick={(e) => {
+              e.stopPropagation();
+              onMove(1);
+            }}
+            style={trackButtonStyle}
+          >
+            ↓
+          </button>
+          <button
+            type="button"
+            aria-label={`${item.name} を編集`}
+            onClick={(e) => {
+              e.stopPropagation();
+              onEdit();
+            }}
+            style={trackButtonStyle}
+          >
+            編集
+          </button>
+          <button
+            type="button"
+            aria-label={`${item.name} をトリミング`}
+            onClick={(e) => {
+              e.stopPropagation();
+              onTrim();
+            }}
+            style={trackButtonStyle}
+          >
+            トリミング
+          </button>
+          {onSpectrogram && (
+            <button
+              type="button"
+              aria-label={`${item.name} の CQT spectrogram`}
+              onClick={(e) => {
+                e.stopPropagation();
+                onSpectrogram();
+              }}
+              style={trackButtonStyle}
+            >
+              CQT
+            </button>
+          )}
+          {onToggleVideo && (
+            <button
+              type="button"
+              aria-label={`${item.name} の動画表示`}
+              aria-pressed={showVideo}
+              onClick={(e) => {
+                e.stopPropagation();
+                onToggleVideo();
+              }}
+              style={
+                showVideo
+                  ? { ...trackButtonStyle, background: "#2563eb", color: "white" }
+                  : trackButtonStyle
+              }
+            >
+              動画
+            </button>
+          )}
+          <button
+            type="button"
+            aria-label={`${item.name} をソロ再生`}
+            aria-pressed={soloed}
+            onClick={(e) => {
+              e.stopPropagation();
+              onSolo();
+            }}
+            style={
+              soloed
+                ? { ...trackButtonStyle, background: "#d97706", color: "white" }
+                : trackButtonStyle
+            }
+          >
+            ソロ
+          </button>
+          <button
+            type="button"
+            aria-label={`${item.name} をミュート`}
+            aria-pressed={muted}
+            onClick={(e) => {
+              e.stopPropagation();
+              onMute();
+            }}
+            style={
+              muted
+                ? { ...trackButtonStyle, background: "#6b7280", color: "white" }
+                : trackButtonStyle
+            }
+          >
+            ミュート
+          </button>
+          <button
+            type="button"
+            aria-label={`${item.name} を削除`}
+            onClick={(e) => {
+              e.stopPropagation();
+              onDelete();
+            }}
+            style={trackButtonStyle}
+          >
+            ×
+          </button>
+        </div>
       </div>
       {track.kind === "video" ? (
-        <video
-          ref={attachRef as (el: HTMLVideoElement | null) => void}
-          src={(item as VideoItem).streamUrl}
-          preload="metadata"
-          style={{ display: "none" }}
-          aria-hidden="true"
+        // 表示 ON なら行下の monitor 帯に現在フレームを出す。band は絶対配置で縦位置を固定し、
+        // 中の video を sticky-left で横スクロールしても画面内に残す。常に mount したまま
+        // display で出し分けて、toggle での再 mount (再生位置リセット) を避ける
+        <div
+          style={{
+            position: "absolute",
+            left: 0,
+            right: 0,
+            top: TRACK_HEIGHT + 2,
+            height: bandHeight,
+            pointerEvents: "none",
+            display: showVideo ? "block" : "none",
+            zIndex: 3,
+          }}
         >
-          <track kind="captions" />
-        </video>
+          <video
+            ref={attachRef as (el: HTMLVideoElement | null) => void}
+            src={(item as VideoItem).streamUrl}
+            preload="metadata"
+            aria-hidden="true"
+            style={{
+              position: "sticky",
+              left: 4,
+              display: "block",
+              height: bandHeight,
+              width: "auto",
+              maxWidth: "60vw",
+              borderRadius: 4,
+              background: "#000",
+              boxShadow: "0 1px 3px rgba(0,0,0,0.3)",
+            }}
+          >
+            <track kind="captions" />
+          </video>
+        </div>
       ) : (
         <audio
           ref={attachRef as (el: HTMLAudioElement | null) => void}

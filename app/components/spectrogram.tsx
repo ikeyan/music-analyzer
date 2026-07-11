@@ -108,6 +108,18 @@ const COLORMAP: Uint8Array = (() => {
   return map;
 })();
 
+// swap 表示 (color=harmonic, 横位置=振幅) で harmonic ごとに割り当てる固定色
+const HARMONIC_RGB: [number, number, number][] = [
+  [255, 255, 255],
+  [56, 189, 248],
+  [250, 204, 21],
+  [244, 114, 182],
+  [74, 222, 128],
+  [251, 146, 60],
+  [167, 139, 250],
+  [248, 113, 113],
+];
+
 function modeHarmonics(meta: SpectrogramMeta, mode: string): number[] {
   if (mode === "rgb") return meta.harmonics.slice(0, 3);
   const h = Number(mode.slice(1));
@@ -332,7 +344,9 @@ export type LensHover = {
 };
 
 const LENS_AXIS_W = 58;
-const LENS_STRIPE_W = 16;
+export const LENS_STRIPE_DEFAULT_W = 16;
+export const LENS_STRIPE_MIN_W = 6;
+export const LENS_STRIPE_MAX_W = 80;
 const LENS_LABEL_H = 14;
 
 const NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
@@ -357,14 +371,50 @@ export function HarmonicLens({
   yRatio,
   anchorX,
   anchorY,
+  placement = "float",
+  title,
+  fillHeight,
+  swap = false,
+  onToggleSwap,
+  interactive = false,
+  maxHarmonic,
+  onSetMaxHarmonic,
+  onHeightResize,
+  stripeW = LENS_STRIPE_DEFAULT_W,
+  onSetStripeW,
+  onHoverYRatio,
 }: {
   spec: ApiSpectrogram;
   audio: ApiAudio;
   projT: number;
   yRatio: number | null;
-  anchorX: number;
-  anchorY: number;
+  // placement="float" では anchor 座標に fixed 配置、"inline" では親の flで横並び
+  anchorX?: number;
+  anchorY?: number;
+  placement?: "float" | "inline";
+  title?: string;
+  // inline で pane 高さに合わせて縦に伸ばす CQT 描画高さ (px)
+  fillHeight?: number;
+  // swap: color=harmony・横位置(bar長)=振幅 に入れ替える (既定は color=振幅)
+  swap?: boolean;
+  onToggleSwap?: () => void;
+  // float で pointer 操作を許可する (Ctrl/Cmd で追従停止して触れるようにするとき)
+  interactive?: boolean;
+  // 表示する倍音の上限。未計算の倍数は最近傍の計算済み plane を bin 方向に平行移動して近似
+  maxHarmonic?: number;
+  onSetMaxHarmonic?: (n: number) => void;
+  // float で高さを変えるハンドル用 (現在の displayH を渡して新しい高さを返す)
+  onHeightResize?: (h: number) => void;
+  // 1 plane 幅 (project 共通)。内側四角形の右端ハンドルで変更する
+  stripeW?: number;
+  onSetStripeW?: (w: number) => void;
+  // 内側 CQT を hover したときの縦位置 (0=上端, 1=下端)。null = leave
+  onHoverYRatio?: (yRatio: number | null) => void;
 }) {
+  const heightDrag = useRef<{ sy: number; orig: number } | null>(null);
+  const stripeDrag = useRef<{ sx: number; orig: number; last: number } | null>(null);
+  // ドラッグ中だけ列レイアウトを固定したまま canvas を preview 幅で再描画する
+  const [dragStripeW, setDragStripeW] = useState<number | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const [meta, setMeta] = useState<SpectrogramMeta | null>(null);
   const [tilesVersion, setTilesVersion] = useState(0);
@@ -389,11 +439,16 @@ export function HarmonicLens({
     };
   }, []);
 
-  // layout は spec だけで決まる (meta 到着前にパネル寸法が変わらないように)
-  const numH = spec.harmonics.length;
+  // layout は spec だけで決まる (meta 到着前にパネル寸法が変わらないように)。
+  // 表示倍音は 1..maxH (既定は計算済み最大倍音)。未計算の倍数も列として出す
+  const maxH = Math.max(1, Math.round(maxHarmonic ?? Math.max(...spec.harmonics)));
+  const numH = maxH;
   const bins = spec.binsPerOctave * spec.octaves;
-  const displayH = Math.min(320, Math.max(144, bins * 2));
-  const canvasW = LENS_AXIS_W + numH * LENS_STRIPE_W;
+  const displayH = fillHeight ?? Math.min(320, Math.max(144, bins * 2));
+  // 列footprintは commit 済み stripeW で決まる。ドラッグ中の canvas だけ preview 幅で描く
+  const effStripeW = dragStripeW ?? stripeW;
+  const canvasW = LENS_AXIS_W + numH * stripeW;
+  const drawW = LENS_AXIS_W + numH * effStripeW;
   const canvasH = displayH + LENS_LABEL_H;
 
   const dProj = audio.projEndSec - audio.projStartSec;
@@ -414,52 +469,114 @@ export function HarmonicLens({
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas || !meta) return;
-    if (canvas.width !== canvasW) canvas.width = canvasW;
+    if (canvas.width !== drawW) canvas.width = drawW;
     if (canvas.height !== canvasH) canvas.height = canvasH;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
     ctx.imageSmoothingEnabled = false;
-    ctx.fillStyle = "#111";
-    ctx.fillRect(0, 0, canvasW, canvasH);
 
     const fps0 = meta.sampleRate / meta.hop;
     const frame = Math.min(meta.frames - 1, Math.max(0, Math.round(srcT * fps0)));
     const tileIdx = Math.floor(frame / meta.tileFrames);
-    const offset = (frame - tileIdx * meta.tileFrames) * meta.bins;
+    const frameInTile = frame - tileIdx * meta.tileFrames;
 
-    // 1 harmonic = 1px 列の ImageData を作って横に引き伸ばす
+    // 各表示倍音 h の候補 source を「サブ bin 丸め誤差」昇順で並べる。描画時に bin ごとに
+    // カバーできる最小誤差の source を選ぶ。harmonic plane は同一 VQT を log 周波数で
+    // ずらしたものなので値はほぼ厳密に一致し、誤差は bin 丸めのみ (shift=B*log2(h/h0))。
+    // base plane (h0=0, [fmin,Nyquist]) は全表示 bin を覆う fallback で高域切れを無くす
+    const candidates: { h0: number; shift: number; err: number; planeBins: number }[][] = [];
+    for (let hi = 0; hi < numH; hi++) {
+      const h = hi + 1;
+      const cs = meta.harmonics.map((h0) => {
+        const s = spec.binsPerOctave * Math.log2(h / h0);
+        const shift = Math.round(s);
+        return { h0, shift, err: Math.abs(s - shift), planeBins: meta.bins };
+      });
+      if (meta.baseBins) {
+        const s = spec.binsPerOctave * Math.log2(h);
+        const shift = Math.round(s);
+        cs.push({ h0: 0, shift, err: Math.abs(s - shift), planeBins: meta.baseBins });
+      }
+      cs.sort((a, b) => a.err - b.err);
+      candidates.push(cs);
+    }
+
+    // 計算済み plane + base のタイルを集める。1 つでも未取得なら前フレーム保持
+    const srcTiles = new Map<number, Uint8Array | null>();
+    let anyMissing = false;
+    for (const h0 of meta.baseBins ? [0, ...meta.harmonics] : meta.harmonics) {
+      const b = getTileBytes(`${spec.tileUrlBase}/${h0}/0/${tileIdx}`);
+      srcTiles.set(h0, b);
+      if (!b) anyMissing = true;
+    }
+    if (anyMissing) return;
+
+    const sampleAt = (hi: number, b: number): number => {
+      for (const c of candidates[hi]!) {
+        const rb = b + c.shift;
+        if (rb >= 0 && rb < c.planeBins) {
+          return srcTiles.get(c.h0)![frameInTile * c.planeBins + rb]!;
+        }
+      }
+      return 0;
+    };
+
+    ctx.fillStyle = "#111";
+    ctx.fillRect(0, 0, drawW, canvasH);
+
+    // CQT 本体。通常は color=振幅 (harmonic ごとに 1px 列→引き伸ばし)。swap では
+    // color=harmonic (固定色)・横方向の bar 長=振幅 にして、振幅を位置で読めるようにする
     const off = document.createElement("canvas");
-    off.width = numH;
-    off.height = bins;
     const octx = off.getContext("2d");
     if (!octx) return;
-    const img = octx.createImageData(numH, bins);
-    const px = img.data;
-    for (let hi = 0; hi < numH; hi++) {
-      const bytes = getTileBytes(`${spec.tileUrlBase}/${meta.harmonics[hi]}/0/${tileIdx}`);
-      for (let b = 0; b < bins; b++) {
-        const o = ((bins - 1 - b) * numH + hi) * 4;
-        if (bytes) {
-          const v = bytes[offset + b]!;
+    if (swap) {
+      const W = effStripeW;
+      off.width = numH * W;
+      off.height = bins;
+      const img = octx.createImageData(numH * W, bins);
+      const px = img.data;
+      for (let hi = 0; hi < numH; hi++) {
+        const c = HARMONIC_RGB[hi % HARMONIC_RGB.length]!;
+        for (let b = 0; b < bins; b++) {
+          const v = sampleAt(hi, b);
+          const barLen = Math.round((v / 255) * W);
+          const row = bins - 1 - b;
+          for (let x = 0; x < W; x++) {
+            const o = (row * numH * W + hi * W + x) * 4;
+            const inBar = x < barLen;
+            px[o] = inBar ? c[0] : 12;
+            px[o + 1] = inBar ? c[1] : 12;
+            px[o + 2] = inBar ? c[2] : 12;
+            px[o + 3] = 255;
+          }
+        }
+      }
+      octx.putImageData(img, 0, 0);
+      ctx.drawImage(off, 0, 0, numH * W, bins, LENS_AXIS_W, 0, numH * W, displayH);
+    } else {
+      off.width = numH;
+      off.height = bins;
+      const img = octx.createImageData(numH, bins);
+      const px = img.data;
+      for (let hi = 0; hi < numH; hi++) {
+        for (let b = 0; b < bins; b++) {
+          const o = ((bins - 1 - b) * numH + hi) * 4;
+          const v = sampleAt(hi, b);
           px[o] = COLORMAP[v * 3]!;
           px[o + 1] = COLORMAP[v * 3 + 1]!;
           px[o + 2] = COLORMAP[v * 3 + 2]!;
-        } else {
-          px[o] = 70;
-          px[o + 1] = 70;
-          px[o + 2] = 70;
+          px[o + 3] = 255;
         }
-        px[o + 3] = 255;
       }
+      octx.putImageData(img, 0, 0);
+      ctx.drawImage(off, 0, 0, numH, bins, LENS_AXIS_W, 0, numH * effStripeW, displayH);
     }
-    octx.putImageData(img, 0, 0);
-    ctx.drawImage(off, 0, 0, numH, bins, LENS_AXIS_W, 0, numH * LENS_STRIPE_W, displayH);
 
     // 列区切り + オクターブ目盛 + harmonic ラベル
     ctx.strokeStyle = "rgba(0,0,0,0.5)";
     ctx.beginPath();
     for (let hi = 1; hi < numH; hi++) {
-      const x = LENS_AXIS_W + hi * LENS_STRIPE_W + 0.5;
+      const x = LENS_AXIS_W + hi * effStripeW + 0.5;
       ctx.moveTo(x, 0);
       ctx.lineTo(x, displayH);
     }
@@ -474,16 +591,21 @@ export function HarmonicLens({
       const f = spec.fminHz * 2 ** o;
       ctx.beginPath();
       ctx.moveTo(LENS_AXIS_W, y + 0.5);
-      ctx.lineTo(canvasW, y + 0.5);
+      ctx.lineTo(drawW, y + 0.5);
       ctx.stroke();
       ctx.fillText(`${noteName(f)} ${formatHz(f)}`, LENS_AXIS_W - 4, Math.max(6, y));
     }
     ctx.textAlign = "center";
-    ctx.fillStyle = "#ccc";
+    // ×n が 1 plane 幅に収まらなくなったら間引く
+    const labelStep = Math.max(1, Math.ceil(ctx.measureText(`×${numH}~`).width / effStripeW));
     for (let hi = 0; hi < numH; hi++) {
+      if (hi % labelStep !== 0) continue;
+      // 計算済み倍音は明るく、近似 (非計算 = shift で補間) は暗めで区別する
+      const approx = !meta.harmonics.includes(hi + 1);
+      ctx.fillStyle = approx ? "#7a7a7a" : "#ccc";
       ctx.fillText(
-        `×${meta.harmonics[hi]}`,
-        LENS_AXIS_W + (hi + 0.5) * LENS_STRIPE_W,
+        `×${hi + 1}${approx ? "~" : ""}`,
+        LENS_AXIS_W + (hi + 0.5) * effStripeW,
         displayH + LENS_LABEL_H / 2 + 1,
       );
     }
@@ -492,49 +614,237 @@ export function HarmonicLens({
       const rowH = displayH / bins;
       const y = displayH * (1 - (binSel + 1) / bins);
       ctx.strokeStyle = "#fff";
-      ctx.strokeRect(LENS_AXIS_W + 0.5, y + 0.5, numH * LENS_STRIPE_W - 1, Math.max(1, rowH));
+      ctx.strokeRect(LENS_AXIS_W + 0.5, y + 0.5, numH * effStripeW - 1, Math.max(1, rowH));
+      // 白線の左に 2 段ラベル: 上=step, 下=note + Hz
+      const fSel = spec.fminHz * 2 ** (binSel / spec.binsPerOctave);
+      const l1 = `${Math.floor(binSel / spec.binsPerOctave)}oct +${binSel % spec.binsPerOctave}/${spec.binsPerOctave}`;
+      const l2 = `${noteName(fSel)} ${formatHz(fSel)}Hz`;
+      const yc = y + rowH / 2;
+      ctx.font = "8px system-ui, sans-serif";
+      ctx.textAlign = "right";
+      ctx.textBaseline = "alphabetic";
+      const tw = Math.max(ctx.measureText(l1).width, ctx.measureText(l2).width);
+      const rx = LENS_AXIS_W - 3;
+      ctx.fillStyle = "rgba(0,0,0,0.82)";
+      ctx.fillRect(rx - tw - 2, yc - 10, tw + 4, 20);
+      ctx.fillStyle = "#fff";
+      ctx.fillText(l1, rx, yc - 1);
+      ctx.fillText(l2, rx, yc + 8);
     }
-  }, [meta, spec, srcT, binSel, tilesVersion, numH, bins, displayH, canvasW, canvasH]);
+  }, [
+    meta,
+    spec,
+    srcT,
+    binSel,
+    tilesVersion,
+    numH,
+    bins,
+    displayH,
+    drawW,
+    canvasH,
+    swap,
+    effStripeW,
+  ]);
 
   const panelW = canvasW + 18;
   const panelH = canvasH + 40;
-  let left = anchorX + 18;
-  if (left + panelW > window.innerWidth - 8) left = anchorX - panelW - 12;
-  const top = Math.max(8, Math.min(window.innerHeight - panelH - 8, anchorY - panelH / 2));
+  const floatStyle: CSSProperties =
+    placement === "float"
+      ? (() => {
+          let left = (anchorX ?? 0) + 18;
+          if (left + panelW > window.innerWidth - 8) left = (anchorX ?? 0) - panelW - 12;
+          const top = Math.max(
+            8,
+            Math.min(window.innerHeight - panelH - 8, (anchorY ?? 0) - panelH / 2),
+          );
+          return { position: "fixed", left, top, zIndex: 50 };
+        })()
+      : { position: "relative", flex: "0 0 auto" };
 
-  const f0 = binSel === null ? null : spec.fminHz * 2 ** (binSel / spec.binsPerOctave);
-  const stepOct = binSel === null ? null : Math.floor(binSel / spec.binsPerOctave);
-  const stepInOct = binSel === null ? null : binSel % spec.binsPerOctave;
   return (
     <div
       aria-hidden="true"
       style={{
-        position: "fixed",
-        left,
-        top,
-        zIndex: 50,
+        ...floatStyle,
         background: "rgba(17,17,17,0.95)",
         border: "1px solid #444",
         borderRadius: 6,
         padding: "4px 8px 6px",
-        pointerEvents: "none",
+        cursor: "default",
+        pointerEvents: placement === "inline" || interactive ? "auto" : "none",
         boxShadow: "0 4px 16px rgba(0,0,0,0.4)",
       }}
     >
-      <div
-        style={{
-          color: "#ddd",
-          fontSize: 11,
-          fontVariantNumeric: "tabular-nums",
-          marginBottom: 2,
-          whiteSpace: "nowrap",
-        }}
-      >
-        t={srcT.toFixed(2)}s
-        {f0 !== null &&
-          ` · step ${binSel} (${stepOct}oct +${stepInOct}/${spec.binsPerOctave}) · ${f0.toFixed(1)}Hz ${noteName(f0)}`}
+      {(onToggleSwap || onSetMaxHarmonic) && (
+        <div
+          onPointerDown={(e) => e.stopPropagation()}
+          style={{
+            position: "absolute",
+            top: 2,
+            right: 3,
+            display: "flex",
+            alignItems: "center",
+            gap: 3,
+            zIndex: 2,
+          }}
+        >
+          {onSetMaxHarmonic && (
+            <input
+              type="number"
+              min={1}
+              max={32}
+              value={maxH}
+              aria-label="表示倍音の上限"
+              title="表示する倍音の上限 (未計算の倍数は近似表示)"
+              onChange={(e) => {
+                const n = Math.round(Number(e.target.value));
+                if (Number.isFinite(n)) onSetMaxHarmonic(Math.max(1, Math.min(32, n)));
+              }}
+              style={{ width: 34, height: 15, fontSize: 10, padding: "0 2px" }}
+            />
+          )}
+          {onToggleSwap && (
+            <input
+              type="checkbox"
+              aria-label="振幅を位置で表示 (color↔harmony)"
+              checked={swap}
+              onChange={onToggleSwap}
+              style={{ margin: 0, width: 12, height: 12, cursor: "pointer" }}
+            />
+          )}
+        </div>
+      )}
+      {title && (
+        <div
+          style={{
+            color: "#fff",
+            fontSize: 11,
+            fontWeight: 600,
+            marginBottom: 2,
+            maxWidth: Math.max(30, canvasW - 56),
+            whiteSpace: "nowrap",
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+          }}
+        >
+          {title}
+        </div>
+      )}
+      {placement === "float" && (
+        <div
+          style={{
+            color: "#ddd",
+            fontSize: 11,
+            fontVariantNumeric: "tabular-nums",
+            marginBottom: 2,
+            whiteSpace: "nowrap",
+          }}
+        >
+          t={srcT.toFixed(2)}s
+        </div>
+      )}
+      <div style={{ position: "relative", width: canvasW, height: canvasH }}>
+        <canvas
+          ref={canvasRef}
+          onPointerMove={
+            onHoverYRatio
+              ? (e) => {
+                  const oy = e.nativeEvent.offsetY;
+                  onHoverYRatio(
+                    oy >= 0 && oy <= displayH ? Math.min(1, Math.max(0, oy / displayH)) : null,
+                  );
+                }
+              : undefined
+          }
+          onPointerLeave={onHoverYRatio ? () => onHoverYRatio(null) : undefined}
+          style={{
+            width: drawW,
+            height: canvasH,
+            display: "block",
+            position: "absolute",
+            left: 0,
+            top: 0,
+          }}
+        />
+        {onSetStripeW && (placement === "inline" || interactive) && (
+          <div
+            aria-hidden="true"
+            onPointerDown={(e) => {
+              stripeDrag.current = { sx: e.clientX, orig: stripeW, last: stripeW };
+              // synthetic PointerEvent (テスト) では active pointer が無く throw する
+              try {
+                e.currentTarget.setPointerCapture(e.pointerId);
+              } catch {}
+              e.preventDefault();
+              e.stopPropagation();
+            }}
+            onPointerMove={(e) => {
+              const d = stripeDrag.current;
+              if (!d) return;
+              const w = Math.round(
+                Math.max(
+                  LENS_STRIPE_MIN_W,
+                  Math.min(LENS_STRIPE_MAX_W, d.orig + (e.clientX - d.sx) / numH),
+                ),
+              );
+              d.last = w;
+              setDragStripeW(w);
+            }}
+            onPointerUp={(e) => {
+              const d = stripeDrag.current;
+              stripeDrag.current = null;
+              try {
+                e.currentTarget.releasePointerCapture(e.pointerId);
+              } catch {}
+              if (d) onSetStripeW(d.last);
+              setDragStripeW(null);
+            }}
+            style={{
+              position: "absolute",
+              left: LENS_AXIS_W + numH * effStripeW - 3,
+              top: 0,
+              width: 7,
+              height: displayH,
+              cursor: "ew-resize",
+              background: dragStripeW != null ? "rgba(120,180,255,0.5)" : "rgba(255,255,255,0.12)",
+              zIndex: 3,
+            }}
+          />
+        )}
       </div>
-      <canvas ref={canvasRef} style={{ width: canvasW, height: canvasH, display: "block" }} />
+      {onHeightResize && interactive && (
+        <div
+          aria-hidden="true"
+          onPointerDown={(e) => {
+            heightDrag.current = { sy: e.clientY, orig: displayH };
+            try {
+              e.currentTarget.setPointerCapture(e.pointerId);
+            } catch {}
+            e.preventDefault();
+            e.stopPropagation();
+          }}
+          onPointerMove={(e) => {
+            const d = heightDrag.current;
+            if (!d) return;
+            onHeightResize(Math.max(100, Math.min(800, d.orig + (e.clientY - d.sy))));
+          }}
+          onPointerUp={(e) => {
+            heightDrag.current = null;
+            try {
+              e.currentTarget.releasePointerCapture(e.pointerId);
+            } catch {}
+          }}
+          style={{
+            position: "absolute",
+            left: 0,
+            right: 0,
+            bottom: 0,
+            height: 9,
+            cursor: "ns-resize",
+            background: "rgba(255,255,255,0.15)",
+          }}
+        />
+      )}
     </div>
   );
 }
@@ -601,7 +911,9 @@ export function SpectrogramDialogBody({
     ...DEFAULT_CQT_FORM,
     ...loadLocal<Partial<CqtForm>>(formKey, {}),
   }));
-  const [busy, setBusy] = useState<string | null>(null);
+  // busy は操作単位で分ける: 生成中でも別 CQT の削除/表示切替を妨げないようにする
+  const [creating, setCreating] = useState(false);
+  const [deleting, setDeleting] = useState<ReadonlySet<string>>(() => new Set());
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -637,19 +949,25 @@ export function SpectrogramDialogBody({
       return;
     }
     const { fminHz, octaves } = cqtRangeFromCenter(center, down, up);
-    setBusy("create");
+    // h=1 は低域近似元として常に含める
+    const harmonics = Array.from(new Set([1, ...form.harmonics])).toSorted((a, x) => a - x);
+    setCreating(true);
     setError(null);
-    const result = await onCreate({ binsPerOctave: b, octaves, fminHz, harmonics: form.harmonics });
-    setBusy(null);
+    const result = await onCreate({ binsPerOctave: b, octaves, fminHz, harmonics });
+    setCreating(false);
     if ("error" in result) setError(result.error);
   }
 
   async function remove(specId: string): Promise<void> {
     if (!confirm("この spectrogram を削除しますか？")) return;
-    setBusy(specId);
+    setDeleting((d) => new Set(d).add(specId));
     setError(null);
     const result = await onDelete(specId);
-    setBusy(null);
+    setDeleting((d) => {
+      const n = new Set(d);
+      n.delete(specId);
+      return n;
+    });
     if ("error" in result) setError(result.error);
     else if (view?.specId === specId) onChangeView(null);
   }
@@ -717,7 +1035,8 @@ export function SpectrogramDialogBody({
               >
                 <span style={{ fontFamily: "monospace" }}>{specLabel(spec)}</span>
                 <span style={{ color: badge.color, fontWeight: 600 }}>{badge.label}</span>
-                {spec.status === "ready" && (
+                {/* 生成中 (pending) でも表示を先に選べる: ready になった瞬間に反映される */}
+                {spec.status !== "failed" && (
                   <label style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
                     表示
                     <select
@@ -726,7 +1045,6 @@ export function SpectrogramDialogBody({
                         const mode = e.target.value;
                         onChangeView(mode === "" ? null : { specId: spec.id, mode });
                       }}
-                      disabled={busy !== null}
                     >
                       <option value="">非表示</option>
                       {spec.harmonics.map((h) => (
@@ -745,9 +1063,9 @@ export function SpectrogramDialogBody({
                 <button
                   type="button"
                   onClick={() => remove(spec.id)}
-                  disabled={busy !== null || spec.status === "pending"}
+                  disabled={deleting.has(spec.id) || spec.status === "pending"}
                 >
-                  {busy === spec.id ? "削除中…" : "削除"}
+                  {deleting.has(spec.id) ? "削除中…" : "削除"}
                 </button>
               </li>
             );
@@ -768,7 +1086,7 @@ export function SpectrogramDialogBody({
               list="bins-per-octave-presets"
               value={form.binsPerOctave}
               onChange={(e) => setField("binsPerOctave", e.target.value)}
-              disabled={busy !== null}
+              disabled={creating}
               style={{ width: 80 }}
             />
             <datalist id="bins-per-octave-presets">
@@ -785,7 +1103,7 @@ export function SpectrogramDialogBody({
               step="0.001"
               value={form.centerHz}
               onChange={(e) => setField("centerHz", e.target.value)}
-              disabled={busy !== null}
+              disabled={creating}
               style={{ width: 100 }}
             />
           </label>
@@ -798,7 +1116,7 @@ export function SpectrogramDialogBody({
               step="1"
               value={form.octavesDown}
               onChange={(e) => setField("octavesDown", e.target.value)}
-              disabled={busy !== null}
+              disabled={creating}
               style={{ width: 56 }}
             />
           </label>
@@ -811,7 +1129,7 @@ export function SpectrogramDialogBody({
               step="1"
               value={form.octavesUp}
               onChange={(e) => setField("octavesUp", e.target.value)}
-              disabled={busy !== null}
+              disabled={creating}
               style={{ width: 56 }}
             />
           </label>
@@ -839,7 +1157,7 @@ export function SpectrogramDialogBody({
             >
               <input
                 type="checkbox"
-                checked={form.harmonics.includes(h)}
+                checked={h === 1 || form.harmonics.includes(h)}
                 onChange={(e) =>
                   setField(
                     "harmonics",
@@ -848,7 +1166,8 @@ export function SpectrogramDialogBody({
                       : form.harmonics.filter((x) => x !== h),
                   )
                 }
-                disabled={busy !== null}
+                // h=1 は低域の近似元として常に計算する (off 不可)
+                disabled={creating || h === 1}
               />
               ×{h}
             </label>
@@ -856,15 +1175,12 @@ export function SpectrogramDialogBody({
         </div>
         <p style={{ fontSize: 11, color: "#666", margin: "0.4rem 0" }}>
           harmonic CQT は選んだ各倍音 (中心×h) ごとに CQT を計算します。複数選ぶと RGB
-          合成表示が使えます。{MAX_SPECTROGRAM_FMAX_HZ}Hz
-          を超える高域は自動で黒く（クランプ）表示されます。
+          合成表示が使えます。×1 は低域の近似元として常に計算します。レンズでは未計算の
+          倍数も、計算済み plane を bin 方向に平行移動して近似表示します。
+          {MAX_SPECTROGRAM_FMAX_HZ}Hz を超える高域は自動で黒く（クランプ）表示されます。
         </p>
-        <button
-          type="button"
-          onClick={create}
-          disabled={busy !== null || baseTopOver || !formValid}
-        >
-          {busy === "create" ? "開始中…" : "生成開始"}
+        <button type="button" onClick={create} disabled={creating || baseTopOver || !formValid}>
+          {creating ? "開始中…" : "生成開始"}
         </button>
       </section>
     </div>

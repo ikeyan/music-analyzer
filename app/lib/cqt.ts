@@ -10,7 +10,19 @@ export type CqtParams = {
   fminHz: number;
   /** sampleRate 基準の hop。2^(octaves-1) の倍数であること */
   hop: number;
+  /**
+   * VQT 帯域幅下限 (Hz)。窓長を n = fs/(α·f + gamma) とし、低域で窓が伸びすぎるのを抑える
+   * (α = 2^(1/B)-1)。0 (既定) なら純 constant-Q。autoGamma(binsPerOctave) が推奨値
+   */
+  gamma?: number;
 };
+
+// librosa 方式の VQT gamma。ERB (帯域幅 ≈ 24.7 + 0.108·f) に整合する帯域幅下限を
+// binsPerOctave から導く。低域の時間分解能を上げる代わりに周波数分解能を落とす
+export function autoGamma(binsPerOctave: number): number {
+  const alpha = 2 ** (1 / binsPerOctave) - 1;
+  return (24.7 * alpha) / 0.108;
+}
 
 export type CqtResult = {
   /** frame-major: magnitudes[frame * bins + bin], bin 0 が最低周波数 */
@@ -49,29 +61,40 @@ export function cqtBinFrequency(fminHz: number, binsPerOctave: number, bin: numb
   return fminHz * 2 ** (bin / binsPerOctave);
 }
 
-// 直接相関の概算 tap 反復回数 (実測 ~0.5-1G/s)。decode 前の compute 予算ゲート用。
-// 全オクターブで frame 数とカーネル長が同一なので octaves 倍するだけでよい
-export function estimateCqtOps(samples: number, p: CqtParams): number {
-  const q = 1 / (2 ** (1 / p.binsPerOctave) - 1);
-  let kernelTaps = 0;
-  for (let k = 0; k < p.binsPerOctave; k++) {
-    const f = cqtBinFrequency(p.fminHz, p.binsPerOctave, (p.octaves - 1) * p.binsPerOctave + k);
-    kernelTaps += Math.max(2, Math.round((q * p.sampleRate) / f));
-  }
-  const frames = Math.floor(samples / p.hop) + 1;
-  return 2 * p.octaves * frames * kernelTaps;
+// octave o (0=最上位) の bin k の窓長 (tap 数)。VQT では α·f に gamma を足して低域の
+// 窓長を頭打ちにする。gamma は絶対 Hz の下限なので octave ごとに実効値が 2^o 倍される
+// (下位 octave ほど窓が短くなる)。gamma=0 なら全 octave で同一 = 純 constant-Q
+function binTaps(p: CqtParams, gamma: number, o: number, k: number): number {
+  const B = p.binsPerOctave;
+  const alpha = 2 ** (1 / B) - 1;
+  const f = cqtBinFrequency(p.fminHz, B, (p.octaves - 1) * B + k);
+  // 2 tap だと Hann 窓 (両端 0) の和が 0 になり norm が Infinity → NaN になるので最低 3 tap
+  return Math.max(3, Math.round(p.sampleRate / (alpha * f + gamma * 2 ** o)));
 }
 
-// 最上位オクターブ (bin = (octaves-1)*B .. octaves*B-1) 用のカーネル
-function designTopOctaveKernel(p: CqtParams): Kernel {
+// 直接相関の概算 tap 反復回数 (実測 ~0.5-1G/s)。decode 前の compute 予算ゲート用。
+// VQT では octave ごとに窓長が変わるので全 octave 分を合算する (gamma=0 なら octaves 倍と一致)
+export function estimateCqtOps(samples: number, p: CqtParams): number {
+  const gamma = p.gamma ?? 0;
+  let kernelTaps = 0;
+  for (let o = 0; o < p.octaves; o++) {
+    for (let k = 0; k < p.binsPerOctave; k++) kernelTaps += binTaps(p, gamma, o, k);
+  }
+  const frames = Math.floor(samples / p.hop) + 1;
+  return 2 * frames * kernelTaps;
+}
+
+// octave o (bin = (octaves-1-o)*B .. (octaves-o)*B-1) 用のカーネル。正規化周波数 f/fs は
+// 全 octave 不変なので指数部は最上位 octave の bin 周波数をそのまま使い、窓長だけ octave で
+// 変える (VQT: 下位 octave ほど短い窓 → 低域の時間分解能が上がる)
+function designOctaveKernel(p: CqtParams, gamma: number, o: number): Kernel {
   const B = p.binsPerOctave;
-  const q = 1 / (2 ** (1 / B) - 1);
   const re: Float32Array<ArrayBuffer>[] = [];
   const im: Float32Array<ArrayBuffer>[] = [];
   const norm: number[] = [];
   for (let k = 0; k < B; k++) {
     const f = cqtBinFrequency(p.fminHz, B, (p.octaves - 1) * B + k);
-    const n = Math.max(2, Math.round((q * p.sampleRate) / f));
+    const n = binTaps(p, gamma, o, k);
     const wRe = new Float32Array(n);
     const wIm = new Float32Array(n);
     let wSum = 0;
@@ -219,7 +242,10 @@ export async function computeCqt(
   }
   const frames = Math.max(1, Math.floor(samples.length / p.hop) + 1);
   const out = new Float32Array(frames * bins);
-  const kernel = designTopOctaveKernel(p);
+  const gamma = p.gamma ?? 0;
+  // VQT では octave ごとに窓長が異なるので octave 分のカーネルを設計する
+  // (gamma=0 なら全 octave 同一 = 従来の 1 カーネル使い回しと等価)
+  const kernels = Array.from({ length: p.octaves }, (_, o) => designOctaveKernel(p, gamma, o));
   let signal = samples;
   let hop = p.hop;
   for (let o = 0; o < p.octaves; o++) {
@@ -227,7 +253,7 @@ export async function computeCqt(
       signal,
       hop,
       frames,
-      kernel,
+      kernels[o]!,
       out,
       bins,
       (p.octaves - 1 - o) * p.binsPerOctave,

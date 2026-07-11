@@ -88,6 +88,7 @@ describe("cqt spectrogram task", () => {
     const meta = (await metaRes.json()) as {
       frames: number;
       bins: number;
+      baseBins: number;
       levels: number;
       hop: number;
       harmonics: number[];
@@ -96,6 +97,8 @@ describe("cqt spectrogram task", () => {
     expect(meta.harmonics).toEqual([1, 2]);
     expect(meta.frames).toBeGreaterThan(0);
     expect(meta.levels).toBeGreaterThanOrEqual(1);
+    // base plane は [fmin, Nyquist] を覆うので表示 bins より広い
+    expect(meta.baseBins).toBeGreaterThan(meta.bins);
 
     const tileRes = await specsApi[":specId"].tiles[":harmonic"][":level"][":index"].$get({
       param: {
@@ -110,6 +113,21 @@ describe("cqt spectrogram task", () => {
     expect(tileRes.status).toBe(200);
     const tile = new Uint8Array(await tileRes.arrayBuffer());
     expect(tile.length).toBe(Math.min(2048, meta.frames) * meta.bins);
+
+    // base plane (harmonic=0) は取得でき、baseBins 幅を持つ
+    const baseTile = await specsApi[":specId"].tiles[":harmonic"][":level"][":index"].$get({
+      param: {
+        id: projectId,
+        audioId,
+        specId: spectrogram.id,
+        harmonic: "0",
+        level: "0",
+        index: "0",
+      },
+    });
+    expect(baseTile.status).toBe(200);
+    const base = new Uint8Array(await baseTile.arrayBuffer());
+    expect(base.length).toBe(Math.min(2048, meta.frames) * meta.baseBins);
 
     // 持っていない harmonic は 404
     const badTile = await specsApi[":specId"].tiles[":harmonic"][":level"][":index"].$get({
@@ -130,6 +148,30 @@ describe("cqt spectrogram task", () => {
     expect(deleted.status).toBe(204);
     expect(await prisma.spectrogram.count()).toBe(0);
     expect(await listPrefix(spectrogramPrefix(projectId, audioId, spectrogram.id))).toEqual([]);
+  }, 60_000);
+
+  it("base plane の octave 数が表示 octave 数を超えても hop 整列で完走する", async () => {
+    const client = makeClient();
+    const { projectId, audioId } = await seedAudio(client);
+    // fmax 16Hz → fs=3000, baseOctaves=7 > octaves=1。hop が 2^(baseOctaves-1) に整列しないと
+    // base plane の computeCqt が throw する
+    const created = await client.projects[":id"].audios[":audioId"].spectrograms.$post({
+      param: { id: projectId, audioId },
+      json: { binsPerOctave: 12, octaves: 1, fminHz: 8, harmonics: [1] },
+    });
+    expect(created.status).toBe(201);
+    if (!created.ok) throw new Error("unreachable");
+    const { spectrogram, task } = await created.json();
+
+    await waitForInflightTasks();
+    const doneTask = await prisma.task.findUniqueOrThrow({ where: { id: task.id } });
+    expect(doneTask.status).toBe("succeeded");
+    const metaRes = await client.projects[":id"].audios[":audioId"].spectrograms[
+      ":specId"
+    ].meta.$get({ param: { id: projectId, audioId, specId: spectrogram.id } });
+    const meta = (await metaRes.json()) as { bins: number; baseBins: number };
+    expect(meta.bins).toBe(12);
+    expect(meta.baseBins).toBe(84);
   }, 60_000);
 
   it("audio 実体が S3 にないと task/spectrogram が failed になり mark も残らない", async () => {
@@ -177,14 +219,15 @@ describe("cqt spectrogram task", () => {
   it("低周波 × 高 bins の演算量見積もりが予算超過なら decode せずに failed になる", async () => {
     const client = makeClient();
     const { projectId, audioId } = await seedAudio(client);
-    // fmin=8/oct=1/B=96 は fs 床 3kHz でカーネル ~50k サンプルになり ops が爆発する
+    // VQT が低域の窓長を頭打ちにするので単一 plane では ops が膨らみにくい。
+    // 高 bins × 8 harmonic plane × 長尺で全 plane 合算が予算を超える構成にする
     await prisma.audio.update({
       where: { id: audioId },
       data: { durationSec: 3600, srcEndSec: 3600, projEndSec: 3600 },
     });
     const created = await client.projects[":id"].audios[":audioId"].spectrograms.$post({
       param: { id: projectId, audioId },
-      json: { binsPerOctave: 96, octaves: 1, fminHz: 8, harmonics: [1] },
+      json: { binsPerOctave: 96, octaves: 4, fminHz: 8, harmonics: [1, 2, 3, 4, 5, 6, 7, 8] },
     });
     expect(created.status).toBe(201);
     if (!created.ok) throw new Error("unreachable");

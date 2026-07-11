@@ -1,6 +1,13 @@
 import { describe, expect, it } from "bun:test";
 import * as fc from "fast-check";
-import { computeCqt, cqtBinFrequency, downsample2, magnitudesToU8, padBinsToFull } from "./cqt";
+import {
+  autoGamma,
+  computeCqt,
+  cqtBinFrequency,
+  downsample2,
+  magnitudesToU8,
+  padBinsToFull,
+} from "./cqt";
 
 const FS = 8000;
 const B = 12;
@@ -52,6 +59,41 @@ describe("computeCqt", () => {
     const mid = Math.floor(frames / 2);
     expect(magnitudes[mid * bins + bin]!).toBeGreaterThan(0.9);
     expect(magnitudes[mid * bins + bin]!).toBeLessThan(1.1);
+  });
+
+  // 性質: VQT (gamma>0) は低域の窓長を頭打ちにするので、急な onset の magnitude が
+  // 0.1→0.9 に立ち上がる frame 幅が純 constant-Q より狭い
+  it("VQT は低域 onset の時間方向の滲みを constant-Q より狭める", async () => {
+    const bin = B; // 下から 2 番目の octave の最下 bin
+    const f = cqtBinFrequency(FMIN, B, bin);
+    const onset = 8000;
+    const x = new Float32Array(16000);
+    for (let i = onset; i < x.length; i++) x[i] = Math.sin((2 * Math.PI * f * i) / FS);
+    const base = { sampleRate: FS, binsPerOctave: B, octaves: OCTAVES, fminHz: FMIN, hop: HOP };
+    const riseFrames = async (gamma: number): Promise<number> => {
+      const { magnitudes, frames, bins } = await computeCqt(x, { ...base, gamma });
+      const col = (fr: number) => magnitudes[fr * bins + bin]!;
+      const steady = col(frames - 1);
+      let lo = -1;
+      for (let fr = 0; fr < frames; fr++) {
+        if (lo < 0 && col(fr) >= 0.1 * steady) lo = fr;
+        if (col(fr) >= 0.9 * steady) return fr - lo;
+      }
+      return frames;
+    };
+    expect(await riseFrames(autoGamma(B))).toBeLessThan(await riseFrames(0));
+  });
+
+  it("窓長が丸めで 2 tap になる高域 bin でも NaN を出さない", async () => {
+    // fs/(alpha*f)=2.29 → 丸めで 2 tap。Hann 窓は両端 0 なので和が 0 になり NaN が出ていた
+    const { magnitudes } = await computeCqt(sine(3500, 0.5, FS), {
+      sampleRate: FS,
+      binsPerOctave: 1,
+      octaves: 1,
+      fminHz: 3500,
+      hop: 64,
+    });
+    expect(magnitudes.every((v) => Number.isFinite(v))).toBe(true);
   });
 
   it("最上位 bin が Nyquist 超だと throw (kernel aliasing 防止)", () => {
