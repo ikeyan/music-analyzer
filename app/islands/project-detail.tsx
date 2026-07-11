@@ -19,6 +19,7 @@ import type {
 } from "../api/types";
 import {
   HarmonicLens,
+  LENS_STRIPE_DEFAULT_W,
   type LensHover,
   SPECTROGRAM_STRIP_HEIGHT,
   type SpectrogramCreateParams,
@@ -96,6 +97,8 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
   const [swapLens, setSwapLens] = useState(false);
   // float hover レンズの高さ override (null = 既定)
   const [floatLensHeight, setFloatLensHeight] = useState<number | null>(null);
+  // CQT レンズの 1 plane 幅 (project 共通)。ドラッグで内側四角形をリサイズして更新
+  const [lensStripeW, setLensStripeW] = useState(LENS_STRIPE_DEFAULT_W);
   // CQT レンズで表示する倍音の上限 (spec ごと)
   const [lensMaxHarmonic, setLensMaxHarmonic] = useState<Record<string, number>>({});
   // hover レンズを Ctrl/Cmd (or マルチタッチ) で追従停止して触れる状態にする
@@ -129,8 +132,9 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
     if (restoredRef.current) saveLocal(videoShownKey, [...shownVideos]);
   }, [videoShownKey, shownVideos]);
   useEffect(() => {
-    if (restoredRef.current) saveLocal(mixKey, { volume, speed, swapLens, floatLensHeight });
-  }, [mixKey, volume, speed, swapLens, floatLensHeight]);
+    if (restoredRef.current)
+      saveLocal(mixKey, { volume, speed, swapLens, floatLensHeight, lensStripeW });
+  }, [mixKey, volume, speed, swapLens, floatLensHeight, lensStripeW]);
   useEffect(() => {
     if (restoredRef.current) saveLocal(bandHeightsKey, [...bandHeights]);
   }, [bandHeightsKey, bandHeights]);
@@ -147,11 +151,13 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
       speed: 1,
       swapLens: false,
       floatLensHeight: null as number | null,
+      lensStripeW: LENS_STRIPE_DEFAULT_W,
     });
     setVolume(mix.volume);
     setSpeed(mix.speed);
     setSwapLens(mix.swapLens ?? false);
     setFloatLensHeight(mix.floatLensHeight ?? null);
+    setLensStripeW(mix.lensStripeW ?? LENS_STRIPE_DEFAULT_W);
     setLensMaxHarmonic(loadLocal<Record<string, number>>(lensMaxHKey, {}));
     setBandHeights(new Map(loadLocal<[string, number][]>(bandHeightsKey, [])));
     restoredRef.current = true;
@@ -918,6 +924,8 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
           interactive={lensFrozen}
           fillHeight={floatLensHeight ?? undefined}
           onHeightResize={(h) => setFloatLensHeight(h)}
+          stripeW={lensStripeW}
+          onSetStripeW={setLensStripeW}
           maxHarmonic={lensMaxHarmonic[lensTarget.spec.id]}
           onSetMaxHarmonic={(n) =>
             setLensMaxHarmonic((prev) => ({ ...prev, [lensTarget.spec.id]: n }))
@@ -935,6 +943,8 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
           onToggleSwap={() => setSwapLens((v) => !v)}
           lensMaxHarmonic={lensMaxHarmonic}
           onSetMaxHarmonic={(specId, n) => setLensMaxHarmonic((prev) => ({ ...prev, [specId]: n }))}
+          stripeW={lensStripeW}
+          onSetStripeW={setLensStripeW}
           storageKey={`cqtLensPane:${data.id}`}
         />
       )}
@@ -942,9 +952,12 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
   );
 }
 
-type PaneGeo = { x: number; y: number; w: number; h: number };
+// wMax: 幅を「中身幅に追従」に latch する (CQT 追加で自動拡大)。false は固定幅
+type PaneGeo = { x: number; y: number; w: number; h: number; wMax?: boolean };
 const LENS_PANE_MIN_W = 220;
 const LENS_PANE_MIN_H = 160;
+// pane がどれだけ画面外に出ても、この幅/高さだけは常に画面内に残す (掴めるように)
+const LENS_PANE_KEEP_VISIBLE = 48;
 
 function defaultPaneGeo(): PaneGeo {
   const vw = typeof window === "undefined" ? 1200 : window.innerWidth;
@@ -952,6 +965,17 @@ function defaultPaneGeo(): PaneGeo {
   const w = Math.min(720, vw - 24);
   const h = Math.min(300, Math.round(vh * 0.4));
   return { x: Math.max(12, (vw - w) / 2), y: vh - h - 16, w, h };
+}
+
+// pane を画面内に一部残すよう x/y を clamp する。header(上端)は常に見える高さに留める
+function clampPaneGeo(g: PaneGeo, paneW: number): PaneGeo {
+  if (typeof window === "undefined") return g;
+  const vw = window.innerWidth;
+  const vh = window.innerHeight;
+  const k = LENS_PANE_KEEP_VISIBLE;
+  const x = Math.min(vw - k, Math.max(k - paneW, g.x));
+  const y = Math.min(vh - k, Math.max(0, g.y));
+  return x === g.x && y === g.y ? g : { ...g, x, y };
 }
 
 // 再生位置レンズ: 表示中の各 spectrogram を再生ヘッド時刻でスライスして 1 つの pane に
@@ -975,6 +999,8 @@ function PlaybackLensPane({
   onToggleSwap,
   lensMaxHarmonic,
   onSetMaxHarmonic,
+  stripeW,
+  onSetStripeW,
   storageKey,
 }: {
   tracks: Track[];
@@ -986,6 +1012,8 @@ function PlaybackLensPane({
   onToggleSwap: () => void;
   lensMaxHarmonic: Record<string, number>;
   onSetMaxHarmonic: (specId: string, n: number) => void;
+  stripeW: number;
+  onSetStripeW: (w: number) => void;
   storageKey: string;
 }) {
   const [geo, setGeo] = useState<PaneGeo>(() => loadLocal(storageKey, defaultPaneGeo()));
@@ -1004,6 +1032,19 @@ function PlaybackLensPane({
     ro.observe(el);
     return () => ro.disconnect();
   }, []);
+  // pane 幅は中身幅を超えない。wMax なら中身幅に追従、それ以外は固定幅を中身幅で cap
+  const paneW =
+    contentW != null ? (geo.wMax ? contentW : Math.min(geo.w, contentW)) : geo.w;
+  // 保存済みの座標が画面外でも掴めるよう mount 時 + resize 時に clamp する
+  useEffect(() => {
+    const clamp = () => setGeo((g) => clampPaneGeo(g, paneW));
+    clamp();
+    window.addEventListener("resize", clamp);
+    return () => window.removeEventListener("resize", clamp);
+  }, [paneW]);
+  // レンズ内 CQT を hover したときに全 CQT へ出す周波数 (media 行 hover と同じ白線)
+  const [paneHoverFreq, setPaneHoverFreq] = useState<number | null>(null);
+  const effFreq = paneHoverFreq ?? hoverFreqHz;
   const drag = useRef<{ mode: "move" | "resize"; sx: number; sy: number; orig: PaneGeo } | null>(
     null,
   );
@@ -1012,17 +1053,26 @@ function PlaybackLensPane({
     e.currentTarget.setPointerCapture(e.pointerId);
     e.preventDefault();
   };
+  // header 以外 (外周マージン) からの move は、子要素の上では開始しない
+  const onDownMargin = (e: ReactPointerEvent): void => {
+    if (e.target !== e.currentTarget) return;
+    onDown("move")(e);
+  };
   const onMove = (e: ReactPointerEvent): void => {
     const d = drag.current;
     if (!d) return;
     const dx = e.clientX - d.sx;
     const dy = e.clientY - d.sy;
-    if (d.mode === "move") setGeo({ ...d.orig, x: d.orig.x + dx, y: d.orig.y + dy });
+    if (d.mode === "move") setGeo(clampPaneGeo({ ...d.orig, x: d.orig.x + dx, y: d.orig.y + dy }, paneW));
     else {
-      const maxW = contentW ?? Number.POSITIVE_INFINITY;
+      const rawW = Math.max(LENS_PANE_MIN_W, d.orig.w + dx);
+      // 中身幅まで引き切ったら「追従」に latch。戻せば固定幅に復帰。
+      // latch 時は w を中身幅に留め、掴み直しで即座に固定幅へ戻せるようにする
+      const wMax = contentW != null && rawW >= contentW;
       setGeo({
         ...d.orig,
-        w: Math.min(maxW, Math.max(LENS_PANE_MIN_W, d.orig.w + dx)),
+        w: wMax ? contentW! : rawW,
+        wMax,
         h: Math.max(LENS_PANE_MIN_H, d.orig.h + dy),
       });
     }
@@ -1038,11 +1088,13 @@ function PlaybackLensPane({
     .map((info, idx) => ({ info, track: tracks[idx]! }))
     .filter(({ info, track }) => info.shownSpec && !isSoloedOut(track));
   if (shown.length === 0) return null;
-  // pane 幅は中身幅を超えない。中身の縦幅は pane 高さから header/padding を引いて充填する
-  const paneW = contentW != null ? Math.min(geo.w, contentW) : geo.w;
+  // 中身の縦幅は pane 高さから header/padding を引いて充填する
   const lensHeight = Math.max(120, geo.h - LENS_PANE_HEADER_H - 16 - 44);
   return (
     <div
+      onPointerDown={onDownMargin}
+      onPointerMove={onMove}
+      onPointerUp={onUp}
       style={{
         position: "fixed",
         left: geo.x,
@@ -1052,6 +1104,8 @@ function PlaybackLensPane({
         maxWidth: contentW ?? undefined,
         display: "flex",
         flexDirection: "column",
+        padding: 2,
+        touchAction: "none",
         background: "rgba(10,10,12,0.92)",
         border: "1px solid #555",
         borderRadius: 6,
@@ -1070,6 +1124,7 @@ function PlaybackLensPane({
           display: "flex",
           justifyContent: "space-between",
           alignItems: "center",
+          gap: 8,
           padding: "3px 8px",
           color: "#ddd",
           fontSize: 12,
@@ -1079,6 +1134,18 @@ function PlaybackLensPane({
         <span style={{ fontVariantNumeric: "tabular-nums" }}>
           再生位置レンズ t={currentTime.toFixed(2)}s
         </span>
+        <label
+          onPointerDown={(e) => e.stopPropagation()}
+          style={{ display: "flex", alignItems: "center", gap: 4, cursor: "pointer" }}
+        >
+          <input
+            type="checkbox"
+            checked={swap}
+            onChange={onToggleSwap}
+            style={{ margin: 0, width: 12, height: 12, cursor: "pointer" }}
+          />
+          <span style={{ fontSize: 11, color: "#bbb" }}>色↔位置</span>
+        </label>
       </div>
       <div style={{ flex: 1, overflow: "auto", padding: 8 }}>
         <div ref={innerRef} style={{ display: "flex", gap: 8, width: "max-content" }}>
@@ -1088,14 +1155,22 @@ function PlaybackLensPane({
               placement="inline"
               fillHeight={lensHeight}
               swap={swap}
-              onToggleSwap={onToggleSwap}
+              stripeW={stripeW}
+              onSetStripeW={onSetStripeW}
+              onHoverYRatio={(yr) =>
+                setPaneHoverFreq(
+                  yr == null
+                    ? null
+                    : info.shownSpec!.spec.fminHz * 2 ** ((1 - yr) * info.shownSpec!.spec.octaves),
+                )
+              }
               maxHarmonic={lensMaxHarmonic[info.shownSpec!.spec.id]}
               onSetMaxHarmonic={(n) => onSetMaxHarmonic(info.shownSpec!.spec.id, n)}
               title={`[${track.kind === "video" ? "V" : "A"}] ${track.data.name}`}
               spec={info.shownSpec!.spec}
               audio={info.shownSpec!.audio}
               projT={currentTime}
-              yRatio={hoverFreqHz != null ? freqToYRatio(info.shownSpec!.spec, hoverFreqHz) : null}
+              yRatio={effFreq != null ? freqToYRatio(info.shownSpec!.spec, effFreq) : null}
             />
           ))}
         </div>

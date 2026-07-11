@@ -344,7 +344,9 @@ export type LensHover = {
 };
 
 const LENS_AXIS_W = 58;
-const LENS_STRIPE_W = 16;
+export const LENS_STRIPE_DEFAULT_W = 16;
+export const LENS_STRIPE_MIN_W = 6;
+export const LENS_STRIPE_MAX_W = 80;
 const LENS_LABEL_H = 14;
 
 const NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
@@ -378,6 +380,9 @@ export function HarmonicLens({
   maxHarmonic,
   onSetMaxHarmonic,
   onHeightResize,
+  stripeW = LENS_STRIPE_DEFAULT_W,
+  onSetStripeW,
+  onHoverYRatio,
 }: {
   spec: ApiSpectrogram;
   audio: ApiAudio;
@@ -400,8 +405,16 @@ export function HarmonicLens({
   onSetMaxHarmonic?: (n: number) => void;
   // float で高さを変えるハンドル用 (現在の displayH を渡して新しい高さを返す)
   onHeightResize?: (h: number) => void;
+  // 1 plane 幅 (project 共通)。内側四角形の右端ハンドルで変更する
+  stripeW?: number;
+  onSetStripeW?: (w: number) => void;
+  // 内側 CQT を hover したときの縦位置 (0=上端, 1=下端)。null = leave
+  onHoverYRatio?: (yRatio: number | null) => void;
 }) {
   const heightDrag = useRef<{ sy: number; orig: number } | null>(null);
+  const stripeDrag = useRef<{ sx: number; orig: number; last: number } | null>(null);
+  // ドラッグ中だけ列レイアウトを固定したまま canvas を preview 幅で再描画する
+  const [dragStripeW, setDragStripeW] = useState<number | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const [meta, setMeta] = useState<SpectrogramMeta | null>(null);
   const [tilesVersion, setTilesVersion] = useState(0);
@@ -432,7 +445,10 @@ export function HarmonicLens({
   const numH = maxH;
   const bins = spec.binsPerOctave * spec.octaves;
   const displayH = fillHeight ?? Math.min(320, Math.max(144, bins * 2));
-  const canvasW = LENS_AXIS_W + numH * LENS_STRIPE_W;
+  // 列footprintは commit 済み stripeW で決まる。ドラッグ中の canvas だけ preview 幅で描く
+  const effStripeW = dragStripeW ?? stripeW;
+  const canvasW = LENS_AXIS_W + numH * stripeW;
+  const drawW = LENS_AXIS_W + numH * effStripeW;
   const canvasH = displayH + LENS_LABEL_H;
 
   const dProj = audio.projEndSec - audio.projStartSec;
@@ -453,7 +469,7 @@ export function HarmonicLens({
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas || !meta) return;
-    if (canvas.width !== canvasW) canvas.width = canvasW;
+    if (canvas.width !== drawW) canvas.width = drawW;
     if (canvas.height !== canvasH) canvas.height = canvasH;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
@@ -506,7 +522,7 @@ export function HarmonicLens({
     };
 
     ctx.fillStyle = "#111";
-    ctx.fillRect(0, 0, canvasW, canvasH);
+    ctx.fillRect(0, 0, drawW, canvasH);
 
     // CQT 本体。通常は color=振幅 (harmonic ごとに 1px 列→引き伸ばし)。swap では
     // color=harmonic (固定色)・横方向の bar 長=振幅 にして、振幅を位置で読めるようにする
@@ -514,7 +530,7 @@ export function HarmonicLens({
     const octx = off.getContext("2d");
     if (!octx) return;
     if (swap) {
-      const W = LENS_STRIPE_W;
+      const W = effStripeW;
       off.width = numH * W;
       off.height = bins;
       const img = octx.createImageData(numH * W, bins);
@@ -553,14 +569,14 @@ export function HarmonicLens({
         }
       }
       octx.putImageData(img, 0, 0);
-      ctx.drawImage(off, 0, 0, numH, bins, LENS_AXIS_W, 0, numH * LENS_STRIPE_W, displayH);
+      ctx.drawImage(off, 0, 0, numH, bins, LENS_AXIS_W, 0, numH * effStripeW, displayH);
     }
 
     // 列区切り + オクターブ目盛 + harmonic ラベル
     ctx.strokeStyle = "rgba(0,0,0,0.5)";
     ctx.beginPath();
     for (let hi = 1; hi < numH; hi++) {
-      const x = LENS_AXIS_W + hi * LENS_STRIPE_W + 0.5;
+      const x = LENS_AXIS_W + hi * effStripeW + 0.5;
       ctx.moveTo(x, 0);
       ctx.lineTo(x, displayH);
     }
@@ -575,18 +591,21 @@ export function HarmonicLens({
       const f = spec.fminHz * 2 ** o;
       ctx.beginPath();
       ctx.moveTo(LENS_AXIS_W, y + 0.5);
-      ctx.lineTo(canvasW, y + 0.5);
+      ctx.lineTo(drawW, y + 0.5);
       ctx.stroke();
       ctx.fillText(`${noteName(f)} ${formatHz(f)}`, LENS_AXIS_W - 4, Math.max(6, y));
     }
     ctx.textAlign = "center";
+    // ×n が 1 plane 幅に収まらなくなったら間引く
+    const labelStep = Math.max(1, Math.ceil(ctx.measureText(`×${numH}~`).width / effStripeW));
     for (let hi = 0; hi < numH; hi++) {
+      if (hi % labelStep !== 0) continue;
       // 計算済み倍音は明るく、近似 (非計算 = shift で補間) は暗めで区別する
       const approx = !meta.harmonics.includes(hi + 1);
       ctx.fillStyle = approx ? "#7a7a7a" : "#ccc";
       ctx.fillText(
         `×${hi + 1}${approx ? "~" : ""}`,
-        LENS_AXIS_W + (hi + 0.5) * LENS_STRIPE_W,
+        LENS_AXIS_W + (hi + 0.5) * effStripeW,
         displayH + LENS_LABEL_H / 2 + 1,
       );
     }
@@ -595,7 +614,7 @@ export function HarmonicLens({
       const rowH = displayH / bins;
       const y = displayH * (1 - (binSel + 1) / bins);
       ctx.strokeStyle = "#fff";
-      ctx.strokeRect(LENS_AXIS_W + 0.5, y + 0.5, numH * LENS_STRIPE_W - 1, Math.max(1, rowH));
+      ctx.strokeRect(LENS_AXIS_W + 0.5, y + 0.5, numH * effStripeW - 1, Math.max(1, rowH));
       // 白線の左に 2 段ラベル: 上=step, 下=note + Hz
       const fSel = spec.fminHz * 2 ** (binSel / spec.binsPerOctave);
       const l1 = `${Math.floor(binSel / spec.binsPerOctave)}oct +${binSel % spec.binsPerOctave}/${spec.binsPerOctave}`;
@@ -612,7 +631,7 @@ export function HarmonicLens({
       ctx.fillText(l1, rx, yc - 1);
       ctx.fillText(l2, rx, yc + 8);
     }
-  }, [meta, spec, srcT, binSel, tilesVersion, numH, bins, displayH, canvasW, canvasH, swap, maxH]);
+  }, [meta, spec, srcT, binSel, tilesVersion, numH, bins, displayH, drawW, canvasH, swap, effStripeW]);
 
   const panelW = canvasW + 18;
   const panelH = canvasH + 40;
@@ -710,7 +729,72 @@ export function HarmonicLens({
           t={srcT.toFixed(2)}s
         </div>
       )}
-      <canvas ref={canvasRef} style={{ width: canvasW, height: canvasH, display: "block" }} />
+      <div style={{ position: "relative", width: canvasW, height: canvasH }}>
+        <canvas
+          ref={canvasRef}
+          onPointerMove={
+            onHoverYRatio
+              ? (e) => {
+                  const oy = e.nativeEvent.offsetY;
+                  onHoverYRatio(
+                    oy >= 0 && oy <= displayH ? Math.min(1, Math.max(0, 1 - oy / displayH)) : null,
+                  );
+                }
+              : undefined
+          }
+          onPointerLeave={onHoverYRatio ? () => onHoverYRatio(null) : undefined}
+          style={{
+            width: drawW,
+            height: canvasH,
+            display: "block",
+            position: "absolute",
+            left: 0,
+            top: 0,
+          }}
+        />
+        {onSetStripeW && (placement === "inline" || interactive) && (
+          <div
+            aria-hidden="true"
+            onPointerDown={(e) => {
+              stripeDrag.current = { sx: e.clientX, orig: stripeW, last: stripeW };
+              e.currentTarget.setPointerCapture(e.pointerId);
+              e.preventDefault();
+              e.stopPropagation();
+            }}
+            onPointerMove={(e) => {
+              const d = stripeDrag.current;
+              if (!d) return;
+              const w = Math.round(
+                Math.max(
+                  LENS_STRIPE_MIN_W,
+                  Math.min(LENS_STRIPE_MAX_W, d.orig + (e.clientX - d.sx) / numH),
+                ),
+              );
+              d.last = w;
+              setDragStripeW(w);
+            }}
+            onPointerUp={(e) => {
+              const d = stripeDrag.current;
+              stripeDrag.current = null;
+              try {
+                e.currentTarget.releasePointerCapture(e.pointerId);
+              } catch {}
+              if (d) onSetStripeW(d.last);
+              setDragStripeW(null);
+            }}
+            style={{
+              position: "absolute",
+              left: LENS_AXIS_W + numH * effStripeW - 3,
+              top: 0,
+              width: 7,
+              height: displayH,
+              cursor: "ew-resize",
+              background: dragStripeW != null ? "rgba(120,180,255,0.5)" : "rgba(255,255,255,0.12)",
+              zIndex: 3,
+            }}
+          />
+        )}
+      </div>
       {onHeightResize && interactive && (
         <div
           aria-hidden="true"
