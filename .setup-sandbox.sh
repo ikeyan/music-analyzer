@@ -1,4 +1,4 @@
 #!/usr/bin/env bash
-# 環境setupから呼ばれるファイル名は固定。実体は scripts/setup-sandbox.ts
+# ファイル名は ikeyan/agent-files の setup.sh から呼ばれる規約で固定
 set -euo pipefail
 exec bun "$(dirname -- "$0")/scripts/setup-sandbox.ts"
