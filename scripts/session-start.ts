@@ -2,9 +2,10 @@
 import { $ } from "bun";
 import { existsSync, openSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
-import { tempDir } from "../../app/lib/temp-dir";
-import { CHROME_VERSION, installChrome } from "../../scripts/install-chrome";
-import { installFfmpeg } from "../../scripts/install-ffmpeg";
+import { tempDir } from "../app/lib/temp-dir";
+import { CHROME_VERSION, installChrome } from "./install-chrome";
+import { installDeps } from "./install-deps";
+import { installFfmpeg } from "./install-ffmpeg";
 
 if (process.env.CLAUDE_CODE_REMOTE !== "true") process.exit(0);
 
@@ -54,16 +55,6 @@ const ensureChrome = async () => {
   await installChrome(CHROME_DIR, CHROME_WRAP);
 };
 
-const installDeps = async () => {
-  const cwd = process.env.CLAUDE_PROJECT_DIR!;
-  // Prisma のエンジン取得は proxy 経由の Node https が転送途中で ECONNRESET する。
-  // binaries.prisma.sh は直結が速く確実なのでこのホストだけ proxy を迂回する
-  const noProxy = `binaries.prisma.sh,${process.env.NO_PROXY ?? ""}`;
-  const env = { ...process.env, NO_PROXY: noProxy, no_proxy: noProxy };
-  await $`bun install --frozen-lockfile`.cwd(cwd).env(env);
-  await $`bun run db:generate`.cwd(cwd).env(env);
-};
-
 const pullAgentFiles = async () => {
   if (!existsSync("/root/agent-files")) return;
   await $`git -C /root/agent-files pull --ff-only`;
@@ -75,7 +66,7 @@ const docker = ensureDocker();
 const bun = ensureBunVersion();
 await Promise.all([
   docker.then(() => ensureFfmpeg()),
-  bun.then(() => installDeps()),
+  bun.then(() => installDeps(process.env.CLAUDE_PROJECT_DIR!)),
   ensureChrome(),
   $`git -C ${process.env.CLAUDE_PROJECT_DIR} remote set-head origin -a`,
   pullAgentFiles(),
