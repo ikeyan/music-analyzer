@@ -26,5 +26,5 @@
       "react-dom/*": ["./node_modules/@types/react-dom/*"]
     }
   },
-  "include": ["app", "prisma", "scripts", ".claude/hooks", "vite.config.ts"]
+  "include": ["app", "prisma", "scripts", "vite.config.ts"]
 }
