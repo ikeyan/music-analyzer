@@ -17,12 +17,12 @@ const stageProxyCa = async () => {
   await Bun.write(join(root, "proxy-ca.crt"), ca);
 };
 
-await step("installDeps (bun install / prisma generate)")(() => installDeps(root));
-await step("stage proxy CA (NODE_EXTRA_CA_CERTS)")(stageProxyCa);
+await step`installDeps (bun install / prisma generate)`(() => installDeps(root));
+await step`stage proxy CA (NODE_EXTRA_CA_CERTS)`(stageProxyCa);
 
 // node_modules なしで起動した bun プロセスは bun install 後も bare specifier を
 // 正しく解決できないためサブプロセスで import する
-const REAPER_IMAGE = await step("resolve REAPER_IMAGE")(async () =>
+const REAPER_IMAGE = await step`resolve REAPER_IMAGE`(async () =>
   (
     await $`bun -e ${'console.log((await import("testcontainers/build/reaper/reaper.js")).REAPER_IMAGE)'}`
       .cwd(root)

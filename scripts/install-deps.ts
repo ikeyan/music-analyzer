@@ -27,7 +27,7 @@ const prefetchPrismaEngine = async (root: string) => {
 };
 
 export const installDeps = async (root: string) => {
-  await step("prisma engine prefetch")(() => prefetchPrismaEngine(root));
-  await step("bun install --frozen-lockfile")(() => $`bun install --frozen-lockfile`.cwd(root));
-  await step("bun run db:generate")(() => $`bun run db:generate`.cwd(root));
+  await step`prisma engine prefetch`(() => prefetchPrismaEngine(root));
+  await step`bun install --frozen-lockfile`(() => $`bun install --frozen-lockfile`.cwd(root));
+  await step`bun run db:generate`(() => $`bun run db:generate`.cwd(root));
 };
