@@ -16,7 +16,6 @@ const REAPER_IMAGE = (
     .text()
 ).trim();
 const authentik = join(root, "e2e/authentik");
-
 const results = await Promise.allSettled([
   $`docker pull ${MINIO_IMAGE}`,
   $`docker pull ${REAPER_IMAGE}`,
