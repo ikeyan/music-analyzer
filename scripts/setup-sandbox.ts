@@ -17,12 +17,12 @@ const stageProxyCa = async () => {
   await Bun.write(join(root, "proxy-ca.crt"), ca);
 };
 
-await step("installDeps (bun install / prisma generate)", () => installDeps(root));
-await step("stage proxy CA (NODE_EXTRA_CA_CERTS)", stageProxyCa);
+await step("installDeps (bun install / prisma generate)")(() => installDeps(root));
+await step("stage proxy CA (NODE_EXTRA_CA_CERTS)")(stageProxyCa);
 
 // node_modules なしで起動した bun プロセスは bun install 後も bare specifier を
-// 正しく解決できないことがあるため、サブプロセスで import する
-const REAPER_IMAGE = await step("resolve REAPER_IMAGE", async () =>
+// 正しく解決できないためサブプロセスで import する
+const REAPER_IMAGE = await step("resolve REAPER_IMAGE")(async () =>
   (
     await $`bun -e ${'console.log((await import("testcontainers/build/reaper/reaper.js")).REAPER_IMAGE)'}`
       .cwd(root)
@@ -32,25 +32,22 @@ const REAPER_IMAGE = await step("resolve REAPER_IMAGE", async () =>
 const authentik = join(root, "e2e/authentik");
 
 const steps = [
-  { name: `docker pull ${MINIO_IMAGE}`, run: () => $`docker pull ${MINIO_IMAGE}` },
-  { name: `docker pull ${REAPER_IMAGE}`, run: () => $`docker pull ${REAPER_IMAGE}` },
+  step`docker pull ${MINIO_IMAGE}`(() => $`docker pull ${MINIO_IMAGE}`),
+  step`docker pull ${REAPER_IMAGE}`(() => $`docker pull ${REAPER_IMAGE}`),
   // build-only serviceをpull対象から外さないとimage未公開で失敗する
-  {
-    name: "docker compose pull (authentik)",
-    run: () => $`docker compose --env-file .env.example pull --ignore-buildable`.cwd(authentik),
-  },
-  {
-    name: "docker compose build music-analyzer",
-    run: () => $`docker compose --env-file .env.example build music-analyzer`.cwd(authentik),
-  },
+  step`docker compose pull (authentik)`(() =>
+    $`docker compose --env-file .env.example pull --ignore-buildable`.cwd(authentik),
+  ),
+  step`docker compose build music-analyzer`(() =>
+    $`docker compose --env-file .env.example build music-analyzer`.cwd(authentik),
+  ),
 ];
 
-const results = await Promise.allSettled(steps.map((s) => step(s.name, s.run)));
+const results = await Promise.allSettled(steps);
 const failed = results.flatMap((r, i) =>
-  r.status === "rejected" ? [{ r, name: steps[i].name }] : [],
+  r.status === "rejected" ? [{ name: steps[i].name, reason: r.reason }] : [],
 );
-for (const { r, name } of failed)
-  console.error(`[setup] ✗ ${name} の失敗理由:`, (r as PromiseRejectedResult).reason);
+for (const { name, reason } of failed) console.error(`[setup] ✗ ${name} の失敗理由:`, reason);
 if (failed.length > 0) {
   console.error(`[setup] ${failed.length}/${steps.length} ステップが失敗しました`);
   process.exit(1);
