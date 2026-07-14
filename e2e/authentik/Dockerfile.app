@@ -10,9 +10,12 @@ COPY --from=ffmpeg /ffprobe /usr/local/bin/ffprobe
 WORKDIR /app
 
 # Install deps first for better layer caching.
-COPY package.json bun.lock ./
+# proxy-ca.crt は sandbox の MITM proxy CA (scripts/setup-sandbox.ts が stage する)。
+# glob なので未 stage 時はマッチせず素通り (CI や proxy 無し環境では不要)。
+COPY package.json bun.lock proxy-ca.crt* ./
 COPY patches/ ./patches/
 RUN --mount=type=cache,target=/root/.bun/install/cache,sharing=locked \
+    if [ -f proxy-ca.crt ]; then export NODE_EXTRA_CA_CERTS="$PWD/proxy-ca.crt"; fi; \
     bun install --frozen-lockfile
 
 COPY prisma ./prisma
