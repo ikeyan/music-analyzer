@@ -11,12 +11,12 @@ WORKDIR /app
 
 # Install deps first for better layer caching.
 # proxy-ca.crt は sandbox の MITM proxy CA (scripts/setup-sandbox.ts が stage する)。
-# glob なので未 stage 時はマッチせず素通り (CI や proxy 無し環境では不要)。
+# glob なので CI 等の未 stage 時はマッチせず、NODE_EXTRA_CA_CERTS も不在ファイルを
+# 指すが bun は built-in CA にフォールバックする。
 COPY package.json bun.lock proxy-ca.crt* ./
 COPY patches/ ./patches/
 RUN --mount=type=cache,target=/root/.bun/install/cache,sharing=locked \
-    if [ -f proxy-ca.crt ]; then export NODE_EXTRA_CA_CERTS="$PWD/proxy-ca.crt"; fi; \
-    bun install --frozen-lockfile
+    NODE_EXTRA_CA_CERTS="$PWD/proxy-ca.crt" bun install --frozen-lockfile
 
 COPY prisma ./prisma
 COPY prisma.config.ts tsconfig.json vite.config.ts .oxlintrc.json .oxfmtrc.json ./
