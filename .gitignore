@@ -152,3 +152,5 @@ dist/
 # agents
 .claude/settings.local.json
 .claude/worktrees/
+# sandbox MITM proxy CA (scripts/setup-sandbox.ts が stage する build context 用)
+/proxy-ca.crt
