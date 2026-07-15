@@ -1,11 +1,59 @@
 #!/usr/bin/env bun
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { spawn } from "node:child_process";
 import { $ } from "bun";
 import { MINIO_IMAGE } from "../app/test-images";
 import { installDeps } from "./install-deps";
 import { step } from "./log-step";
 
 const root = join(import.meta.dir, "..");
+
+const commandExists = async (command: string) => {
+  const result = await $`which ${command}`.quiet().nothrow();
+  return result.exitCode === 0;
+};
+
+const waitForDockerApi = async (socket: string, attempts = 20) => {
+  for (let i = 0; i < attempts; i++) {
+    const result = await $`curl --unix-socket ${socket} -fsS http://d/_ping`.quiet().nothrow();
+    if (result.exitCode === 0) return true;
+    await Bun.sleep(250);
+  }
+  return false;
+};
+
+const ensureDockerApi = async () => {
+  if (!(await commandExists("docker"))) return;
+
+  const dockerVersion = await $`docker --version`
+    .quiet()
+    .text()
+    .catch(() => "");
+  const usesPodman = dockerVersion.toLowerCase().includes("podman");
+  if (!usesPodman) return;
+  if (!(await commandExists("podman"))) return;
+
+  const runtimeDir = process.env.XDG_RUNTIME_DIR ?? `/run/user/${process.getuid?.() ?? 1000}`;
+  const socket = join(runtimeDir, "podman/podman.sock");
+  const env = { ...process.env, DOCKER_HOST: `unix://${socket}` };
+
+  await $`mkdir -p ${dirname(socket)}`.quiet();
+  await $`systemctl --user start podman.socket`.quiet().nothrow();
+  if (!(await waitForDockerApi(socket, 4))) {
+    spawn("podman", ["system", "service", "--time=0", `unix://${socket}`], {
+      detached: true,
+      stdio: "ignore",
+      env,
+    }).unref();
+  }
+
+  if (!(await waitForDockerApi(socket))) {
+    throw new Error(
+      `Docker Compose requires a Docker API socket, but ${env.DOCKER_HOST} did not become ready`,
+    );
+  }
+  process.env.DOCKER_HOST = env.DOCKER_HOST;
+};
 
 // sandbox の MITM proxy CA を build context に置き、Dockerfile.app の bun install が
 // TLS 検証に使えるようにする。NODE_EXTRA_CA_CERTS が未設定/読めなければ空ファイル
@@ -19,6 +67,7 @@ const stageProxyCa = async () => {
 
 await step`installDeps (bun install / prisma generate)`(() => installDeps(root));
 await step`stage proxy CA (NODE_EXTRA_CA_CERTS)`(stageProxyCa);
+await step`ensure docker API`(ensureDockerApi);
 
 // node_modules なしで起動した bun プロセスは bun install 後も bare specifier を
 // 正しく解決できないためサブプロセスで import する
