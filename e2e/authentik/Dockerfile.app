@@ -15,9 +15,6 @@ WORKDIR /app
 # 指すが bun は built-in CA にフォールバックする。
 COPY package.json bun.lock proxy-ca.crt* ./
 COPY patches/ ./patches/
-# sandbox MITM proxy
-ARG HTTPS_PROXY
-ARG NO_PROXY
 RUN --mount=type=cache,target=/root/.bun/install/cache,sharing=locked \
     NODE_EXTRA_CA_CERTS="$PWD/proxy-ca.crt" bun install --frozen-lockfile
 
