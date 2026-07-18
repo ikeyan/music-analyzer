@@ -109,6 +109,10 @@ services:
     build:
       context: ../..
       dockerfile: e2e/authentik/Dockerfile.app
+      # 環境変数があれば dockerfile に渡す
+      args:
+        HTTPS_PROXY:
+        NO_PROXY:
     environment:
       DATABASE_URL: file:/data/dev.db
       AUTH_PROXY_SECRET: ${AUTH_PROXY_SECRET:?proxy secret required}
