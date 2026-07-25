@@ -552,7 +552,14 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
     return { ok: true };
   }
 
-  // Alt+クリック位置の (時刻, 周波数) を f0 ヒントに減衰振動子フィットを実行する
+  // Alt+クリック位置の (時刻, 周波数) を f0 ヒントに減衰振動子フィットを実行する。
+  // token が最新のときだけ応答を反映する (連打の stale 応答と閉じた後の再表示を防ぐ。
+  // モーダルを閉じたら token を進めて飛行中の応答を無効化する)
+  const noteReqToken = useRef(0);
+  function closeNoteModal(): void {
+    noteReqToken.current++;
+    setNoteModal(null);
+  }
   async function analyzeNoteAt(
     audio: AudioItem,
     spec: ApiSpectrogram,
@@ -564,28 +571,42 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
     if (dProj === 0 || dSrc === 0) return;
     const f0Hz = Math.min(5000, Math.max(20, spec.fminHz * 2 ** ((1 - yRatio) * spec.octaves)));
     const srcT = audio.srcStartSec + ((projT - audio.projStartSec) / dProj) * dSrc;
-    const startSec = Math.max(0, srcT - 0.1);
+    // 低 f0 の pre-onset ノイズ床推定に ~0.2s 超のプリロールが要る
+    const startSec = Math.max(0, srcT - 0.35);
     const durationSec = Math.min(4, audio.durationSec - startSec);
     if (durationSec < 0.2) {
+      noteReqToken.current++;
       setNoteModal({ name: audio.name, state: "error", message: "解析区間が短すぎます" });
       return;
     }
+    const token = ++noteReqToken.current;
     setNoteModal({ name: audio.name, state: "loading" });
-    const res = await apiClient.projects[":id"].audios[":audioId"]["analyze-note"].$post({
-      param: { id: data.id, audioId: audio.id },
-      json: { startSec, durationSec, f0Hz, maxPartials: 12 },
-    });
-    if (!res.ok) {
-      const body = (await res.json().catch(() => ({}))) as { error?: string };
+    try {
+      const res = await apiClient.projects[":id"].audios[":audioId"]["analyze-note"].$post({
+        param: { id: data.id, audioId: audio.id },
+        json: { startSec, durationSec, f0Hz, maxPartials: 12 },
+      });
+      if (!res.ok) {
+        const body = (await res.json().catch(() => ({}))) as { error?: string };
+        if (token !== noteReqToken.current) return;
+        setNoteModal({
+          name: audio.name,
+          state: "error",
+          message: `単音解析失敗 (HTTP ${res.status}): ${body.error ?? "(no message)"}`,
+        });
+        return;
+      }
+      const body = await res.json();
+      if (token !== noteReqToken.current) return;
+      setNoteModal({ name: audio.name, state: "ready", analysis: body.analysis });
+    } catch (err) {
+      if (token !== noteReqToken.current) return;
       setNoteModal({
         name: audio.name,
         state: "error",
-        message: `単音解析失敗 (HTTP ${res.status}): ${body.error ?? "(no message)"}`,
+        message: `単音解析失敗: ${err instanceof Error ? err.message : String(err)}`,
       });
-      return;
     }
-    const body = await res.json();
-    setNoteModal({ name: audio.name, state: "ready", analysis: body.analysis });
   }
 
   const editingTrack = useMemo(
@@ -962,7 +983,7 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
         </ModalShell>
       )}
       {noteModal && (
-        <ModalShell title={`単音解析: ${noteModal.name}`} onClose={() => setNoteModal(null)}>
+        <ModalShell title={`単音解析: ${noteModal.name}`} onClose={closeNoteModal}>
           {noteModal.state === "loading" && <p style={{ color: "#666" }}>解析中…</p>}
           {noteModal.state === "error" && (
             <p

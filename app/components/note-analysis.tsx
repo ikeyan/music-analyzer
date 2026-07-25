@@ -199,7 +199,8 @@ export function NoteAnalysisPanel({ analysis }: { analysis: NoteAnalysis }) {
               </td>
               <td style={cellStyle}>{p.dbPerSec === null ? "—" : p.dbPerSec.toFixed(1)}</td>
               <td style={cellStyle}>{p.tau60Sec === null ? "—" : `${p.tau60Sec.toFixed(2)}s`}</td>
-              <td style={cellStyle}>{p.r2 === null ? "—" : p.r2.toFixed(2)}</td>
+              {/* Theil-Sen は LS 最適でないため r2 は負になり得る。負値は無意味なので伏せる */}
+              <td style={cellStyle}>{p.r2 === null || p.r2 < 0 ? "—" : p.r2.toFixed(2)}</td>
               <td style={cellStyle}>{p.snrDb.toFixed(0)}dB</td>
               <td style={cellStyle}>
                 {p.beat === null
