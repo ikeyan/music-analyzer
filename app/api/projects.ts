@@ -1,12 +1,14 @@
 import { vValidator } from "@hono/valibot-validator";
 import { Effect, Either, pipe } from "effect";
 import { Hono } from "hono";
+import { join } from "node:path";
 import * as v from "valibot";
 import { requireUser } from "../lib/auth";
 import { leftErr, provideEitherJson } from "../lib/either-json";
 import { describeError } from "../lib/error";
-import { MAX_PROJECT_TIMING_SEC, MAX_UPLOAD_BYTES } from "../lib/ffmpeg";
+import { MAX_PROJECT_TIMING_SEC, MAX_UPLOAD_BYTES, decodeAudioPcm } from "../lib/ffmpeg";
 import { eagerCleanupAndUnmark, markPrefixForDeletion } from "../lib/gc";
+import { type NoteAnalysis, analyzeNote } from "../lib/note-analysis";
 import { prisma } from "../lib/prisma";
 import { withSlotRetry } from "../lib/prisma-retry";
 import {
@@ -22,6 +24,7 @@ import {
   MAX_SPECTROGRAM_FMAX_HZ,
   MAX_SPECTROGRAM_HARMONICS,
   MIN_SPECTROGRAM_FMIN_HZ,
+  analysisSampleRate,
   parseHarmonics,
 } from "../lib/spectrogram";
 import {
@@ -37,6 +40,7 @@ import {
   videoPrefix,
 } from "../lib/storage";
 import { TASK_GRACE_MS, enqueueTask } from "../lib/task-runner";
+import { tempDir } from "../lib/temp-dir";
 import {
   type ApiAudio,
   type ApiProject,
@@ -131,6 +135,13 @@ const createSpectrogramSchema = v.pipe(
     `fminHz * 2^octaves must be <= ${MAX_SPECTROGRAM_FMAX_HZ}`,
   ),
 );
+
+const analyzeNoteSchema = v.object({
+  startSec: v.pipe(v.number(), v.finite(), v.minValue(0)),
+  durationSec: v.pipe(v.number(), v.finite(), v.minValue(0.2), v.maxValue(20)),
+  f0Hz: v.pipe(v.number(), v.finite(), v.minValue(20), v.maxValue(5000)),
+  maxPartials: v.optional(v.pipe(v.number(), v.integer(), v.minValue(1), v.maxValue(24))),
+});
 
 // 反転は projStart > projEnd で表現するため proj 側に大小制約は置かない。
 // src は正方向のみで、durationSec 超過は row 取得後に handler 側で検証する
@@ -1094,6 +1105,62 @@ export const projects = new Hono()
       Effect.runPromise,
     );
   })
+
+  // 単音のモード解析 (減衰振動子フィット)。選択区間を region デコードして同期解析、DB 書き込みなし
+  .post(
+    "/:id/audios/:audioId/analyze-note",
+    vValidator("param", audioIdParamSchema),
+    vValidator("json", analyzeNoteSchema),
+    (c) => {
+      const { id, audioId } = c.req.valid("param");
+      const body = c.req.valid("json");
+      const maxPartials = body.maxPartials ?? 12;
+      return pipe(
+        requireProject(c.var.user.id, id),
+        Effect.flatMap((project) => requireAudio(project.id, audioId)),
+        Effect.flatMap((audio) =>
+          body.startSec >= audio.durationSec
+            ? leftErr({
+                status: 400,
+                error: `startSec must be < durationSec (${audio.durationSec})`,
+              })
+            : Either.right(audio),
+        ),
+        Effect.flatMap((audio) =>
+          Effect.promise(
+            async (): Promise<
+              Either.Either<NoteAnalysis, { status: 400 | 500; error: string }>
+            > => {
+              const sampleRate = analysisSampleRate(body.f0Hz * (maxPartials + 1));
+              await using td = await tempDir("note-analysis");
+              const inputPath = join(td.path, "audio.m4a");
+              await Bun.write(inputPath, getS3().file(audio.audioKey));
+              let samples: Float32Array<ArrayBuffer>;
+              try {
+                samples = await decodeAudioPcm(inputPath, sampleRate, undefined, {
+                  startSec: body.startSec,
+                  durationSec: body.durationSec,
+                });
+              } catch (err) {
+                return Either.left({ status: 500, error: describeError(err) });
+              }
+              if (samples.length === 0) {
+                return Either.left({ status: 400, error: "decoded audio is empty" });
+              }
+              return Either.right(
+                analyzeNote(samples, sampleRate, { f0Hz: body.f0Hz, maxPartials }),
+              );
+            },
+          ),
+        ),
+        Effect.flatMap((r) => r),
+        Effect.map((analysis): { analysis: NoteAnalysis } => ({ analysis })),
+        Effect.either,
+        Effect.map((r) => c.var.eitherJson(r)),
+        Effect.runPromise,
+      );
+    },
+  )
 
   .get("/:id/audios/:audioId/spectrograms", vValidator("param", audioIdParamSchema), (c) => {
     const { id, audioId } = c.req.valid("param");

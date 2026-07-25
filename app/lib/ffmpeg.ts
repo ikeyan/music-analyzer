@@ -199,11 +199,13 @@ export async function extractAudio(
 
 export const transcodeAudio = extractAudio;
 
-// mono f32le PCM へデコード (CQT 解析用)
+// mono f32le PCM へデコード (CQT 解析用)。region は -i 前の -ss/-t による fast seek
+// (AAC パケット粒度 ~21ms の誤差は許容)
 export async function decodeAudioPcm(
   input: string,
   sampleRate: number,
   signal?: AbortSignal,
+  region?: { startSec: number; durationSec: number },
 ): Promise<Float32Array<ArrayBuffer>> {
   if (signal?.aborted) throw new Error("ffmpeg aborted before start");
   const proc = Bun.spawn(
@@ -212,6 +214,7 @@ export async function decodeAudioPcm(
       "-hide_banner",
       "-loglevel",
       "error",
+      ...(region ? ["-ss", String(region.startSec), "-t", String(region.durationSec)] : []),
       "-i",
       input,
       "-vn",
