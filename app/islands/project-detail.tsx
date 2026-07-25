@@ -17,6 +17,7 @@ import type {
   ApiThumbnail,
   ApiVideo,
 } from "../api/types";
+import { NoteAnalysisPanel } from "../components/note-analysis";
 import {
   HarmonicLens,
   LENS_STRIPE_DEFAULT_W,
@@ -28,6 +29,7 @@ import {
   SpectrogramStrip,
 } from "../components/spectrogram";
 import { apiClient } from "../lib/api-client";
+import type { NoteAnalysis } from "../lib/note-analysis";
 import { chunkedUpload } from "../lib/chunked-upload";
 import { loadLocal, saveLocal } from "../lib/local-store";
 
@@ -41,6 +43,10 @@ const TASK_POLL_INTERVAL_MS = 1000;
 
 type Track = { kind: "video"; data: VideoItem } | { kind: "audio"; data: AudioItem };
 type ShownSpec = { spec: ApiSpectrogram; mode: string; audio: AudioItem };
+type NoteModalState =
+  | { name: string; state: "loading" }
+  | { name: string; state: "error"; message: string }
+  | { name: string; state: "ready"; analysis: NoteAnalysis };
 
 // タイトル + 操作ボタンは行左上に sticky で重ね (縦積み)、横スクロールでも画面内に残す。
 // 緑の clip 帯は info とサムネイルだけ持たせて低く保つ
@@ -78,6 +84,8 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
   const [specViews, setSpecViews] = useState<Record<string, SpectrogramSelection | undefined>>({});
   // harmonic CQT lens: spectrogram 表示中の audio 行を hover している間だけ出す
   const [lens, setLens] = useState<(LensHover & { audioId: string }) | null>(null);
+  // 単音解析 (Alt+クリック) の結果モーダル
+  const [noteModal, setNoteModal] = useState<NoteModalState | null>(null);
   // 再生位置レンズ: ON の間は hover ではなく再生ヘッド時刻で各表示行にレンズを出す
   const [playbackLens, setPlaybackLens] = useState(false);
   // 再生中に再生ヘッドを画面内に保つよう横スクロールを追従させる
@@ -544,6 +552,42 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
     return { ok: true };
   }
 
+  // Alt+クリック位置の (時刻, 周波数) を f0 ヒントに減衰振動子フィットを実行する
+  async function analyzeNoteAt(
+    audio: AudioItem,
+    spec: ApiSpectrogram,
+    projT: number,
+    yRatio: number,
+  ): Promise<void> {
+    const dProj = audio.projEndSec - audio.projStartSec;
+    const dSrc = audio.srcEndSec - audio.srcStartSec;
+    if (dProj === 0 || dSrc === 0) return;
+    const f0Hz = Math.min(5000, Math.max(20, spec.fminHz * 2 ** ((1 - yRatio) * spec.octaves)));
+    const srcT = audio.srcStartSec + ((projT - audio.projStartSec) / dProj) * dSrc;
+    const startSec = Math.max(0, srcT - 0.1);
+    const durationSec = Math.min(4, audio.durationSec - startSec);
+    if (durationSec < 0.2) {
+      setNoteModal({ name: audio.name, state: "error", message: "解析区間が短すぎます" });
+      return;
+    }
+    setNoteModal({ name: audio.name, state: "loading" });
+    const res = await apiClient.projects[":id"].audios[":audioId"]["analyze-note"].$post({
+      param: { id: data.id, audioId: audio.id },
+      json: { startSec, durationSec, f0Hz, maxPartials: 12 },
+    });
+    if (!res.ok) {
+      const body = (await res.json().catch(() => ({}))) as { error?: string };
+      setNoteModal({
+        name: audio.name,
+        state: "error",
+        message: `単音解析失敗 (HTTP ${res.status}): ${body.error ?? "(no message)"}`,
+      });
+      return;
+    }
+    const body = await res.json();
+    setNoteModal({ name: audio.name, state: "ready", analysis: body.analysis });
+  }
+
   const editingTrack = useMemo(
     () =>
       editing ? tracks.find((t) => t.kind === editing.kind && t.data.id === editing.id) : null,
@@ -835,6 +879,12 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
                         }
                       : undefined
                   }
+                  onNoteClick={
+                    shown
+                      ? (projT, yRatio) =>
+                          void analyzeNoteAt(shown.audio, shown.spec, projT, yRatio)
+                      : undefined
+                  }
                   lensProjT={
                     shown
                       ? playbackLens
@@ -909,6 +959,29 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
             onCreate={(p) => createSpectrogram(specDialogAudio.id, p)}
             onDelete={(specId) => deleteSpectrogram(specDialogAudio.id, specId)}
           />
+        </ModalShell>
+      )}
+      {noteModal && (
+        <ModalShell title={`単音解析: ${noteModal.name}`} onClose={() => setNoteModal(null)}>
+          {noteModal.state === "loading" && <p style={{ color: "#666" }}>解析中…</p>}
+          {noteModal.state === "error" && (
+            <p
+              role="alert"
+              style={{
+                color: "crimson",
+                background: "#fff5f5",
+                border: "1px solid crimson",
+                padding: "0.4rem 0.6rem",
+                borderRadius: 4,
+                margin: "0.5rem 0",
+                fontSize: 13,
+                whiteSpace: "pre-wrap",
+              }}
+            >
+              {noteModal.message}
+            </p>
+          )}
+          {noteModal.state === "ready" && <NoteAnalysisPanel analysis={noteModal.analysis} />}
         </ModalShell>
       )}
       {!playbackLens && lens && lensTarget && (
@@ -1358,6 +1431,7 @@ function TrackRow({
   bandHeight,
   onBandResize,
   onLensHover,
+  onNoteClick,
   lensProjT,
   attachRef,
   spectrogram,
@@ -1384,6 +1458,7 @@ function TrackRow({
   bandHeight: number;
   onBandResize?: (h: number) => void;
   onLensHover?: (h: LensHover | null) => void;
+  onNoteClick?: (projT: number, yRatio: number) => void;
   lensProjT?: number | null;
   attachRef: (el: HTMLMediaElement | null) => void;
   spectrogram?: ReactNode;
@@ -1415,10 +1490,18 @@ function TrackRow({
       <button
         type="button"
         aria-label={`${item.name} を選択してシーク`}
+        title={onNoteClick ? "Alt+クリックで単音解析" : undefined}
         onClick={(e) => {
           const parent = e.currentTarget.parentElement as HTMLDivElement;
           const bounds = parent.getBoundingClientRect();
           const x = e.clientX - bounds.left + parent.scrollLeft;
+          if (e.altKey && onNoteClick) {
+            const yIn = e.clientY - bounds.top - (TRACK_HEIGHT + 2);
+            if (yIn >= 0 && yIn < bandHeight) {
+              onNoteClick(x / pxPerSec, yIn / bandHeight);
+              return;
+            }
+          }
           onSeek(x / pxPerSec);
           // ソロ再生中に別 track をクリックしたら solo 対象をその track に入れ替える
           if (soloActive && !soloed) onSolo();

@@ -109,7 +109,7 @@ const COLORMAP: Uint8Array = (() => {
 })();
 
 // swap 表示 (color=harmonic, 横位置=振幅) で harmonic ごとに割り当てる固定色
-const HARMONIC_RGB: [number, number, number][] = [
+export const HARMONIC_RGB: [number, number, number][] = [
   [255, 255, 255],
   [56, 189, 248],
   [250, 204, 21],
@@ -351,13 +351,13 @@ const LENS_LABEL_H = 14;
 
 const NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
 
-function noteName(freq: number): string {
+export function noteName(freq: number): string {
   const midi = Math.round(69 + 12 * Math.log2(freq / 440));
   if (!Number.isFinite(midi) || midi < 0 || midi > 127) return "";
   return `${NOTE_NAMES[midi % 12]}${Math.floor(midi / 12) - 1}`;
 }
 
-function formatHz(freq: number): string {
+export function formatHz(freq: number): string {
   return freq >= 1000 ? `${(freq / 1000).toFixed(1)}k` : `${Math.round(freq)}`;
 }
 
