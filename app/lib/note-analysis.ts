@@ -65,8 +65,8 @@ export function extractComplexEnvelope(
       accRe += kr[t]! * s;
       accIm += ki[t]! * s;
     }
-    // カーネル位相は窓内 tap 基準なのでフレーム間で搬送波位相が残る。窓中心の搬送波位相で
-    // 回転して真のベースバンド (位相増分 = 周波数差) に落とす。cycles は mod 1 で精度を保つ
+    // 窓内 tap 基準のカーネル位相を窓中心の搬送波位相で回転してベースバンド化
+    // (位相増分 = 周波数差になる)
     const cycles = (freqHz * i * hop) / sampleRate;
     const ang = -2 * Math.PI * (cycles - Math.floor(cycles));
     const cs = Math.cos(ang);
@@ -78,7 +78,7 @@ export function extractComplexEnvelope(
 }
 
 // 隣接フレーム間の位相増分から精密周波数。S = Σ z[i+1]·conj(z[i]) の複素和が
-// 振幅²重み付き平均を内包する
+// 振幅²重み付き平均を内包する。測定範囲は carrier ± frameRate/2 (超えると折り返す)
 export function instantFreqHz(
   env: ComplexEnvelope,
   hop: number,
@@ -268,12 +268,13 @@ export function analyzeNote(
     const fk = instantFreqHz(env, hop, sampleRate, fPred);
     tracked.push({ k, freqHz: fk, amp, db });
     // (fk/(k·f0))² - 1 = B·k² を振幅²重み付き最小二乗で逐次更新。
-    // 窓の主弁を外れた実測値 (別 partial / ノイズ由来) は除外する
+    // 窓の主弁を外れた実測値 (別 partial / ノイズ由来) と、instantFreqHz の
+    // 測定範囲 ±frameRate/2 の折り返し境界に近い実測値は除外する
     const provisionalSnr = toDb(peakAmp) - percentile(db, 0.1);
     if (
       k >= 2 &&
       peakAmp > 0 &&
-      Math.abs(fk - fPred) < 0.25 * f0 &&
+      Math.abs(fk - fPred) < Math.min(0.25 * f0, 0.4 * (frameRate / 2)) &&
       provisionalSnr >= B_FIT_MIN_SNR_DB
     ) {
       const y = (fk / (k * f0)) ** 2 - 1;
