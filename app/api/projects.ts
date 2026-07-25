@@ -1,7 +1,6 @@
 import { vValidator } from "@hono/valibot-validator";
 import { Effect, Either, pipe } from "effect";
 import { Hono } from "hono";
-import { join } from "node:path";
 import * as v from "valibot";
 import { requireUser } from "../lib/auth";
 import { leftErr, provideEitherJson } from "../lib/either-json";
@@ -40,7 +39,6 @@ import {
   videoPrefix,
 } from "../lib/storage";
 import { TASK_GRACE_MS, enqueueTask } from "../lib/task-runner";
-import { tempDir } from "../lib/temp-dir";
 import {
   type ApiAudio,
   type ApiProject,
@@ -1132,12 +1130,12 @@ export const projects = new Hono()
               Either.Either<NoteAnalysis, { status: 400 | 500; error: string }>
             > => {
               const sampleRate = analysisSampleRate(body.f0Hz * (maxPartials + 1));
-              await using td = await tempDir("note-analysis");
-              const inputPath = join(td.path, "audio.m4a");
-              await Bun.write(inputPath, getS3().file(audio.audioKey));
+              // 全量ダウンロードせず presigned URL を ffmpeg に直接渡す
+              // (-i 前の -ss fast seek が HTTP range で効く)
+              const inputUrl = getS3().presign(audio.audioKey, { expiresIn: 300, method: "GET" });
               let samples: Float32Array<ArrayBuffer>;
               try {
-                samples = await decodeAudioPcm(inputPath, sampleRate, undefined, {
+                samples = await decodeAudioPcm(inputUrl, sampleRate, undefined, {
                   startSec: body.startSec,
                   durationSec: body.durationSec,
                 });
