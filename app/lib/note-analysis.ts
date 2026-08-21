@@ -204,6 +204,10 @@ export type PartialFit = {
   interceptDb: number | null;
   /** dbPerSec >= -1e-6 なら null */
   tau60Sec: number | null;
+  /** この partial が実際にフィットした区間 (領域先頭基準)。フィット不能なら null。
+   * NoteAnalysis.fitStartSec は全 partial 共通の候補開始 (onset + 半窓) で別物 */
+  fitStartSec: number | null;
+  fitEndSec: number | null;
   r2: number | null;
   snrDb: number;
   /** 尾部床判定で持続背景と分離不能 (同一周波数の衝突)。フィットしない */
@@ -267,8 +271,26 @@ const WINDOW_PERIODS_DEFAULT = 4;
 /** peakDb − 尾部床 がこれ未満なら持続背景との衝突とみなしフィットしない
  * (実音源の実測でベース衝突 partial は 0〜3dB、フィット可能 partial は 5dB 以上に分離する) */
 const COLLIDE_MIN_DB = 4;
-/** 尾部床あり時の点フィルタ余裕 (実音源で検証済みの experiment3 と同値) */
+/** 尾部床あり時の点フィルタ余裕 */
 const FIT_TAIL_MARGIN_DB = 3;
+
+const TAIL_MAX_CHUNKS = 4;
+const TAIL_CHUNK_MIN_FRAMES = 12;
+
+function tailFloor(tail: number[]): number | null {
+  if (tail.length === 0) return null;
+  const chunks = Math.max(
+    1,
+    Math.min(TAIL_MAX_CHUNKS, Math.floor(tail.length / TAIL_CHUNK_MIN_FRAMES)),
+  );
+  const size = Math.ceil(tail.length / chunks);
+  let floor = Number.POSITIVE_INFINITY;
+  for (let c = 0; c < chunks; c++) {
+    const part = tail.slice(c * size, Math.min(tail.length, (c + 1) * size));
+    if (part.length > 0) floor = Math.min(floor, median(part));
+  }
+  return floor;
+}
 
 function median3(xs: number[]): number[] {
   if (xs.length < 3) return xs.slice();
@@ -404,7 +426,9 @@ export function analyzeNote(
     tracked.push({ k, fPred, fkFull: fk, envs, db });
     // (fk/(k·f0))² - 1 = B·k² を振幅²重み付き最小二乗で逐次更新。
     // 窓の主弁を外れた実測値 (別 partial / ノイズ由来) と、instantFreqHz の
-    // 測定範囲 ±frameRate/2 の折り返し境界に近い実測値は除外する
+    // 測定範囲 ±frameRate/2 の折り返し境界に近い実測値は除外する。
+    // fk は全域測定なので領域内の別の音に引かれうるが、onset 確定前に
+    // B の逐次更新 (fPred 計算) が必要なため上記 guard で弾くに留める
     const provisionalSnr = toDb(peakAmp) - percentile(db, 0.1);
     if (
       k >= 2 &&
@@ -452,10 +476,11 @@ export function analyzeNote(
     const peakDb = noteWin.length > 0 ? Math.max(...noteWin) : Math.max(...db);
     const freqHz =
       freqHi - freqLo >= 3 ? freqOverWindow(envs, freqLo, freqHi, hop, sampleRate, fPred) : fkFull;
-    // 尾部床: フィット上限以降の中央値 (持続背景のレベル)。ピークが床から立たない
-    // partial は衝突 = 分離不能としてフィットしない
+    // 尾部床: フィット上限以降のチャンク median の最小値 (持続背景のレベル)。ピークが
+    // 床から立たない partial は衝突 = 分離不能としてフィットしない。全体 median だと
+    // 尾部の同一周波数の後続音 (減衰して消える) まで床に数えて誤 collided になる
     const tail = fitEndCapFrame + 1 < frames ? db.slice(fitEndCapFrame + 1) : [];
-    const tailFloorDb = tail.length > 0 ? median(tail) : null;
+    const tailFloorDb = tailFloor(tail);
     const floorDb = tailFloorDb != null ? Math.max(noiseDb, tailFloorDb) : noiseDb;
     const collided = tailFloorDb != null && peakDb - tailFloorDb < COLLIDE_MIN_DB;
     const ts: number[] = [];
@@ -515,6 +540,8 @@ export function analyzeNote(
       dbPerSec: fit ? fit.dbPerSec : null,
       interceptDb: fit ? fit.interceptDb : null,
       tau60Sec: fit && fit.dbPerSec < -1e-6 ? 60 / -fit.dbPerSec : null,
+      fitStartSec: fit ? ts[0]! : null,
+      fitEndSec: fit ? ts[ts.length - 1]! : null,
       r2: fit ? fit.r2 : null,
       snrDb: peakDb - noiseDb,
       collided,

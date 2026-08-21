@@ -9,7 +9,6 @@ const PAD_R = 8;
 const PAD_T = 8;
 const PAD_B = 18;
 const LOW_SNR_DB = 10;
-const FIT_SNR_MARGIN_DB = 6;
 
 function partialColor(k: number): string {
   const [r, g, b] = HARMONIC_RGB[(k - 1) % HARMONIC_RGB.length]!;
@@ -27,21 +26,6 @@ function isWeak(p: PartialFit): boolean {
 
 /** グリッドスナップ設定 (EDO + 基準周波数)。step 表示に使う */
 export type NoteGrid = { edo: number; baseHz: number };
-
-// フィット区間の終端をエンベロープから復元する (noiseDb = peakDb - snrDb、
-// ピーク保存間引きなので peakDb は間引き後 max と近い)。fitEndSec 指定時はそこで cap
-function fitEndSec(p: PartialFit, analysis: NoteAnalysis): number {
-  const cap = analysis.params.fitEndSec ?? Number.POSITIVE_INFINITY;
-  const peakDb = Math.max(...p.envelopeDb);
-  const noiseDb = peakDb - p.snrDb;
-  const dt = analysis.envStride / analysis.frameRate;
-  for (let i = p.envelopeDb.length - 1; i >= 0; i--) {
-    if (p.envelopeDb[i]! > noiseDb + FIT_SNR_MARGIN_DB) {
-      return Math.min((i + 1) * dt, cap);
-    }
-  }
-  return Math.min(analysis.fitStartSec, cap);
-}
 
 // partial ごとのエンベロープ (実線) + フィット直線 (破線) を重ね描きし、
 // フィットの妥当性を目視検証するための canvas プロット
@@ -108,9 +92,14 @@ function EnvelopePlot({ analysis }: { analysis: NoteAnalysis }) {
       }
       ctx.stroke();
 
-      if (p.dbPerSec !== null && p.interceptDb !== null) {
-        const t0 = analysis.fitStartSec;
-        const t1 = fitEndSec(p, analysis);
+      if (
+        p.dbPerSec !== null &&
+        p.interceptDb !== null &&
+        p.fitStartSec !== null &&
+        p.fitEndSec !== null
+      ) {
+        const t0 = p.fitStartSec;
+        const t1 = p.fitEndSec;
         ctx.setLineDash([5, 4]);
         ctx.beginPath();
         ctx.moveTo(x(t0), y(Math.max(p.interceptDb + p.dbPerSec * t0, dbMin)));

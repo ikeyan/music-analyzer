@@ -258,6 +258,44 @@ describe("analyzeNote options", () => {
     );
   });
 
+  // 性質: フィット上限後に同一周波数のより大きい減衰音 (再打鍵) があっても、尾部床は
+  // チャンク最小 median なので誤 collided にならず dbPerSec を ±20% で復元する
+  // 入力: f∈[300,600], dbPerSec∈[-40,-25], 後続音の振幅∈[2,4]
+  it("fitEnd 後の同一周波数の減衰音では collided にならない", () => {
+    fc.assert(
+      fc.property(
+        fc.double({ min: 300, max: 600, noNaN: true }),
+        fc.double({ min: -40, max: -25, noNaN: true }),
+        fc.double({ min: 2, max: 4, noNaN: true }),
+        (f, dps, amp2) => {
+          const fs = 8000;
+          const x = synth(
+            [
+              { freqHz: f, amp: 1, dbPerSec: dps, phase: 0.8 },
+              { freqHz: f, amp: amp2, dbPerSec: dps, phase: 2.1, startSec: 1.0 },
+            ],
+            1.5,
+            fs,
+            0,
+            1,
+          );
+          const a = analyzeNote(x, fs, {
+            f0Hz: f,
+            maxPartials: 1,
+            f0Refine: false,
+            fitEndSec: 0.4,
+            onsetSearchEndSec: 0.5,
+          });
+          const p1 = a.partials[0]!;
+          expect(p1.collided).toBe(false);
+          expect(p1.dbPerSec).not.toBeNull();
+          expect(Math.abs(p1.dbPerSec! - dps)).toBeLessThanOrEqual(0.2 * Math.abs(dps));
+        },
+      ),
+      { numRuns: 10 },
+    );
+  });
+
   // 性質: 26% 離れた定常妨害音があっても windowPeriods=10 の狭帯域なら dbPerSec ±20% で復元
   // 入力: f0∈[300,500], dbPerSec∈[-40,-20] (妨害音 1.26·f0, 振幅 0.8)
   it("26% 離れた妨害音があっても windowPeriods=10 で dbPerSec ±20%", () => {
