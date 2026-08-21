@@ -25,16 +25,22 @@ function isWeak(p: PartialFit): boolean {
   return p.dbPerSec === null || p.snrDb < LOW_SNR_DB;
 }
 
+/** グリッドスナップ設定 (EDO + 基準周波数)。step 表示に使う */
+export type NoteGrid = { edo: number; baseHz: number };
+
 // フィット区間の終端をエンベロープから復元する (noiseDb = peakDb - snrDb、
-// ピーク保存間引きなので peakDb は間引き後 max と一致する)
+// ピーク保存間引きなので peakDb は間引き後 max と近い)。fitEndSec 指定時はそこで cap
 function fitEndSec(p: PartialFit, analysis: NoteAnalysis): number {
+  const cap = analysis.params.fitEndSec ?? Number.POSITIVE_INFINITY;
   const peakDb = Math.max(...p.envelopeDb);
   const noiseDb = peakDb - p.snrDb;
   const dt = analysis.envStride / analysis.frameRate;
   for (let i = p.envelopeDb.length - 1; i >= 0; i--) {
-    if (p.envelopeDb[i]! > noiseDb + FIT_SNR_MARGIN_DB) return (i + 1) * dt;
+    if (p.envelopeDb[i]! > noiseDb + FIT_SNR_MARGIN_DB) {
+      return Math.min((i + 1) * dt, cap);
+    }
   }
-  return analysis.fitStartSec;
+  return Math.min(analysis.fitStartSec, cap);
 }
 
 // partial ごとのエンベロープ (実線) + フィット直線 (破線) を重ね描きし、
@@ -134,11 +140,18 @@ const cellStyle: CSSProperties = {
   whiteSpace: "nowrap",
 };
 
-export function NoteAnalysisPanel({ analysis }: { analysis: NoteAnalysis }) {
+export function NoteAnalysisPanel({
+  analysis,
+  grid,
+}: {
+  analysis: NoteAnalysis;
+  grid?: NoteGrid | null;
+}) {
   const durationSec =
     Math.max(0, ...analysis.partials.map((p) => p.envelopeDb.length)) *
     (analysis.envStride / analysis.frameRate);
   const f0Cents = centsFromNearestNote(analysis.f0Hz);
+  const f0Step = grid ? Math.round(grid.edo * Math.log2(analysis.f0Hz / grid.baseHz)) : null;
   return (
     <div style={{ fontSize: 13 }}>
       <p style={{ margin: "0.5rem 0", display: "flex", gap: "1rem", flexWrap: "wrap" }}>
@@ -146,6 +159,15 @@ export function NoteAnalysisPanel({ analysis }: { analysis: NoteAnalysis }) {
           f0: <b>{analysis.f0Hz.toFixed(2)}Hz</b> ({noteName(analysis.f0Hz)}{" "}
           {f0Cents >= 0 ? "+" : ""}
           {f0Cents.toFixed(0)}c)
+          {f0Step !== null && (
+            <>
+              {" "}
+              <b>
+                step {f0Step >= 0 ? "+" : ""}
+                {f0Step}
+              </b>
+            </>
+          )}
         </span>
         <span>
           B: {analysis.inharmonicityB === null ? "—" : analysis.inharmonicityB.toExponential(2)}
@@ -162,6 +184,7 @@ export function NoteAnalysisPanel({ analysis }: { analysis: NoteAnalysis }) {
             <th style={cellStyle}>k</th>
             <th style={cellStyle}>freq</th>
             <th style={cellStyle}>cents</th>
+            {grid && <th style={cellStyle}>Δstep</th>}
             <th style={cellStyle}>dB/s</th>
             <th style={cellStyle}>τ60</th>
             <th style={cellStyle}>R²</th>
@@ -170,45 +193,82 @@ export function NoteAnalysisPanel({ analysis }: { analysis: NoteAnalysis }) {
           </tr>
         </thead>
         <tbody>
-          {analysis.partials.map((p) => (
-            <tr
-              key={p.k}
-              style={{
-                color: isWeak(p) ? "#9ca3af" : "#222",
-                borderBottom: "1px solid #f0f0f0",
-              }}
-            >
-              <td style={cellStyle}>
-                <span
-                  aria-hidden="true"
-                  style={{
-                    display: "inline-block",
-                    width: 8,
-                    height: 8,
-                    borderRadius: 2,
-                    background: partialColor(p.k),
-                    marginRight: 4,
-                  }}
-                />
-                {p.k}
-              </td>
-              <td style={cellStyle}>{formatHz(p.freqHz)}Hz</td>
-              <td style={cellStyle}>
-                {p.centsFromHarmonic >= 0 ? "+" : ""}
-                {p.centsFromHarmonic.toFixed(1)}
-              </td>
-              <td style={cellStyle}>{p.dbPerSec === null ? "—" : p.dbPerSec.toFixed(1)}</td>
-              <td style={cellStyle}>{p.tau60Sec === null ? "—" : `${p.tau60Sec.toFixed(2)}s`}</td>
-              {/* Theil-Sen は LS 最適でないため r2 は負になり得る。負値は無意味なので伏せる */}
-              <td style={cellStyle}>{p.r2 === null || p.r2 < 0 ? "—" : p.r2.toFixed(2)}</td>
-              <td style={cellStyle}>{p.snrDb.toFixed(0)}dB</td>
-              <td style={cellStyle}>
-                {p.beat === null
-                  ? "—"
-                  : `${p.beat.hz.toFixed(1)}Hz (${p.beat.strength.toFixed(2)})`}
-              </td>
-            </tr>
-          ))}
+          {analysis.partials.map((p) => {
+            const dStep = grid ? (p.centsFromHarmonic / 1200) * grid.edo : null;
+            return (
+              <tr
+                key={p.k}
+                style={{
+                  color: isWeak(p) || p.collided ? "#9ca3af" : "#222",
+                  borderBottom: "1px solid #f0f0f0",
+                }}
+              >
+                <td style={cellStyle}>
+                  <span
+                    aria-hidden="true"
+                    style={{
+                      display: "inline-block",
+                      width: 8,
+                      height: 8,
+                      borderRadius: 2,
+                      background: partialColor(p.k),
+                      marginRight: 4,
+                    }}
+                  />
+                  {p.k}
+                </td>
+                <td style={cellStyle}>{formatHz(p.freqHz)}Hz</td>
+                <td style={cellStyle}>
+                  {p.centsFromHarmonic >= 0 ? "+" : ""}
+                  {p.centsFromHarmonic.toFixed(1)}
+                </td>
+                {grid && (
+                  <td
+                    style={{
+                      ...cellStyle,
+                      color: dStep !== null && Math.abs(dStep) > 0.25 ? "#b45309" : undefined,
+                    }}
+                    title={
+                      dStep !== null && Math.abs(dStep) > 0.25
+                        ? "理想倍音からのずれが 0.25 step 超 (別の音/衝突の可能性)"
+                        : undefined
+                    }
+                  >
+                    {dStep! >= 0 ? "+" : ""}
+                    {dStep!.toFixed(2)}
+                  </td>
+                )}
+                <td style={cellStyle}>
+                  {p.collided ? (
+                    <span
+                      title="尾部床判定: フィット上限以降も持続する同一周波数の背景 (ベース等) と分離できません"
+                      style={{
+                        background: "#e5e7eb",
+                        color: "#6b7280",
+                        borderRadius: 3,
+                        padding: "0 4px",
+                      }}
+                    >
+                      衝突
+                    </span>
+                  ) : p.dbPerSec === null ? (
+                    "—"
+                  ) : (
+                    p.dbPerSec.toFixed(1)
+                  )}
+                </td>
+                <td style={cellStyle}>{p.tau60Sec === null ? "—" : `${p.tau60Sec.toFixed(2)}s`}</td>
+                {/* Theil-Sen は LS 最適でないため r2 は負になり得る。負値は無意味なので伏せる */}
+                <td style={cellStyle}>{p.r2 === null || p.r2 < 0 ? "—" : p.r2.toFixed(2)}</td>
+                <td style={cellStyle}>{p.snrDb.toFixed(0)}dB</td>
+                <td style={cellStyle}>
+                  {p.beat === null
+                    ? "—"
+                    : `${p.beat.hz.toFixed(1)}Hz (${p.beat.strength.toFixed(2)})`}
+                </td>
+              </tr>
+            );
+          })}
         </tbody>
       </table>
     </div>

@@ -17,7 +17,7 @@ import type {
   ApiThumbnail,
   ApiVideo,
 } from "../api/types";
-import { NoteAnalysisPanel } from "../components/note-analysis";
+import { type NoteGrid, NoteAnalysisPanel } from "../components/note-analysis";
 import {
   HarmonicLens,
   LENS_STRIPE_DEFAULT_W,
@@ -43,10 +43,44 @@ const TASK_POLL_INTERVAL_MS = 1000;
 
 type Track = { kind: "video"; data: VideoItem } | { kind: "audio"; data: AudioItem };
 type ShownSpec = { spec: ApiSpectrogram; mode: string; audio: AudioItem };
-type NoteModalState =
-  | { name: string; state: "loading" }
-  | { name: string; state: "error"; message: string }
-  | { name: string; state: "ready"; analysis: NoteAnalysis };
+// Alt+クリック時の解析対象 (srcT / クリック周波数) を保持し、設定変更後の再解析に使う
+type NoteModalState = {
+  audioId: string;
+  name: string;
+  audioDurationSec: number;
+  srcT: number;
+  clickHz: number;
+  phase:
+    | { state: "loading" }
+    | { state: "error"; message: string }
+    | { state: "ready"; analysis: NoteAnalysis; grid: NoteGrid | null };
+};
+
+// 単音解析の設定 (project 単位で localStorage に永続化)
+type NoteAnalysisSettings = {
+  /** グリッドスナップの EDO。null = off (クリック周波数そのまま + f0 精密化あり) */
+  edo: number | null;
+  baseHz: number;
+  windowPeriods: number;
+  durationSec: number;
+  onsetSearchEndSec: number;
+  /** null = 無効 */
+  fitEndSec: number | null;
+  spikeMedian: boolean;
+  /** null = off */
+  repeat: { periodSec: number; count: number } | null;
+};
+
+const NOTE_SETTINGS_DEFAULT: NoteAnalysisSettings = {
+  edo: null,
+  baseHz: 261.6256,
+  windowPeriods: 4,
+  durationSec: 4,
+  onsetSearchEndSec: 0.5,
+  fitEndSec: null,
+  spikeMedian: false,
+  repeat: null,
+};
 
 // タイトル + 操作ボタンは行左上に sticky で重ね (縦積み)、横スクロールでも画面内に残す。
 // 緑の clip 帯は info とサムネイルだけ持たせて低く保つ
@@ -126,6 +160,8 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
   const mixKey = `mix:${data.id}`;
   const bandHeightsKey = `bandHeights:${data.id}`;
   const lensMaxHKey = `lensMaxH:${data.id}`;
+  const noteSettingsKey = `noteAnalysis:${data.id}`;
+  const [noteSettings, setNoteSettings] = useState<NoteAnalysisSettings>(NOTE_SETTINGS_DEFAULT);
   const restoredRef = useRef(false);
   useEffect(() => {
     if (restoredRef.current) saveLocal(viewsKey, specViews);
@@ -150,6 +186,9 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
     if (restoredRef.current) saveLocal(lensMaxHKey, lensMaxHarmonic);
   }, [lensMaxHKey, lensMaxHarmonic]);
   useEffect(() => {
+    if (restoredRef.current) saveLocal(noteSettingsKey, noteSettings);
+  }, [noteSettingsKey, noteSettings]);
+  useEffect(() => {
     setSpecViews(loadLocal(viewsKey, {} as Record<string, SpectrogramSelection | undefined>));
     setPlaybackLens(loadLocal(lensKey, false));
     setAutoScroll(loadLocal(autoScrollKey, false));
@@ -168,8 +207,21 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
     setLensStripeW(mix.lensStripeW ?? LENS_STRIPE_DEFAULT_W);
     setLensMaxHarmonic(loadLocal<Record<string, number>>(lensMaxHKey, {}));
     setBandHeights(new Map(loadLocal<[string, number][]>(bandHeightsKey, [])));
+    setNoteSettings({
+      ...NOTE_SETTINGS_DEFAULT,
+      ...loadLocal<Partial<NoteAnalysisSettings>>(noteSettingsKey, {}),
+    });
     restoredRef.current = true;
-  }, [viewsKey, lensKey, autoScrollKey, videoShownKey, mixKey, bandHeightsKey, lensMaxHKey]);
+  }, [
+    viewsKey,
+    lensKey,
+    autoScrollKey,
+    videoShownKey,
+    mixKey,
+    bandHeightsKey,
+    lensMaxHKey,
+    noteSettingsKey,
+  ]);
 
   const tracks: Track[] = useMemo(() => {
     const all: Track[] = [
@@ -560,51 +612,97 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
     noteReqToken.current++;
     setNoteModal(null);
   }
-  async function analyzeNoteAt(
-    audio: AudioItem,
-    spec: ApiSpectrogram,
-    projT: number,
-    yRatio: number,
-  ): Promise<void> {
+  function analyzeNoteAt(audio: AudioItem, spec: ApiSpectrogram, projT: number, yRatio: number) {
     const dProj = audio.projEndSec - audio.projStartSec;
     const dSrc = audio.srcEndSec - audio.srcStartSec;
     if (dProj === 0 || dSrc === 0) return;
-    const f0Hz = Math.min(5000, Math.max(20, spec.fminHz * 2 ** ((1 - yRatio) * spec.octaves)));
+    const clickHz = Math.min(5000, Math.max(20, spec.fminHz * 2 ** ((1 - yRatio) * spec.octaves)));
     const srcT = audio.srcStartSec + ((projT - audio.projStartSec) / dProj) * dSrc;
+    void runNoteAnalysis({
+      audioId: audio.id,
+      name: audio.name,
+      audioDurationSec: audio.durationSec,
+      srcT,
+      clickHz,
+    });
+  }
+
+  async function runNoteAnalysis(ctx: Omit<NoteModalState, "phase">): Promise<void> {
+    const s = noteSettings;
+    // グリッドスナップ有効時はクリック周波数を最寄り step にスナップし f0 精密化を切る
+    const grid: NoteGrid | null = s.edo != null ? { edo: s.edo, baseHz: s.baseHz } : null;
+    const f0Hz = grid
+      ? Math.min(
+          5000,
+          Math.max(
+            20,
+            grid.baseHz *
+              2 ** (Math.round(grid.edo * Math.log2(ctx.clickHz / grid.baseHz)) / grid.edo),
+          ),
+        )
+      : ctx.clickHz;
     // 低 f0 の pre-onset ノイズ床推定に ~0.2s 超のプリロールが要る
-    const startSec = Math.max(0, srcT - 0.35);
-    const durationSec = Math.min(4, audio.durationSec - startSec);
+    const startSec = Math.max(0, ctx.srcT - 0.35);
+    const durationSec = Math.min(
+      Math.min(20, Math.max(0.3, s.durationSec)),
+      ctx.audioDurationSec - startSec,
+    );
     if (durationSec < 0.2) {
       noteReqToken.current++;
-      setNoteModal({ name: audio.name, state: "error", message: "解析区間が短すぎます" });
+      setNoteModal({ ...ctx, phase: { state: "error", message: "解析区間が短すぎます" } });
       return;
     }
+    // repeat は音源の残り長と合計 30s cap に収まる回数へ縮める (2 回未満なら off)
+    let repeat = s.repeat;
+    if (repeat) {
+      const maxCount = Math.min(
+        repeat.count,
+        1 + Math.floor((ctx.audioDurationSec - startSec - durationSec) / repeat.periodSec),
+        1 + Math.floor((30 - durationSec) / repeat.periodSec),
+      );
+      repeat = maxCount >= 2 ? { periodSec: repeat.periodSec, count: maxCount } : null;
+    }
     const token = ++noteReqToken.current;
-    setNoteModal({ name: audio.name, state: "loading" });
+    setNoteModal({ ...ctx, phase: { state: "loading" } });
     try {
       const res = await apiClient.projects[":id"].audios[":audioId"]["analyze-note"].$post({
-        param: { id: data.id, audioId: audio.id },
-        json: { startSec, durationSec, f0Hz, maxPartials: 12 },
+        param: { id: data.id, audioId: ctx.audioId },
+        json: {
+          startSec,
+          durationSec,
+          f0Hz,
+          maxPartials: 12,
+          f0Refine: grid === null,
+          windowPeriods: Math.min(16, Math.max(2, s.windowPeriods)),
+          onsetSearchEndSec: Math.min(20, Math.max(0.05, s.onsetSearchEndSec)),
+          ...(s.fitEndSec != null ? { fitEndSec: Math.min(20, Math.max(0.05, s.fitEndSec)) } : {}),
+          ...(s.spikeMedian ? { spikeMedian: true } : {}),
+          ...(repeat ? { repeat } : {}),
+        },
       });
       if (!res.ok) {
         const body = (await res.json().catch(() => ({}))) as { error?: string };
         if (token !== noteReqToken.current) return;
         setNoteModal({
-          name: audio.name,
-          state: "error",
-          message: `単音解析失敗 (HTTP ${res.status}): ${body.error ?? "(no message)"}`,
+          ...ctx,
+          phase: {
+            state: "error",
+            message: `単音解析失敗 (HTTP ${res.status}): ${body.error ?? "(no message)"}`,
+          },
         });
         return;
       }
       const body = await res.json();
       if (token !== noteReqToken.current) return;
-      setNoteModal({ name: audio.name, state: "ready", analysis: body.analysis });
+      setNoteModal({ ...ctx, phase: { state: "ready", analysis: body.analysis, grid } });
     } catch (err) {
       if (token !== noteReqToken.current) return;
       setNoteModal({
-        name: audio.name,
-        state: "error",
-        message: `単音解析失敗: ${err instanceof Error ? err.message : String(err)}`,
+        ...ctx,
+        phase: {
+          state: "error",
+          message: `単音解析失敗: ${err instanceof Error ? err.message : String(err)}`,
+        },
       });
     }
   }
@@ -902,8 +1000,7 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
                   }
                   onNoteClick={
                     shown
-                      ? (projT, yRatio) =>
-                          void analyzeNoteAt(shown.audio, shown.spec, projT, yRatio)
+                      ? (projT, yRatio) => analyzeNoteAt(shown.audio, shown.spec, projT, yRatio)
                       : undefined
                   }
                   lensProjT={
@@ -984,8 +1081,20 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
       )}
       {noteModal && (
         <ModalShell title={`単音解析: ${noteModal.name}`} onClose={closeNoteModal}>
-          {noteModal.state === "loading" && <p style={{ color: "#666" }}>解析中…</p>}
-          {noteModal.state === "error" && (
+          <p style={{ fontSize: 12, color: "#555", margin: "0.4rem 0" }}>
+            クリック位置: t={noteModal.srcT.toFixed(3)}s / {noteModal.clickHz.toFixed(1)}Hz
+          </p>
+          <NoteSettingsForm
+            settings={noteSettings}
+            onChange={setNoteSettings}
+            disabled={noteModal.phase.state === "loading"}
+            onReanalyze={() => {
+              const { phase: _phase, ...ctx } = noteModal;
+              void runNoteAnalysis(ctx);
+            }}
+          />
+          {noteModal.phase.state === "loading" && <p style={{ color: "#666" }}>解析中…</p>}
+          {noteModal.phase.state === "error" && (
             <p
               role="alert"
               style={{
@@ -999,10 +1108,12 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
                 whiteSpace: "pre-wrap",
               }}
             >
-              {noteModal.message}
+              {noteModal.phase.message}
             </p>
           )}
-          {noteModal.state === "ready" && <NoteAnalysisPanel analysis={noteModal.analysis} />}
+          {noteModal.phase.state === "ready" && (
+            <NoteAnalysisPanel analysis={noteModal.phase.analysis} grid={noteModal.phase.grid} />
+          )}
         </ModalShell>
       )}
       {!playbackLens && lens && lensTarget && (
@@ -2105,6 +2216,233 @@ function ModalShell({
         {children}
       </div>
     </div>
+  );
+}
+
+function parseNumField(v: string): number | null {
+  if (v.trim() === "") return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+function clampNum(v: number, lo: number, hi: number): number {
+  return Math.min(hi, Math.max(lo, v));
+}
+
+// 単音解析の設定行。数値入力は編集中の文字列を保持し、パースできた値だけ clamp して反映する
+function NoteSettingsForm({
+  settings,
+  onChange,
+  onReanalyze,
+  disabled,
+}: {
+  settings: NoteAnalysisSettings;
+  onChange: (s: NoteAnalysisSettings) => void;
+  onReanalyze: () => void;
+  disabled: boolean;
+}) {
+  const [edoStr, setEdoStr] = useState(settings.edo?.toString() ?? "");
+  const [baseHzStr, setBaseHzStr] = useState(settings.baseHz.toString());
+  const [periodsStr, setPeriodsStr] = useState(settings.windowPeriods.toString());
+  const [durStr, setDurStr] = useState(settings.durationSec.toString());
+  const [onsetStr, setOnsetStr] = useState(settings.onsetSearchEndSec.toString());
+  const [fitEndStr, setFitEndStr] = useState(settings.fitEndSec?.toString() ?? "");
+  const [repPeriodStr, setRepPeriodStr] = useState(settings.repeat?.periodSec.toString() ?? "");
+  const [repCountStr, setRepCountStr] = useState((settings.repeat?.count ?? 4).toString());
+
+  const commitRepeat = (periodStr: string, countStr: string): void => {
+    const p = parseNumField(periodStr);
+    const c = parseNumField(countStr);
+    onChange({
+      ...settings,
+      repeat:
+        p != null && p > 0
+          ? { periodSec: clampNum(p, 0.1, 30), count: clampNum(Math.round(c ?? 4), 2, 8) }
+          : null,
+    });
+  };
+
+  return (
+    <section
+      style={{
+        border: "1px solid #eee",
+        borderRadius: 4,
+        padding: "0.5rem 0.6rem",
+        margin: "0.4rem 0",
+      }}
+    >
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0.4rem 0.8rem" }}>
+        <label
+          style={dialogLabelStyle}
+          title="クリック周波数を EDO グリッドの最寄り step にスナップし、f0 精密化を切ります (チューニング既知の場合)"
+        >
+          グリッド EDO (空=off)
+          <input
+            type="number"
+            min={1}
+            max={120}
+            step={1}
+            value={edoStr}
+            disabled={disabled}
+            onChange={(e) => {
+              setEdoStr(e.target.value);
+              const n = parseNumField(e.target.value);
+              onChange({ ...settings, edo: n == null ? null : clampNum(Math.round(n), 1, 120) });
+            }}
+            style={{ width: 90 }}
+          />
+        </label>
+        <label style={dialogLabelStyle} title="グリッドの step 0 に対応する周波数">
+          基準周波数 (Hz)
+          <input
+            type="number"
+            step="0.0001"
+            value={baseHzStr}
+            disabled={disabled}
+            onChange={(e) => {
+              setBaseHzStr(e.target.value);
+              const n = parseNumField(e.target.value);
+              if (n != null && n > 0) onChange({ ...settings, baseHz: clampNum(n, 1, 20000) });
+            }}
+            style={{ width: 110 }}
+          />
+        </label>
+        <label
+          style={dialogLabelStyle}
+          title="ヘテロダイン窓長 (f0 周期数)。大きくすると帯域が狭まり近接妨害音を落とせます"
+        >
+          窓長 (f0 周期, 2〜16)
+          <input
+            type="number"
+            min={2}
+            max={16}
+            step={1}
+            value={periodsStr}
+            disabled={disabled}
+            onChange={(e) => {
+              setPeriodsStr(e.target.value);
+              const n = parseNumField(e.target.value);
+              if (n != null) onChange({ ...settings, windowPeriods: clampNum(n, 2, 16) });
+            }}
+            style={{ width: 90 }}
+          />
+        </label>
+        <label style={dialogLabelStyle} title="クリック位置の前後を含む解析領域の長さ">
+          解析窓 (秒)
+          <input
+            type="number"
+            min={0.3}
+            max={20}
+            step={0.1}
+            value={durStr}
+            disabled={disabled}
+            onChange={(e) => {
+              setDurStr(e.target.value);
+              const n = parseNumField(e.target.value);
+              if (n != null) onChange({ ...settings, durationSec: clampNum(n, 0.3, 20) });
+            }}
+            style={{ width: 90 }}
+          />
+        </label>
+        <label
+          style={dialogLabelStyle}
+          title="onset (attack) の探索を領域先頭からこの秒数までに限定します"
+        >
+          onset 探索 (秒)
+          <input
+            type="number"
+            min={0.05}
+            max={20}
+            step={0.05}
+            value={onsetStr}
+            disabled={disabled}
+            onChange={(e) => {
+              setOnsetStr(e.target.value);
+              const n = parseNumField(e.target.value);
+              if (n != null) onChange({ ...settings, onsetSearchEndSec: clampNum(n, 0.05, 20) });
+            }}
+            style={{ width: 90 }}
+          />
+        </label>
+        <label
+          style={dialogLabelStyle}
+          title="フィット区間の上限 (領域先頭から)。次の音の onset より手前に絞ると持続背景との衝突も判定します"
+        >
+          フィット上限 (秒, 空=無効)
+          <input
+            type="number"
+            min={0.05}
+            max={20}
+            step={0.01}
+            value={fitEndStr}
+            disabled={disabled}
+            onChange={(e) => {
+              setFitEndStr(e.target.value);
+              const n = parseNumField(e.target.value);
+              onChange({ ...settings, fitEndSec: n == null ? null : clampNum(n, 0.05, 20) });
+            }}
+            style={{ width: 90 }}
+          />
+        </label>
+        <label
+          style={dialogLabelStyle}
+          title="同一音高が周期的に繰り返す場合、複数回のエンベロープを平均してノイズを抑えます"
+        >
+          繰り返し周期 (秒, 空=off)
+          <input
+            type="number"
+            min={0.1}
+            max={30}
+            step={0.1}
+            value={repPeriodStr}
+            disabled={disabled}
+            onChange={(e) => {
+              setRepPeriodStr(e.target.value);
+              commitRepeat(e.target.value, repCountStr);
+            }}
+            style={{ width: 90 }}
+          />
+        </label>
+        <label style={dialogLabelStyle}>
+          繰り返し回数 (2〜8)
+          <input
+            type="number"
+            min={2}
+            max={8}
+            step={1}
+            value={repCountStr}
+            disabled={disabled || settings.repeat == null}
+            onChange={(e) => {
+              setRepCountStr(e.target.value);
+              commitRepeat(repPeriodStr, e.target.value);
+            }}
+            style={{ width: 90 }}
+          />
+        </label>
+      </div>
+      <div style={{ display: "flex", alignItems: "center", gap: "0.8rem", marginTop: "0.4rem" }}>
+        <label
+          style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 12, color: "#444" }}
+          title="dB エンベロープに median3 を掛けてパーカッション等の単発スパイクを除去します"
+        >
+          <input
+            type="checkbox"
+            checked={settings.spikeMedian}
+            disabled={disabled}
+            onChange={(e) => onChange({ ...settings, spikeMedian: e.target.checked })}
+          />
+          スパイク除去 (median3)
+        </label>
+        <button
+          type="button"
+          onClick={onReanalyze}
+          disabled={disabled}
+          style={{ marginLeft: "auto" }}
+        >
+          {disabled ? "解析中…" : "再解析"}
+        </button>
+      </div>
+    </section>
   );
 }
 
