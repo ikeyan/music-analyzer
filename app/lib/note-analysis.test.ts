@@ -18,7 +18,13 @@ function lcg(seed: number): () => number {
   };
 }
 
-type SynthPartial = { freqHz: number; amp: number; dbPerSec: number; phase: number };
+type SynthPartial = {
+  freqHz: number;
+  amp: number;
+  dbPerSec: number;
+  phase: number;
+  startSec?: number;
+};
 
 // Σ a·e^(-α t)·sin(2π f t + φ) + seeded uniform noise。α = -dbPerSec·ln10/20
 function synth(
@@ -31,8 +37,9 @@ function synth(
   const x = new Float32Array(Math.round(seconds * fs));
   for (const p of partials) {
     const alpha = (-p.dbPerSec * Math.LN10) / 20;
-    for (let i = 0; i < x.length; i++) {
-      const t = i / fs;
+    const i0 = Math.round((p.startSec ?? 0) * fs);
+    for (let i = i0; i < x.length; i++) {
+      const t = (i - i0) / fs;
       x[i]! += p.amp * Math.exp(-alpha * t) * Math.sin(2 * Math.PI * p.freqHz * t + p.phase);
     }
   }
@@ -211,6 +218,158 @@ describe("analyzeNote", () => {
       ),
       { numRuns: 8 },
     );
+  });
+});
+
+describe("analyzeNote options", () => {
+  // 性質: 減衰正弦波より大きい同一周波数の定常成分に埋もれた partial は、fitEndSec の
+  // 尾部床で peak−床 < 4dB となり collided=true / フィット不能になる
+  // 入力: f∈[300,600], 定常振幅 s∈[2,4] (peak/床 ≤ (1+s)/s ≤ 3.5dB < 4dB), 位相
+  it("同一周波数の定常成分との衝突は collided=true", () => {
+    fc.assert(
+      fc.property(
+        fc.double({ min: 300, max: 600, noNaN: true }),
+        fc.double({ min: 2, max: 4, noNaN: true }),
+        fc.double({ min: 0, max: 6, noNaN: true }),
+        (f, steadyAmp, phase) => {
+          const fs = 8000;
+          const x = synth(
+            [
+              { freqHz: f, amp: 1, dbPerSec: -40, phase: 0.8 },
+              { freqHz: f, amp: steadyAmp, dbPerSec: 0, phase },
+            ],
+            1.5,
+            fs,
+            0,
+            1,
+          );
+          const a = analyzeNote(x, fs, {
+            f0Hz: f,
+            maxPartials: 1,
+            f0Refine: false,
+            fitEndSec: 0.4,
+          });
+          const p1 = a.partials[0]!;
+          expect(p1.collided).toBe(true);
+          expect(p1.dbPerSec).toBeNull();
+        },
+      ),
+      { numRuns: 10 },
+    );
+  });
+
+  // 性質: 26% 離れた定常妨害音があっても windowPeriods=10 の狭帯域なら dbPerSec ±20% で復元
+  // 入力: f0∈[300,500], dbPerSec∈[-40,-20] (妨害音 1.26·f0, 振幅 0.8)
+  it("26% 離れた妨害音があっても windowPeriods=10 で dbPerSec ±20%", () => {
+    fc.assert(
+      fc.property(
+        fc.double({ min: 300, max: 500, noNaN: true }),
+        fc.double({ min: -40, max: -20, noNaN: true }),
+        (f0, dps) => {
+          const fs = 8000;
+          const x = synth(
+            [
+              { freqHz: f0, amp: 1, dbPerSec: dps, phase: 0.3 },
+              { freqHz: 1.26 * f0, amp: 0.8, dbPerSec: 0, phase: 1.7 },
+            ],
+            1.5,
+            fs,
+            0,
+            1,
+          );
+          const a = analyzeNote(x, fs, {
+            f0Hz: f0,
+            maxPartials: 1,
+            f0Refine: false,
+            windowPeriods: 10,
+          });
+          const p1 = a.partials[0]!;
+          expect(p1.dbPerSec).not.toBeNull();
+          expect(Math.abs(p1.dbPerSec! - dps)).toBeLessThanOrEqual(0.2 * Math.abs(dps));
+        },
+      ),
+      { numRuns: 10 },
+    );
+  });
+
+  // 性質: 4 回繰り返しの同期平均は、重い外れ値ノイズ下でも単発解析より dbPerSec 誤差が
+  // 悪化しない (±0.1·|dps| の許容内。改善幅は assert しない)
+  // 入力: f0∈[300,500], dbPerSec∈[-35,-20], spike noise の seed
+  it("repeat 同期平均は外れ値ノイズ下で単発より悪化しない", () => {
+    fc.assert(
+      fc.property(
+        fc.double({ min: 300, max: 500, noNaN: true }),
+        fc.double({ min: -35, max: -20, noNaN: true }),
+        fc.integer({ min: 0, max: 2 ** 31 - 1 }),
+        (f0, dps, seed) => {
+          const fs = 8000;
+          const periodSec = 0.8;
+          const count = 4;
+          const durSec = 0.7;
+          const totalSec = durSec + periodSec * (count - 1);
+          const x = synth(
+            Array.from({ length: count }, (_, r) => ({
+              freqHz: f0,
+              amp: 1,
+              dbPerSec: dps,
+              phase: 0.9 + 1.3 * r,
+              startSec: r * periodSec,
+            })),
+            totalSec,
+            fs,
+            0,
+            1,
+          );
+          const rand = lcg(seed);
+          for (let i = 0; i < x.length; i++) {
+            if (rand() < 0.015) x[i]! += (rand() * 2 - 1) * 4;
+          }
+          const base = { f0Hz: f0, maxPartials: 1, f0Refine: false } as const;
+          const single = analyzeNote(x.subarray(0, Math.round(durSec * fs)), fs, base);
+          const repeated = analyzeNote(x, fs, { ...base, repeat: { periodSec, count } });
+          const errSingle = Math.abs(single.partials[0]!.dbPerSec! - dps);
+          const errRepeat = Math.abs(repeated.partials[0]!.dbPerSec! - dps);
+          expect(repeated.params.repeat).toEqual({ periodSec, count });
+          expect(errRepeat).toBeLessThanOrEqual(errSingle + 0.1 * Math.abs(dps));
+        },
+      ),
+      { numRuns: 6 },
+    );
+  });
+
+  // 性質: f0Refine=false なら精密化されず f0Hz は入力そのまま返る (信号は 1% ずらす)
+  it("f0Refine=false のとき f0Hz が入力そのまま返る", () => {
+    fc.assert(
+      fc.property(fc.double({ min: 100, max: 800, noNaN: true }), (f0) => {
+        const fs = 8000;
+        const x = synth([{ freqHz: f0 * 1.01, amp: 1, dbPerSec: -20, phase: 1 }], 0.4, fs, 0, 1);
+        const a = analyzeNote(x, fs, { f0Hz: f0, maxPartials: 1, f0Refine: false });
+        expect(a.f0Hz).toBe(f0);
+        expect(a.params.f0Refine).toBe(false);
+      }),
+      { numRuns: 10 },
+    );
+  });
+
+  it("onsetSearchEndSec で領域後半のより大きい音を onset に選ばない", () => {
+    const fs = 8000;
+    const f0 = 400;
+    const x = synth(
+      [
+        { freqHz: f0, amp: 0.25, dbPerSec: -30, phase: 0.5, startSec: 0.1 },
+        { freqHz: f0, amp: 1, dbPerSec: -30, phase: 2.1, startSec: 1.0 },
+      ],
+      1.5,
+      fs,
+      0,
+      1,
+    );
+    const base = { f0Hz: f0, maxPartials: 1, f0Refine: false } as const;
+    const limited = analyzeNote(x, fs, { ...base, onsetSearchEndSec: 0.5 });
+    expect(limited.onsetSec).toBeGreaterThan(0.05);
+    expect(limited.onsetSec).toBeLessThan(0.3);
+    const unlimited = analyzeNote(x, fs, base);
+    expect(unlimited.onsetSec).toBeGreaterThan(0.9);
   });
 });
 

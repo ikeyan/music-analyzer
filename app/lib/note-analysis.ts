@@ -177,13 +177,20 @@ export function detectBeat(
     r[lag] = acc / energy;
   }
   let best = -1;
+  const peaks: number[] = [];
   for (let lag = BEAT_MIN_LAG; lag <= maxLag; lag++) {
     const prev = r[lag - 1]!;
     const next = lag + 1 <= maxLag ? r[lag + 1]! : Number.NEGATIVE_INFINITY;
-    if (r[lag]! >= prev && r[lag]! >= next && (best < 0 || r[lag]! > r[best]!)) best = lag;
+    if (r[lag]! >= prev && r[lag]! >= next) {
+      peaks.push(lag);
+      if (best < 0 || r[lag]! > r[best]!) best = lag;
+    }
   }
   if (best < 0 || r[best]! < BEAT_MIN_STRENGTH) return null;
-  return { hz: frameRate / best, strength: r[best]! };
+  // 真の周期が半整数 lag 付近だと 2 周期目の整数倍 lag が argmax を僅差で奪うので、
+  // 最良値の 85% 以上の最小 lag ピークを基本周期として選ぶ
+  const chosen = peaks.find((lag) => r[lag]! >= Math.max(BEAT_MIN_STRENGTH, 0.85 * r[best]!))!;
+  return { hz: frameRate / chosen, strength: r[chosen]! };
 }
 
 export type PartialFit = {
@@ -199,9 +206,21 @@ export type PartialFit = {
   tau60Sec: number | null;
   r2: number | null;
   snrDb: number;
+  /** 尾部床判定で持続背景と分離不能 (同一周波数の衝突)。フィットしない */
+  collided: boolean;
   beat: { hz: number; strength: number } | null;
   /** 間引き後 */
   envelopeDb: number[];
+};
+
+/** analyzeNote が実際に使ったパラメータのエコーバック */
+export type NoteAnalysisParams = {
+  windowPeriods: number;
+  f0Refine: boolean;
+  onsetSearchEndSec: number | null;
+  fitEndSec: number | null;
+  spikeMedian: boolean;
+  repeat: { periodSec: number; count: number } | null;
 };
 
 export type NoteAnalysis = {
@@ -215,7 +234,26 @@ export type NoteAnalysis = {
   /** envelopeDb[i] の時刻 = i·envStride/frameRate */
   envStride: number;
   sampleRate: number;
+  params: NoteAnalysisParams;
   partials: PartialFit[];
+};
+
+export type AnalyzeNoteOpts = {
+  f0Hz: number;
+  maxPartials: number;
+  hop?: number;
+  /** false で f0 精密化をスキップ (チューニングが既知の場合)。default true */
+  f0Refine?: boolean;
+  /** ヘテロダイン窓長 (f0 周期数, 2〜16)。狭帯域化で近接妨害音を帯域外に落とす。default 4 */
+  windowPeriods?: number;
+  /** onset (argmax) 探索を領域先頭からこの秒数までに限定 (default: 領域全体) */
+  onsetSearchEndSec?: number;
+  /** フィット区間の上限 (領域先頭基準)。指定時は尾部床で持続背景との衝突も判定する */
+  fitEndSec?: number;
+  /** dB envelope に median3 (パーカッション等のスパイク対策)。default false */
+  spikeMedian?: boolean;
+  /** periodSec 間隔の count 回繰り返しの同期平均。samples は全繰り返しを含む長さで渡す */
+  repeat?: { periodSec: number; count: number };
 };
 
 const REFINE_GUARD_OCT = 1 / 6;
@@ -223,31 +261,113 @@ const B_MAX = 0.02;
 const B_FIT_MIN_SNR_DB = 10;
 const FIT_MIN_FRAMES = 8;
 const FIT_SNR_MARGIN_DB = 6;
+const FIT_BELOW_RUN = 5;
 const ENV_MAX_POINTS = 240;
+const WINDOW_PERIODS_DEFAULT = 4;
+/** peakDb − 尾部床 がこれ未満なら持続背景との衝突とみなしフィットしない
+ * (実音源の実測でベース衝突 partial は 0〜3dB、フィット可能 partial は 5dB 以上に分離する) */
+const COLLIDE_MIN_DB = 4;
+/** 尾部床あり時の点フィルタ余裕 (実音源で検証済みの experiment3 と同値) */
+const FIT_TAIL_MARGIN_DB = 3;
 
-type TrackedPartial = { k: number; freqHz: number; amp: Float32Array<ArrayBuffer>; db: number[] };
+function median3(xs: number[]): number[] {
+  if (xs.length < 3) return xs.slice();
+  return xs.map((_, i) => {
+    const a = xs[Math.max(0, i - 1)]!;
+    const b = xs[i]!;
+    const c = xs[Math.min(xs.length - 1, i + 1)]!;
+    return Math.max(Math.min(a, b), Math.min(Math.max(a, b), c));
+  });
+}
+
+type TrackedPartial = {
+  k: number;
+  fPred: number;
+  fkFull: number;
+  envs: ComplexEnvelope[];
+  db: number[];
+};
+
+// 各繰り返しの [lo, hi) フレームだけで instantFreqHz を測り、エネルギー重みで平均する。
+// 全域だと領域内の別の音に振幅²重みが引かれるため、フィット窓に限定して測る
+function freqOverWindow(
+  envs: ComplexEnvelope[],
+  lo: number,
+  hi: number,
+  hop: number,
+  sampleRate: number,
+  carrierHz: number,
+): number {
+  let num = 0;
+  let den = 0;
+  for (const env of envs) {
+    const sub: ComplexEnvelope = {
+      re: env.re.subarray(lo, hi),
+      im: env.im.subarray(lo, hi),
+      frames: hi - lo,
+    };
+    let energy = 0;
+    for (let i = lo; i < hi; i++) energy += env.re[i]! ** 2 + env.im[i]! ** 2;
+    num += energy * instantFreqHz(sub, hop, sampleRate, carrierHz);
+    den += energy;
+  }
+  return den > 0 ? num / den : carrierHz;
+}
 
 export function analyzeNote(
   samples: Float32Array<ArrayBuffer>,
   sampleRate: number,
-  opts: { f0Hz: number; maxPartials: number; hop?: number },
+  opts: AnalyzeNoteOpts,
 ): NoteAnalysis {
   const hop = opts.hop ?? Math.max(1, Math.round(sampleRate / 200));
   const frameRate = sampleRate / hop;
+  const windowPeriods = clampNum(opts.windowPeriods ?? WINDOW_PERIODS_DEFAULT, 2, 16);
+  const f0Refine = opts.f0Refine ?? true;
+  const spikeMedian = opts.spikeMedian ?? false;
+
+  // 繰り返し同期平均: 各繰り返しから同一長の segment を切り出す。位相はテイク間で
+  // 無相関なので振幅は linear 平均 (非コヒーレント)、周波数は振幅²重み平均
+  let repeat = opts.repeat ?? null;
+  let segLen = samples.length;
+  let offsetStep = 0;
+  if (repeat) {
+    offsetStep = Math.round(repeat.periodSec * sampleRate);
+    segLen = samples.length - offsetStep * (repeat.count - 1);
+    if (offsetStep <= 0 || segLen < 2 * hop) {
+      repeat = null;
+      segLen = samples.length;
+      offsetStep = 0;
+    }
+  }
+  const segments: Float32Array<ArrayBuffer>[] = [];
+  for (let r = 0; r < (repeat?.count ?? 1); r++) {
+    segments.push(samples.subarray(r * offsetStep, r * offsetStep + segLen));
+  }
 
   // f0 精密化 (1 回反復)。ヒントから 1/6 oct 超は隣接音への誤収束とみなしヒントを維持
   const hint = opts.f0Hz;
-  const refineTaps = clampNum(Math.round((8 * sampleRate) / hint), 3, Math.floor(sampleRate * 0.4));
   let f0 = hint;
-  for (let pass = 0; pass < 2; pass++) {
-    const env = extractComplexEnvelope(samples, sampleRate, f0, refineTaps, hop);
-    const measured = instantFreqHz(env, hop, sampleRate, f0);
-    f0 = measured > 0 && Math.abs(Math.log2(measured / hint)) <= REFINE_GUARD_OCT ? measured : hint;
+  if (f0Refine) {
+    const refineTaps = clampNum(
+      Math.round((8 * sampleRate) / hint),
+      3,
+      Math.floor(sampleRate * 0.4),
+    );
+    for (let pass = 0; pass < 2; pass++) {
+      const env = extractComplexEnvelope(segments[0]!, sampleRate, f0, refineTaps, hop);
+      const measured = instantFreqHz(env, hop, sampleRate, f0);
+      f0 =
+        measured > 0 && Math.abs(Math.log2(measured / hint)) <= REFINE_GUARD_OCT ? measured : hint;
+    }
   }
 
   // 隣接 partial は k によらず f0 Hz 間隔なので全 partial 共通の窓で分離できる
-  const taps = clampNum(Math.round((4 * sampleRate) / f0), 3, Math.floor(sampleRate * 0.2));
-  const frames = Math.max(1, Math.floor(samples.length / hop) + 1);
+  const taps = clampNum(
+    Math.round((windowPeriods * sampleRate) / f0),
+    3,
+    Math.floor(sampleRate * 0.25),
+  );
+  const frames = Math.max(1, Math.floor(segLen / hop) + 1);
   const tracked: TrackedPartial[] = [];
   let inharmB = 0;
   let bNum = 0;
@@ -256,17 +376,32 @@ export function analyzeNote(
   for (let k = 1; k <= opts.maxPartials; k++) {
     const fPred = k * f0 * Math.sqrt(1 + inharmB * k * k);
     if (fPred > 0.45 * sampleRate) break;
-    const env = extractComplexEnvelope(samples, sampleRate, fPred, taps, hop);
-    const amp = new Float32Array(env.frames);
-    let peakAmp = 0;
-    for (let i = 0; i < env.frames; i++) {
-      const a = Math.hypot(env.re[i]!, env.im[i]!);
-      amp[i] = a;
-      if (a > peakAmp) peakAmp = a;
+    const ampSum = new Float64Array(frames);
+    let fkNum = 0;
+    let fkDen = 0;
+    const envs: ComplexEnvelope[] = [];
+    for (const seg of segments) {
+      const env = extractComplexEnvelope(seg, sampleRate, fPred, taps, hop);
+      envs.push(env);
+      let energy = 0;
+      for (let i = 0; i < frames; i++) {
+        const a = Math.hypot(env.re[i]!, env.im[i]!);
+        ampSum[i] += a;
+        energy += a * a;
+      }
+      fkNum += energy * instantFreqHz(env, hop, sampleRate, fPred);
+      fkDen += energy;
     }
-    const db = Array.from(amp, toDb);
-    const fk = instantFreqHz(env, hop, sampleRate, fPred);
-    tracked.push({ k, freqHz: fk, amp, db });
+    let peakAmp = 0;
+    const rawDb: number[] = [];
+    for (let i = 0; i < frames; i++) {
+      const a = ampSum[i]! / segments.length;
+      if (a > peakAmp) peakAmp = a;
+      rawDb.push(toDb(a));
+    }
+    const db = spikeMedian ? median3(rawDb) : rawDb;
+    const fk = fkDen > 0 ? fkNum / fkDen : fPred;
+    tracked.push({ k, fPred, fkFull: fk, envs, db });
     // (fk/(k·f0))² - 1 = B·k² を振幅²重み付き最小二乗で逐次更新。
     // 窓の主弁を外れた実測値 (別 partial / ノイズ由来) と、instantFreqHz の
     // 測定範囲 ±frameRate/2 の折り返し境界に近い実測値は除外する
@@ -288,39 +423,81 @@ export function analyzeNote(
 
   const totalPow = new Float64Array(frames);
   for (const p of tracked) {
-    for (let i = 0; i < frames; i++) totalPow[i] += p.amp[i]! * p.amp[i]!;
+    for (let i = 0; i < frames; i++) totalPow[i] += 10 ** (p.db[i]! / 10);
   }
+  const onsetLimit =
+    opts.onsetSearchEndSec != null
+      ? Math.min(frames, Math.max(1, Math.ceil(opts.onsetSearchEndSec * frameRate)))
+      : frames;
   let onsetFrame = 0;
-  for (let i = 1; i < frames; i++) {
+  for (let i = 1; i < onsetLimit; i++) {
     if (totalPow[i]! > totalPow[onsetFrame]!) onsetFrame = i;
   }
   // 窓が attack をまたぐ区間はフィットから除外する
   const fitStartFrame = onsetFrame + Math.ceil(taps / (2 * hop));
   const preFrames = onsetFrame - Math.ceil(taps / hop);
+  const fitEndCapFrame =
+    opts.fitEndSec != null
+      ? Math.min(frames - 1, Math.floor(opts.fitEndSec * frameRate))
+      : frames - 1;
   const stride = Math.ceil(frames / ENV_MAX_POINTS);
 
-  const partials: PartialFit[] = tracked.map(({ k, freqHz, db }) => {
+  const freqLo = fitStartFrame;
+  const freqHi = Math.min(frames, fitEndCapFrame + 1);
+
+  const partials: PartialFit[] = tracked.map(({ k, fPred, fkFull, envs, db }) => {
     const noiseDb = preFrames >= 8 ? median(db.slice(0, preFrames)) : percentile(db, 0.1);
-    const peakDb = Math.max(...db);
-    let fitEnd = -1;
-    for (let i = frames - 1; i >= fitStartFrame; i--) {
-      if (db[i]! > noiseDb + FIT_SNR_MARGIN_DB) {
-        fitEnd = i;
-        break;
+    // peak はこの音の窓 [onset, fitEndCap] から取る (全域 max だと領域内の別の音を拾う)
+    const noteWin = db.slice(onsetFrame, fitEndCapFrame + 1);
+    const peakDb = noteWin.length > 0 ? Math.max(...noteWin) : Math.max(...db);
+    const freqHz =
+      freqHi - freqLo >= 3 ? freqOverWindow(envs, freqLo, freqHi, hop, sampleRate, fPred) : fkFull;
+    // 尾部床: フィット上限以降の中央値 (持続背景のレベル)。ピークが床から立たない
+    // partial は衝突 = 分離不能としてフィットしない
+    const tail = fitEndCapFrame + 1 < frames ? db.slice(fitEndCapFrame + 1) : [];
+    const tailFloorDb = tail.length > 0 ? median(tail) : null;
+    const floorDb = tailFloorDb != null ? Math.max(noiseDb, tailFloorDb) : noiseDb;
+    const collided = tailFloorDb != null && peakDb - tailFloorDb < COLLIDE_MIN_DB;
+    const ts: number[] = [];
+    const ys: number[] = [];
+    if (!collided && tailFloorDb != null) {
+      // 尾部床あり: 持続背景が途中で顔を出すので連続区間でなく点フィルタ (床+3dB 超) で拾う
+      for (let i = fitStartFrame; i <= fitEndCapFrame; i++) {
+        if (db[i]! > floorDb + FIT_TAIL_MARGIN_DB) {
+          ts.push(i / frameRate);
+          ys.push(db[i]!);
+        }
       }
-    }
-    let fit: { dbPerSec: number; interceptDb: number; r2: number } | null = null;
-    let beat: { hz: number; strength: number } | null = null;
-    if (fitEnd - fitStartFrame + 1 >= FIT_MIN_FRAMES) {
-      const ts: number[] = [];
-      const ys: number[] = [];
+    } else if (!collided) {
+      // 床+6dB を FIT_BELOW_RUN frame 連続で割ったら減衰が床に達したとみなし打ち切る
+      // (「最後に超えた frame」だと尾部ノイズの単発超過がフィット区間を床まで引き伸ばす)
+      let fitEnd = -1;
+      let below = 0;
+      for (let i = fitStartFrame; i <= fitEndCapFrame; i++) {
+        if (db[i]! > floorDb + FIT_SNR_MARGIN_DB) {
+          fitEnd = i;
+          below = 0;
+        } else if (++below >= FIT_BELOW_RUN) {
+          break;
+        }
+      }
       for (let i = fitStartFrame; i <= fitEnd; i++) {
         ts.push(i / frameRate);
         ys.push(db[i]!);
       }
+    }
+    let fit: { dbPerSec: number; interceptDb: number; r2: number } | null = null;
+    let beat: { hz: number; strength: number } | null = null;
+    if (ts.length >= FIT_MIN_FRAMES) {
       fit = fitDecay(ts, ys);
       const f = fit;
-      const residual = ts.map((t, i) => ys[i]! - (f.dbPerSec * t + f.interceptDb));
+      // 自己相関の lag→Hz 換算に等間隔が要るので、残差は選択点間の連続 frame で取る
+      const beatLo = Math.round(ts[0]! * frameRate);
+      const beatHi = Math.round(ts[ts.length - 1]! * frameRate);
+      const residual: number[] = [];
+      for (let i = beatLo; i <= beatHi; i++) {
+        residual.push(db[i]! - (f.dbPerSec * (i / frameRate) + f.interceptDb));
+      }
       beat = detectBeat(residual, frameRate);
     }
     // ピーク保存の間引き (stride 内 max)
@@ -340,6 +517,7 @@ export function analyzeNote(
       tau60Sec: fit && fit.dbPerSec < -1e-6 ? 60 / -fit.dbPerSec : null,
       r2: fit ? fit.r2 : null,
       snrDb: peakDb - noiseDb,
+      collided,
       beat,
       envelopeDb,
     };
@@ -353,6 +531,14 @@ export function analyzeNote(
     frameRate,
     envStride: stride,
     sampleRate,
+    params: {
+      windowPeriods,
+      f0Refine,
+      onsetSearchEndSec: opts.onsetSearchEndSec ?? null,
+      fitEndSec: opts.fitEndSec ?? null,
+      spikeMedian,
+      repeat,
+    },
     partials,
   };
 }
