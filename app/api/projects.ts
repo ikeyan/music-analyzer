@@ -134,12 +134,29 @@ const createSpectrogramSchema = v.pipe(
   ),
 );
 
-const analyzeNoteSchema = v.object({
-  startSec: v.pipe(v.number(), v.finite(), v.minValue(0)),
-  durationSec: v.pipe(v.number(), v.finite(), v.minValue(0.2), v.maxValue(20)),
-  f0Hz: v.pipe(v.number(), v.finite(), v.minValue(20), v.maxValue(5000)),
-  maxPartials: v.optional(v.pipe(v.number(), v.integer(), v.minValue(1), v.maxValue(24))),
-});
+const analyzeNoteSchema = v.pipe(
+  v.object({
+    startSec: v.pipe(v.number(), v.finite(), v.minValue(0)),
+    durationSec: v.pipe(v.number(), v.finite(), v.minValue(0.2), v.maxValue(20)),
+    f0Hz: v.pipe(v.number(), v.finite(), v.minValue(20), v.maxValue(5000)),
+    maxPartials: v.optional(v.pipe(v.number(), v.integer(), v.minValue(1), v.maxValue(24))),
+    f0Refine: v.optional(v.boolean()),
+    windowPeriods: v.optional(v.pipe(v.number(), v.finite(), v.minValue(2), v.maxValue(16))),
+    onsetSearchEndSec: v.optional(v.pipe(v.number(), v.finite(), v.minValue(0.05), v.maxValue(20))),
+    fitEndSec: v.optional(v.pipe(v.number(), v.finite(), v.minValue(0.05), v.maxValue(20))),
+    spikeMedian: v.optional(v.boolean()),
+    repeat: v.optional(
+      v.object({
+        periodSec: v.pipe(v.number(), v.finite(), v.minValue(0.1), v.maxValue(30)),
+        count: v.pipe(v.number(), v.integer(), v.minValue(2), v.maxValue(8)),
+      }),
+    ),
+  }),
+  v.check(
+    (d) => d.durationSec + (d.repeat ? d.repeat.periodSec * (d.repeat.count - 1) : 0) <= 30,
+    "total decode length durationSec + periodSec*(count-1) must be <= 30s",
+  ),
+);
 
 // 反転は projStart > projEnd で表現するため proj 側に大小制約は置かない。
 // src は正方向のみで、durationSec 超過は row 取得後に handler 側で検証する
@@ -1130,6 +1147,10 @@ export const projects = new Hono()
               Either.Either<NoteAnalysis, { status: 400 | 500; error: string }>
             > => {
               const sampleRate = analysisSampleRate(body.f0Hz * (maxPartials + 1));
+              // repeat 時は全繰り返しを含む長さをデコードする (合計 ≤ 30s は schema で検証済み)
+              const totalDurationSec =
+                body.durationSec +
+                (body.repeat ? body.repeat.periodSec * (body.repeat.count - 1) : 0);
               // 全量ダウンロードせず presigned URL を ffmpeg に直接渡す
               // (-i 前の -ss fast seek が HTTP range で効く)
               const inputUrl = getS3().presign(audio.audioKey, { expiresIn: 300, method: "GET" });
@@ -1137,7 +1158,7 @@ export const projects = new Hono()
               try {
                 samples = await decodeAudioPcm(inputUrl, sampleRate, undefined, {
                   startSec: body.startSec,
-                  durationSec: body.durationSec,
+                  durationSec: totalDurationSec,
                 });
               } catch (err) {
                 return Either.left({ status: 500, error: describeError(err) });
@@ -1146,7 +1167,16 @@ export const projects = new Hono()
                 return Either.left({ status: 400, error: "decoded audio is empty" });
               }
               return Either.right(
-                analyzeNote(samples, sampleRate, { f0Hz: body.f0Hz, maxPartials }),
+                analyzeNote(samples, sampleRate, {
+                  f0Hz: body.f0Hz,
+                  maxPartials,
+                  f0Refine: body.f0Refine,
+                  windowPeriods: body.windowPeriods,
+                  onsetSearchEndSec: body.onsetSearchEndSec,
+                  fitEndSec: body.fitEndSec,
+                  spikeMedian: body.spikeMedian,
+                  repeat: body.repeat,
+                }),
               );
             },
           ),
