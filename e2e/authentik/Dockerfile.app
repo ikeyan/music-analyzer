@@ -2,7 +2,7 @@
 # stack boots quickly without a full prod build. Not intended for production.
 FROM mwader/static-ffmpeg:7.1.1 AS ffmpeg
 
-FROM oven/bun:1.3.14
+FROM oven/bun:1.4.0
 
 COPY --from=ffmpeg /ffmpeg /usr/local/bin/ffmpeg
 COPY --from=ffmpeg /ffprobe /usr/local/bin/ffprobe
