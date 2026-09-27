@@ -33,7 +33,7 @@ services:
       - redis-data:/data
 
   authentik-server:
-    image: ghcr.io/goauthentik/server:2025.2.4
+    image: ghcr.io/goauthentik/server:2025.12.6
     command: server
     environment:
       AUTHENTIK_REDIS__HOST: redis
@@ -65,7 +65,7 @@ services:
       timeout: 5s
 
   authentik-worker:
-    image: ghcr.io/goauthentik/server:2025.2.4
+    image: ghcr.io/goauthentik/server:2025.12.6
     command: worker
     environment:
       AUTHENTIK_REDIS__HOST: redis
