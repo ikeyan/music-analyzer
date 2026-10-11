@@ -22,13 +22,13 @@ jobs:
       DATABASE_URL: file:./dev.db
     steps:
       - name: Harden the runner
-        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
         with:
           egress-policy: audit
           disable-sudo: true
 
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           show-progress: false
@@ -121,7 +121,7 @@ jobs:
 
       - name: Upload coverage (unit)
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: coverage-unit-${{ github.run_id }}-${{ github.run_attempt }}
           path: coverage/lcov.info
@@ -139,13 +139,13 @@ jobs:
       AUTHENTIK_BOOTSTRAP_EMAIL: "admin@localhost"
     steps:
       - name: Harden the runner
-        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
         with:
           egress-policy: audit
           disable-sudo: true
 
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           show-progress: false
@@ -256,7 +256,7 @@ jobs:
 
       - name: Upload coverage (e2e)
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: coverage-e2e-${{ github.run_id }}-${{ github.run_attempt }}
           path: coverage/lcov.info
@@ -288,7 +288,7 @@ jobs:
 
       - name: Upload compose logs
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: authentik-e2e-logs-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/authentik-e2e-logs
@@ -314,7 +314,7 @@ jobs:
       pull-requests: write
     steps:
       - name: Harden the runner
-        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
         with:
           egress-policy: audit
           disable-sudo: true
