@@ -53,8 +53,8 @@ OMP_NUM_THREADS=8 python3 -u $NM/train_exp.py --songs kipa,xenprog,yxeni,mafle,f
 # pass 2 (テンプレートは pass 1 の検出から作る)
 OMP_NUM_THREADS=8 python3 -u $NM/train_timbre.py --songs kipa,xenprog,yxeni,mafle,fnas --eval_songs "" \
   --train_extra $(cat syn30.txt) --templates 3 --templates_from model:pass1.json --max_steps 5000 \
-  --export pass2.json --version edo41-cnn-v2
-python3 $NM/assemble_v2.py pass2.json pass1.json note-model.json 3
+  --export pass2.json --version edo41-cnn-v4
+python3 $NM/assemble_v2.py pass2.json pass1.json note-model.json 3   # 最終出力の decode は decode_v2.FINAL
 cp note-model.json <repo>/app/lib/note-model.json
 ```
 

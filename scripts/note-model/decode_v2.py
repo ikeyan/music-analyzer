@@ -10,6 +10,8 @@ DEFAULT_REF = dict(onThreshold=0.5, offThreshold=0.3, onsetThreshold=0.5, minFra
 # recommended set (tuned jointly on kipa/m_cnn_k2x and xenprog/m_cnn_x2k, see report_decoder.md)
 DEFAULT = dict(DEFAULT_REF, smooth=9, onThreshold=0.6, offThreshold=0.1, onsetThreshold=0.5, splitMinFrames=5, mergeGap=8,
                minFrames=8, backtrack=5, nmsBins=1, nmsOverlap=0.3, nmsMode='sum', harmMargin=0.0, harmOverlap=0.3, harmOffsets=(41,))
+# 2 パスモデルの最終出力用 (assemble_v2.py が書き込む)。pass 1 (テンプレート用の検出) は DEFAULT のまま
+FINAL = dict(DEFAULT, smooth=5, mergeGap=0)
 
 def moving_mean(x, w):
     if w <= 1: return x
