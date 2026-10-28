@@ -68,6 +68,7 @@ describe("note-estimation", () => {
     const x = tone([{ step: 164, from: 0, to: 6.5 }], 6.5);
     const planes = await computeNotePlanes(x);
     const prob = await runNoteModel(planes);
+    expect(prob.model).toBe(noteModel.pass1!);
     expect(prob.frames).toBe(planes.frames);
     let ok = true;
     for (let i = 0; i < prob.active.length; i++) {

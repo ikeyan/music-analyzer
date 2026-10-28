@@ -281,6 +281,9 @@ export async function runConvModel(
   return { frames, active, onset };
 }
 
+/** 確率と、それを出したモデル (デコード設定はモデルごとに異なる) */
+export type ModelProbabilities = NoteProbabilities & { model: ConvModel };
+
 function decodeWith(model: ConvModel, prob: NoteProbabilities): DecodedNote[] {
   const params: DecodeParams = { ...DEFAULT_DECODE_PARAMS, ...model.decode };
   return decodeNotes(prob.active, prob.onset, prob.frames, NOTE_BINS, params);
@@ -291,12 +294,14 @@ export async function buildTemplateChannels(
   model: NoteModel,
   input: NotePlanes,
   maybeYield?: MaybeYield,
-): Promise<{ templates: Float32Array<ArrayBuffer>[]; fallback?: NoteProbabilities }> {
+): Promise<{ templates: Float32Array<ArrayBuffer>[]; fallback?: ModelProbabilities }> {
   const k = model.input.templates ?? 0;
   if (k === 0 || !model.pass1) return { templates: [] };
   const prob1 = await runConvModel(model.pass1, input, [], maybeYield);
   const notes = decodeWith(model.pass1, prob1);
-  if (notes.length < MIN_TEMPLATE_NOTES) return { templates: [], fallback: prob1 };
+  if (notes.length < MIN_TEMPLATE_NOTES) {
+    return { templates: [], fallback: { ...prob1, model: model.pass1 } };
+  }
   const { dbMin, dbMax, offset, scale } = model.input;
   const planes = input.planes.length;
   const read = (h: number, f: number, b: number) =>
@@ -309,17 +314,18 @@ export async function buildTemplateChannels(
 export async function runNoteModel(
   input: NotePlanes,
   maybeYield?: MaybeYield,
-): Promise<NoteProbabilities> {
+): Promise<ModelProbabilities> {
   const { templates, fallback } = await buildTemplateChannels(noteModel, input, maybeYield);
   if (fallback) return fallback;
-  return runConvModel(noteModel, input, templates, maybeYield);
+  return { ...(await runConvModel(noteModel, input, templates, maybeYield)), model: noteModel };
 }
 
 export function notesFromProbabilities(
   prob: NoteProbabilities,
   durationSec: number,
+  model: ConvModel = noteModel,
 ): NoteEstimationResult {
-  const decoded = decodeWith(noteModel, prob);
+  const decoded = decodeWith(model, prob);
   const secPerFrame = NOTE_HOP / NOTE_SAMPLE_RATE;
   return {
     version: 1,
@@ -348,5 +354,5 @@ export async function estimateNotes(
 ): Promise<NoteEstimationResult> {
   const planes = await computeNotePlanes(samples, maybeYield);
   const prob = await runNoteModel(planes, maybeYield);
-  return notesFromProbabilities(prob, samples.length / NOTE_SAMPLE_RATE);
+  return notesFromProbabilities(prob, samples.length / NOTE_SAMPLE_RATE, prob.model);
 }
