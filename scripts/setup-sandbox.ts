@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 import { join } from "node:path";
 import { $ } from "bun";
-import { MINIO_IMAGE } from "../app/test-images";
+import { SEAWEEDFS_IMAGE } from "../app/test-images";
 import { installDeps } from "./install-deps";
 import { step } from "./log-step";
 
@@ -32,7 +32,7 @@ const REAPER_IMAGE = await step`resolve REAPER_IMAGE`(async () =>
 const authentik = join(root, "e2e/authentik");
 
 const steps = [
-  step`docker pull ${MINIO_IMAGE}`(() => $`docker pull ${MINIO_IMAGE}`),
+  step`docker pull ${SEAWEEDFS_IMAGE}`(() => $`docker pull ${SEAWEEDFS_IMAGE}`),
   step`docker pull ${REAPER_IMAGE}`(() => $`docker pull ${REAPER_IMAGE}`),
   // build-only serviceをpull対象から外さないとimage未公開で失敗する
   step`docker compose pull (authentik)`(() =>
