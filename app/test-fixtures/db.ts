@@ -3,11 +3,12 @@ import assert from "node:assert";
 import { prisma } from "../lib/prisma";
 import { waitForInflightTasks } from "../lib/task-runner";
 
-// FK 順: thumbnail → video, spectrogram → audio, task → upload → uploadChunk, deletionMark → project → user
+// FK 順: thumbnail → video, spectrogram / noteEstimation → audio, task → upload → uploadChunk, deletionMark → project → user
 export async function clearDb(): Promise<void> {
   await prisma.thumbnail.deleteMany();
   await prisma.video.deleteMany();
   await prisma.spectrogram.deleteMany();
+  await prisma.noteEstimation.deleteMany();
   await prisma.audio.deleteMany();
   await prisma.task.deleteMany();
   await prisma.uploadChunk.deleteMany();

@@ -928,4 +928,76 @@ describe("ProjectDetail (frontend)", () => {
     expect(stripe.duringCanvas).toBe(90);
     expect(stripe.afterWrap).toBe(90);
   }, 120_000);
+
+  it("41edo ノート推定: overlay canvas が CQT band 上の推定 step の高さに描画される", async () => {
+    const id = await createProject("notes-overlay-test");
+    await goto(`/projects/${id}`);
+    await waitHydrated('input[type=file][accept="audio/*"]');
+    await injectFileToInput(getMedia().audioMp3, "audio/*", "tone.mp3", "audio/mpeg");
+    await waitFor(webview(), "audio source", 30_000);
+    const detail = (await fetch(`${server()}/api/projects/${id}`).then((r) => r.json())) as {
+      project: { audios: { id: string }[] };
+    };
+    const audioId = detail.project.audios[0]!.id;
+    const spec = await fetch(`${server()}/api/projects/${id}/audios/${audioId}/spectrograms`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ binsPerOctave: 41, octaves: 5, fminHz: 55, harmonics: [1] }),
+    });
+    expect(spec.status).toBe(201);
+    const specId = ((await spec.json()) as { spectrogram: { id: string } }).spectrogram.id;
+    const est = await fetch(`${server()}/api/projects/${id}/audios/${audioId}/notes`, {
+      method: "POST",
+    });
+    expect(est.status).toBe(201);
+    const noteId = ((await est.json()) as { noteEstimation: { id: string } }).noteEstimation.id;
+    await (async () => {
+      const deadline = Date.now() + 60_000;
+      while (Date.now() < deadline) {
+        const d = (await fetch(`${server()}/api/projects/${id}`).then((r) => r.json())) as {
+          project: {
+            audios: {
+              spectrograms: { status: string }[];
+              noteEstimations: { status: string }[];
+            }[];
+          };
+        };
+        const a = d.project.audios[0]!;
+        const ss = a.spectrograms[0]?.status;
+        const ns = a.noteEstimations[0]?.status;
+        if (ss === "failed" || ns === "failed") throw new Error("analysis failed");
+        if (ss === "ready" && ns === "ready") return;
+        await Bun.sleep(200);
+      }
+      throw new Error("analysis not ready in time");
+    })();
+    await webview().evaluate(`(() => {
+      localStorage.setItem("cqtViews:${id}", JSON.stringify({ "${audioId}": { specId: "${specId}", mode: "h1" } }));
+      localStorage.setItem("noteViews:${id}", JSON.stringify({ "${audioId}": "${noteId}" }));
+    })()`);
+    await goto(`/projects/${id}`);
+    await waitFor(webview(), 'canvas[data-testid="note-overlay"]', 15_000);
+    // fixture は 440Hz → 最寄り step は A4 (441.5Hz)。fmin 55Hz / 41 bins/oct × 5 oct の strip 上で
+    // bin = 41·log2(441.5/55) ≈ 123.2 → y ≈ h·(1 - 123.7/205)
+    const painted = await webview().evaluate<{ rows: number[]; h: number }>(`(async () => {
+      const c = document.querySelector('canvas[data-testid="note-overlay"]');
+      for (let i = 0; i < 100; i++) {
+        const ctx = c.getContext("2d");
+        const img = ctx.getImageData(0, 0, c.width, c.height).data;
+        const rows = [];
+        for (let y = 0; y < c.height; y++) {
+          let any = false;
+          for (let x = 0; x < c.width && !any; x++) if (img[(y * c.width + x) * 4 + 3] > 0) any = true;
+          if (any) rows.push(y / (c.height / c.getBoundingClientRect().height));
+        }
+        if (rows.length > 0) return { rows, h: c.getBoundingClientRect().height };
+        await new Promise(r => setTimeout(r, 50));
+      }
+      return { rows: [], h: c.getBoundingClientRect().height };
+    })()`);
+    expect(painted.rows.length).toBeGreaterThan(0);
+    const expectedY = painted.h * (1 - (41 * Math.log2(441.5 / 55) + 0.5) / 205);
+    // 他 step の誤検出があってもよいので、期待の高さに描画行があることだけ見る
+    expect(Math.min(...painted.rows.map((y) => Math.abs(y - expectedY)))).toBeLessThan(6);
+  }, 180_000);
 });

@@ -11,12 +11,14 @@ import {
 } from "react";
 import type {
   ApiAudio,
+  ApiNoteEstimation,
   ApiProjectDetail,
   ApiSpectrogram,
   ApiTask,
   ApiThumbnail,
   ApiVideo,
 } from "../api/types";
+import { NoteEstimationSection, NoteOverlay } from "../components/notes";
 import {
   HarmonicLens,
   LENS_STRIPE_DEFAULT_W,
@@ -40,7 +42,13 @@ export type ProjectDetailData = ApiProjectDetail;
 const TASK_POLL_INTERVAL_MS = 1000;
 
 type Track = { kind: "video"; data: VideoItem } | { kind: "audio"; data: AudioItem };
-type ShownSpec = { spec: ApiSpectrogram; mode: string; audio: AudioItem };
+type ShownSpec = {
+  spec: ApiSpectrogram;
+  mode: string;
+  audio: AudioItem;
+  /** 重ねて表示する ready なノート推定 */
+  notes: ApiNoteEstimation | null;
+};
 
 // タイトル + 操作ボタンは行左上に sticky で重ね (縦積み)、横スクロールでも画面内に残す。
 // 緑の clip 帯は info とサムネイルだけ持たせて低く保つ
@@ -76,6 +84,8 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
   const [trimming, setTrimming] = useState<TrackRef | null>(null);
   const [specDialog, setSpecDialog] = useState<string | null>(null);
   const [specViews, setSpecViews] = useState<Record<string, SpectrogramSelection | undefined>>({});
+  // audioId → 重ねて表示するノート推定 id
+  const [noteViews, setNoteViews] = useState<Record<string, string | undefined>>({});
   // harmonic CQT lens: spectrogram 表示中の audio 行を hover している間だけ出す
   const [lens, setLens] = useState<(LensHover & { audioId: string }) | null>(null);
   // 再生位置レンズ: ON の間は hover ではなく再生ヘッド時刻で各表示行にレンズを出す
@@ -118,10 +128,14 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
   const mixKey = `mix:${data.id}`;
   const bandHeightsKey = `bandHeights:${data.id}`;
   const lensMaxHKey = `lensMaxH:${data.id}`;
+  const noteViewsKey = `noteViews:${data.id}`;
   const restoredRef = useRef(false);
   useEffect(() => {
     if (restoredRef.current) saveLocal(viewsKey, specViews);
   }, [viewsKey, specViews]);
+  useEffect(() => {
+    if (restoredRef.current) saveLocal(noteViewsKey, noteViews);
+  }, [noteViewsKey, noteViews]);
   useEffect(() => {
     if (restoredRef.current) saveLocal(lensKey, playbackLens);
   }, [lensKey, playbackLens]);
@@ -160,8 +174,18 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
     setLensStripeW(mix.lensStripeW ?? LENS_STRIPE_DEFAULT_W);
     setLensMaxHarmonic(loadLocal<Record<string, number>>(lensMaxHKey, {}));
     setBandHeights(new Map(loadLocal<[string, number][]>(bandHeightsKey, [])));
+    setNoteViews(loadLocal(noteViewsKey, {} as Record<string, string | undefined>));
     restoredRef.current = true;
-  }, [viewsKey, lensKey, autoScrollKey, videoShownKey, mixKey, bandHeightsKey, lensMaxHKey]);
+  }, [
+    viewsKey,
+    lensKey,
+    autoScrollKey,
+    videoShownKey,
+    mixKey,
+    bandHeightsKey,
+    lensMaxHKey,
+    noteViewsKey,
+  ]);
 
   const tracks: Track[] = useMemo(() => {
     const all: Track[] = [
@@ -544,6 +568,40 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
     return { ok: true };
   }
 
+  async function createNoteEstimation(audioId: string): Promise<{ ok: true } | { error: string }> {
+    const res = await apiClient.projects[":id"].audios[":audioId"].notes.$post({
+      param: { id: data.id, audioId },
+    });
+    if (!res.ok) {
+      const body = (await res.json().catch(() => ({}))) as { error?: string };
+      return { error: `ノート推定開始失敗 (HTTP ${res.status}): ${body.error ?? "(no message)"}` };
+    }
+    const body = await res.json();
+    setData((d) => ({
+      ...d,
+      tasks: [body.task, ...d.tasks.filter((t) => t.id !== body.task.id)],
+    }));
+    // 開始したものをそのまま表示対象にする (ready になった時点で overlay が出る)
+    setNoteViews((prev) => ({ ...prev, [audioId]: body.noteEstimation.id }));
+    await refresh();
+    return { ok: true };
+  }
+
+  async function deleteNoteEstimation(
+    audioId: string,
+    noteId: string,
+  ): Promise<{ ok: true } | { error: string }> {
+    const res = await apiClient.projects[":id"].audios[":audioId"].notes[":noteId"].$delete({
+      param: { id: data.id, audioId, noteId },
+    });
+    if (!res.ok) {
+      const body = (await res.json().catch(() => ({}))) as { error?: string };
+      return { error: `削除失敗 (HTTP ${res.status}): ${body.error ?? "(no message)"}` };
+    }
+    await refresh();
+    return { ok: true };
+  }
+
   const editingTrack = useMemo(
     () =>
       editing ? tracks.find((t) => t.kind === editing.kind && t.data.id === editing.id) : null,
@@ -574,7 +632,14 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
         const sel = specViews[t.data.id];
         const spec = sel ? t.data.spectrograms.find((s) => s.id === sel.specId) : undefined;
         if (sel && spec && spec.status === "ready") {
-          shownSpec = { spec, mode: sel.mode, audio: t.data };
+          const noteId = noteViews[t.data.id];
+          const est = noteId ? t.data.noteEstimations.find((n) => n.id === noteId) : undefined;
+          shownSpec = {
+            spec,
+            mode: sel.mode,
+            audio: t.data,
+            notes: est && est.status === "ready" ? est : null,
+          };
         }
       }
       const shownVideo = t.kind === "video" && shownVideos.has(t.data.id);
@@ -586,7 +651,7 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
       top += info.height + TRACK_GAP;
       return info;
     });
-  }, [tracks, specViews, shownVideos, bandHeights]);
+  }, [tracks, specViews, noteViews, shownVideos, bandHeights]);
   const tracksTotalHeight =
     rowInfos.length === 0
       ? 0
@@ -862,6 +927,20 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
                       />
                     )
                   }
+                  noteOverlay={
+                    shown?.notes && (
+                      <NoteOverlay
+                        estimation={shown.notes}
+                        spec={shown.spec}
+                        audio={shown.audio}
+                        pxPerSec={pxPerSec}
+                        viewportLeft={viewport.left}
+                        viewportWidth={viewport.width}
+                        top={TRACK_HEIGHT + 2}
+                        height={info.bandHeight}
+                      />
+                    )
+                  }
                 />
               );
             })}
@@ -908,6 +987,15 @@ export default function ProjectDetail({ initial }: { initial: ProjectDetailData 
             }
             onCreate={(p) => createSpectrogram(specDialogAudio.id, p)}
             onDelete={(specId) => deleteSpectrogram(specDialogAudio.id, specId)}
+          />
+          <NoteEstimationSection
+            audio={specDialogAudio}
+            shownId={noteViews[specDialogAudio.id] ?? null}
+            onChangeShown={(id) =>
+              setNoteViews((prev) => ({ ...prev, [specDialogAudio.id]: id ?? undefined }))
+            }
+            onCreate={() => createNoteEstimation(specDialogAudio.id)}
+            onDelete={(noteId) => deleteNoteEstimation(specDialogAudio.id, noteId)}
           />
         </ModalShell>
       )}
@@ -1361,6 +1449,7 @@ function TrackRow({
   lensProjT,
   attachRef,
   spectrogram,
+  noteOverlay,
 }: {
   track: Track;
   index: number;
@@ -1387,6 +1476,8 @@ function TrackRow({
   lensProjT?: number | null;
   attachRef: (el: HTMLMediaElement | null) => void;
   spectrogram?: ReactNode;
+  /** spectrogram の上に重ねる layer (DOM 順で後ろ = 手前) */
+  noteOverlay?: ReactNode;
 }) {
   const bandDrag = useRef<{ sy: number; orig: number } | null>(null);
   const item = track.data;
@@ -1491,6 +1582,7 @@ function TrackRow({
         )}
       </div>
       {spectrogram}
+      {noteOverlay}
       {onBandResize && (
         <div
           aria-hidden="true"
@@ -1811,7 +1903,14 @@ function TaskList({ tasks }: { tasks: ApiTask[] }) {
 }
 
 function TaskRow({ task }: { task: ApiTask }) {
-  const kindLabel = task.kind === "video" ? "動画" : task.kind === "audio" ? "音声" : "CQT";
+  const kindLabel =
+    task.kind === "video"
+      ? "動画"
+      : task.kind === "audio"
+        ? "音声"
+        : task.kind === "spectrogram"
+          ? "CQT"
+          : "ノート";
   const statusLabel = (() => {
     switch (task.status) {
       case "pending":
@@ -1853,7 +1952,13 @@ function TaskRow({ task }: { task: ApiTask }) {
           minWidth: "2.5rem",
           padding: "0 0.4rem",
           background:
-            task.kind === "video" ? "#3b82f6" : task.kind === "audio" ? "#10b981" : "#8b5cf6",
+            task.kind === "video"
+              ? "#3b82f6"
+              : task.kind === "audio"
+                ? "#10b981"
+                : task.kind === "spectrogram"
+                  ? "#8b5cf6"
+                  : "#d97706",
           color: "white",
           borderRadius: 3,
           fontSize: "0.75rem",

@@ -24,8 +24,11 @@ import {
   MIN_SPECTROGRAM_FMIN_HZ,
   parseHarmonics,
 } from "../lib/spectrogram";
+import { noteModel } from "../lib/note-estimation";
 import {
   audioPrefix,
+  noteEstimationNotesKey,
+  noteEstimationPrefix,
   projectPrefix,
   spectrogramMetaKey,
   spectrogramPrefix,
@@ -39,6 +42,7 @@ import {
 import { TASK_GRACE_MS, enqueueTask } from "../lib/task-runner";
 import {
   type ApiAudio,
+  type ApiNoteEstimation,
   type ApiProject,
   type ApiProjectDetail,
   type ApiProjectSummary,
@@ -47,6 +51,7 @@ import {
   type ApiUpload,
   type ApiVideo,
   toApiAudio,
+  toApiNoteEstimation,
   toApiProject,
   toApiProjectDetail,
   toApiProjectSummary,
@@ -79,6 +84,11 @@ const spectrogramIdParamSchema = v.object({
   id: v.string(),
   audioId: v.string(),
   specId: v.string(),
+});
+const noteIdParamSchema = v.object({
+  id: v.string(),
+  audioId: v.string(),
+  noteId: v.string(),
 });
 const spectrogramTileParamSchema = v.object({
   id: v.string(),
@@ -210,6 +220,24 @@ function requireSpectrogram(audioId: string, specId: string) {
   );
 }
 
+function requireNoteEstimation(audioId: string, noteId: string) {
+  return pipe(
+    Effect.promise(() => prisma.noteEstimation.findFirst({ where: { id: noteId, audioId } })),
+    Effect.flatMap(found({ status: 404, error: "note estimation not found" })),
+  );
+}
+
+function requireReadyNoteEstimation(audioId: string, noteId: string) {
+  return pipe(
+    requireNoteEstimation(audioId, noteId),
+    Effect.flatMap((n) =>
+      n.status === "ready"
+        ? Either.right(n)
+        : leftErr({ status: 409, error: `note estimation is ${n.status}` }),
+    ),
+  );
+}
+
 function requireReadySpectrogram(audioId: string, specId: string) {
   return pipe(
     requireSpectrogram(audioId, specId),
@@ -244,7 +272,10 @@ export function requireProjectDetail(userId: string, projectId: string) {
           },
           audios: {
             orderBy: { order: "asc" },
-            include: { spectrograms: { orderBy: { createdAt: "asc" } } },
+            include: {
+              spectrograms: { orderBy: { createdAt: "asc" } },
+              noteEstimations: { orderBy: { createdAt: "asc" } },
+            },
           },
           tasks: {
             where: {
@@ -305,6 +336,7 @@ export const projects = new Hono()
             prisma.thumbnail.deleteMany({ where: { video: { projectId: project.id } } }),
             prisma.video.deleteMany({ where: { projectId: project.id } }),
             prisma.spectrogram.deleteMany({ where: { audio: { projectId: project.id } } }),
+            prisma.noteEstimation.deleteMany({ where: { audio: { projectId: project.id } } }),
             prisma.audio.deleteMany({ where: { projectId: project.id } }),
             prisma.project.delete({ where: { id: project.id } }),
           ]);
@@ -961,8 +993,14 @@ export const projects = new Hono()
               const prefix = audioPrefix(project.id, audio.id);
               await prisma.$transaction([
                 prisma.deletionMark.create({ data: { prefix } }),
-                prisma.task.deleteMany({ where: { audioId: audio.id, type: "cqt_spectrogram" } }),
+                prisma.task.deleteMany({
+                  where: {
+                    audioId: audio.id,
+                    type: { in: ["cqt_spectrogram", "note_estimation"] },
+                  },
+                }),
                 prisma.spectrogram.deleteMany({ where: { audioId: audio.id } }),
+                prisma.noteEstimation.deleteMany({ where: { audioId: audio.id } }),
                 prisma.audio.delete({ where: { id: audio.id } }),
               ]);
               await eagerCleanupAndUnmark(prefix);
@@ -1038,7 +1076,10 @@ export const projects = new Hono()
                         return yield* Effect.promise(() =>
                           tx.audio.findUniqueOrThrow({
                             where: { id: audioId },
-                            include: { spectrograms: { orderBy: { createdAt: "asc" } } },
+                            include: {
+                              spectrograms: { orderBy: { createdAt: "asc" } },
+                              noteEstimations: { orderBy: { createdAt: "asc" } },
+                            },
                           }),
                         );
                       }),
@@ -1290,6 +1331,125 @@ export const projects = new Hono()
                   c,
                   spectrogramTileKey(id, audioId, specId, h, lv, idx),
                   "application/octet-stream",
+                );
+                res.headers.set("cache-control", "private, max-age=31536000, immutable");
+                return res;
+              }),
+        ),
+        Effect.runPromise,
+      );
+    },
+  )
+
+  // 41edo ノート推定。NoteEstimation.id === Task.id (spectrogram と同じ共有 id パターン)
+  .post("/:id/audios/:audioId/notes", vValidator("param", audioIdParamSchema), (c) => {
+    const { id, audioId } = c.req.valid("param");
+    return pipe(
+      requireProject(c.var.user.id, id),
+      Effect.flatMap((project) => requireAudio(project.id, audioId)),
+      Effect.flatMap((audio) =>
+        Effect.promise(async () => {
+          const noteId = crypto.randomUUID();
+          const [est, task] = await prisma.$transaction([
+            prisma.noteEstimation.create({
+              data: { id: noteId, audioId: audio.id, modelVersion: noteModel.version },
+            }),
+            prisma.task.create({
+              data: {
+                id: noteId,
+                projectId: audio.projectId,
+                type: "note_estimation",
+                fileName: audio.name,
+                audioId: audio.id,
+                status: "pending",
+              },
+            }),
+          ]);
+          enqueueTask(task.id);
+          return {
+            noteEstimation: toApiNoteEstimation(audio.projectId, est),
+            task: toApiTask(task),
+          };
+        }),
+      ),
+      Effect.mapBoth({
+        onSuccess: (r) =>
+          c.json(r satisfies { noteEstimation: ApiNoteEstimation; task: ApiTask }, 201),
+        onFailure: (err) => c.var.eitherJson(leftErr(err)),
+      }),
+      Effect.merge,
+      Effect.runPromise,
+    );
+  })
+
+  .delete("/:id/audios/:audioId/notes/:noteId", vValidator("param", noteIdParamSchema), (c) => {
+    const { id, audioId, noteId } = c.req.valid("param");
+    return pipe(
+      requireProject(c.var.user.id, id),
+      Effect.flatMap((project) =>
+        pipe(
+          requireAudio(project.id, audioId),
+          Effect.flatMap((audio) =>
+            pipe(
+              txEither((tx) =>
+                Effect.gen(function* () {
+                  // 実行中 (pending) は task が S3 に書き続けるので terminal のみ消せる
+                  const deleted = yield* Effect.promise(() =>
+                    tx.noteEstimation.deleteMany({
+                      where: { id: noteId, audioId: audio.id, status: { in: ["ready", "failed"] } },
+                    }),
+                  );
+                  if (deleted.count === 0) {
+                    const est = yield* requireNoteEstimation(audio.id, noteId);
+                    return yield* leftErr({
+                      status: 409,
+                      error: `cannot delete: note estimation is ${est.status}`,
+                    });
+                  }
+                  yield* Effect.promise(() => tx.task.deleteMany({ where: { id: noteId } }));
+                  yield* Effect.promise(() =>
+                    tx.deletionMark.create({
+                      data: { prefix: noteEstimationPrefix(project.id, audio.id, noteId) },
+                    }),
+                  );
+                }),
+              ),
+              Effect.flatMap(() =>
+                Effect.promise(() =>
+                  eagerCleanupAndUnmark(noteEstimationPrefix(project.id, audio.id, noteId)),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+      Effect.mapBoth({
+        onSuccess: () => c.body(null, 204),
+        onFailure: (err) => c.var.eitherJson(leftErr(err)),
+      }),
+      Effect.merge,
+      Effect.runPromise,
+    );
+  })
+
+  .get(
+    "/:id/audios/:audioId/notes/:noteId/notes.json",
+    vValidator("param", noteIdParamSchema),
+    (c) => {
+      const { id, audioId, noteId } = c.req.valid("param");
+      return pipe(
+        requireProject(c.var.user.id, id),
+        Effect.flatMap((project) => requireAudio(project.id, audioId)),
+        Effect.flatMap((audio) => requireReadyNoteEstimation(audio.id, noteId)),
+        Effect.either,
+        Effect.flatMap((r) =>
+          Either.isLeft(r)
+            ? Effect.sync(() => c.var.eitherJson(r))
+            : Effect.promise(async () => {
+                const res = await streamS3(
+                  c,
+                  noteEstimationNotesKey(id, audioId, noteId),
+                  "application/json",
                 );
                 res.headers.set("cache-control", "private, max-age=31536000, immutable");
                 return res;

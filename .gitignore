@@ -154,3 +154,6 @@ dist/
 .claude/worktrees/
 # sandbox MITM proxy CA (scripts/setup-sandbox.ts が stage する build context 用)
 /proxy-ca.crt
+
+# Python (scripts/note-model)
+__pycache__/
