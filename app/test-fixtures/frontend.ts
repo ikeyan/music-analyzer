@@ -82,8 +82,17 @@ export async function navigateAndWait(
   url: string,
   timeoutMs = 15_000,
 ): Promise<void> {
-  wv.navigate(url);
   const deadline = Date.now() + timeoutMs;
+  // 直前の load (新規 WebView の about:blank 等) が loading に現れないまま pending のことがある
+  for (;;) {
+    try {
+      wv.navigate(url);
+      break;
+    } catch (e) {
+      if (!String(e).includes("navigation is already pending") || Date.now() > deadline) throw e;
+      await Bun.sleep(50);
+    }
+  }
   while (!wv.loading) {
     if (Date.now() > deadline) throw new Error(`navigate didn't start: ${url}`);
     await Bun.sleep(5);
