@@ -144,7 +144,7 @@ NMF_OFF = [int(round(41 * np.log2(k))) for k in range(1, 9)]  # 0,41,65,82,95,10
 def note_profiles(d, notes, stat):
     X = d['X']; F = d['F']; prof = []
     for t0, t1, p in notes:
-        a = int(t0 * FPS) + 2; b = max(a + 1, int(t1 * FPS) - 1); p = int(p)
+        a = int(round(t0 * FPS)) + 2; b = max(a + 1, int(round(t1 * FPS)) - 1); p = int(p)
         if b > F or p >= P: continue
         seg = X[:, a:b, p]
         if stat == 'median': v = np.median(seg, 1)
@@ -155,12 +155,15 @@ def note_profiles(d, notes, stat):
     prof = np.array(prof); prof = (prof + 40.0) / 40.0
     return prof - prof[:, :1]
 def kmeans(prof, K):
-    rng = np.random.default_rng(0); C = prof[rng.choice(len(prof), K, replace=False)].copy()
+    # app/lib/note-templates.ts の kmeansProfiles と同一 (初期化・出力順)。pass 2 は channel 順に依存する
+    order = np.argsort(prof.sum(1), kind='stable')
+    C = prof[order[((np.arange(K) + 0.5) * len(prof) / K).astype(int)]].astype(np.float64).copy()
     for _ in range(30):
         lab = ((prof[:, None, :] - C[None]) ** 2).sum(-1).argmin(1)
         for k in range(K):
             if (lab == k).any(): C[k] = prof[lab == k].mean(0)
-    return C.astype(np.float32), lab
+    s = np.argsort(C.sum(1), kind='stable'); remap = np.argsort(s)
+    return C[s].astype(np.float32), remap[lab]
 _PASS1 = {}
 def pass1_notes(d, path):
     if 'net' not in _PASS1:
