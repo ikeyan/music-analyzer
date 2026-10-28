@@ -24,9 +24,7 @@ import {
 import { kmeansProfiles, noteProfiles, templateChannels } from "./note-templates";
 import { MAX_SPECTROGRAM_FMAX_HZ, safeCqtOctaves } from "./spectrogram";
 
-// 41edo ノート推定の解析格子。学習側 (scripts/note-model/hcqt-dump.ts は computeNotePlanes を
-// そのまま使う) と同一でなければならない: fs 44100 / hop 512、bin 0 = C1 (step 41)、
-// 41 bins/octave × 7 octave、VQT gamma = autoGamma(41)
+// 解析格子は学習側 (scripts/note-model/hcqt-dump.ts) と同一でなければならない
 export const NOTE_SAMPLE_RATE = 44100;
 export const NOTE_HOP = 512;
 export const NOTE_BINS_PER_OCTAVE = EDO;
