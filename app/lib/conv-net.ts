@@ -59,8 +59,7 @@ export type Tensor = {
   data: Float32Array<ArrayBuffer>;
 };
 
-// 1 (co, ci) 分の相関を out に積算する同期ホットループ。async 関数の中に置くと JIT が
-// 最適化を外して 5 倍以上遅くなるので、await する外側のループから分離している
+// async 関数内に置くと JIT 最適化が外れ 5 倍以上遅くなるため同期関数に分離
 function accumulatePair(
   x: Tensor,
   l: ConvLayer,

@@ -1,6 +1,4 @@
-// frame × bin の (active, onset) 確率からノートイベントを切り出す。
-// 学習側の decode_v2.py と同じ段階構成 (平滑化 → 区間化 → gap 結合 → フィルタ → 隣接 bin NMS →
-// 倍音抑制) で、既定パラメータは学習時に決めたものをモデル JSON から受け取る
+// 学習側 decode_v2.py と挙動を一致させる (note-decode-cases.json で検証)
 
 export type DecodedNote = {
   /** 開始 frame (含む) */

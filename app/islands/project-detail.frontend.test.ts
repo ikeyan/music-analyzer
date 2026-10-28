@@ -977,8 +977,7 @@ describe("ProjectDetail (frontend)", () => {
     })()`);
     await goto(`/projects/${id}`);
     await waitFor(webview(), 'canvas[data-testid="note-overlay"]', 15_000);
-    // fixture は 440Hz → 最寄り step は A4 (441.5Hz)。fmin 55Hz / 41 bins/oct × 5 oct の strip 上で
-    // bin = 41·log2(441.5/55) ≈ 123.2 → y ≈ h·(1 - 123.7/205)
+    // fixture 440Hz の最寄り step A4 (441.5Hz) が strip 上で来る y
     const painted = await webview().evaluate<{ rows: number[]; h: number }>(`(async () => {
       const c = document.querySelector('canvas[data-testid="note-overlay"]');
       for (let i = 0; i < 100; i++) {

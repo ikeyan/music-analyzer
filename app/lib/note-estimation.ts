@@ -134,8 +134,7 @@ export function estimateNoteOps(samples: number): number {
   return ops + 2 * frames * NOTE_BINS * noteModelMacsPerCell();
 }
 
-// note_estimation の演算量上限。CNN が ~2G ops/秒の音声なので 10 分強の音声に相当し、
-// 直列 queue (cqt_spectrogram と共有) を 10 分程度以上占有する入力を弾く
+// 直列 queue (cqt_spectrogram と共有) を約 10 分以上占有する入力を弾く
 export const MAX_NOTE_ANALYSIS_OPS = 1.25e12;
 
 export async function computeNotePlanes(

@@ -32,8 +32,7 @@ export function noteProfiles(
   return out;
 }
 
-// 初期中心は明るさ (プロファイル和) 順に等間隔に取り、出力も明るさ順。pass 2 の CNN は channel 順に
-// 依存するので train_timbre.py の kmeans と同一でなければならない。K 未満なら 0 プロファイルで埋める
+// pass 2 は channel 順に依存するため初期化・出力順とも train_timbre.py の kmeans と同一に保つ
 export function kmeansProfiles(
   profiles: Float32Array<ArrayBuffer>[],
   k: number,
