@@ -113,6 +113,22 @@ describe("note estimation task", () => {
     );
   }, 60_000);
 
+  it("同じ audio への同時 POST は 1 つだけ受け付け、残りは 409", async () => {
+    const client = makeClient();
+    const { projectId, audioId } = await seedAudio(client);
+    const res = await Promise.all(
+      Array.from({ length: 4 }, () =>
+        client.projects[":id"].audios[":audioId"].notes.$post({
+          param: { id: projectId, audioId },
+        }),
+      ),
+    );
+    expect(res.map((r) => r.status).toSorted()).toEqual([201, 409, 409, 409]);
+    expect(await prisma.noteEstimation.count()).toBe(1);
+    expect(await prisma.task.count()).toBe(1);
+    await waitForInflightTasks();
+  }, 60_000);
+
   it("audio 実体が S3 にないと task/noteEstimation が failed になり mark も残らない", async () => {
     const client = makeClient();
     const { projectId, audioId } = await seedAudio(client);

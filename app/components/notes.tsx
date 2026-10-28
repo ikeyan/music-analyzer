@@ -184,6 +184,7 @@ export function NoteEstimationSection({
   const [creating, setCreating] = useState(false);
   const [deleting, setDeleting] = useState<ReadonlySet<string>>(() => new Set());
   const [error, setError] = useState<string | null>(null);
+  const running = audio.noteEstimations.some((e) => e.status === "pending");
 
   async function create() {
     setCreating(true);
@@ -259,7 +260,7 @@ export function NoteEstimationSection({
         })}
       </ul>
       <div style={{ marginTop: "0.5rem" }}>
-        <button type="button" onClick={create} disabled={creating}>
+        <button type="button" onClick={create} disabled={creating || running}>
           {creating ? "開始中…" : "ノート推定を実行"}
         </button>
       </div>

@@ -1,7 +1,5 @@
-// 曲内の音色テンプレート (学習側 train_timbre.py の song_templates / template_channels の移植)。
-// pass 1 で検出したノートごとに、ノート中央区間の各 harmonic plane の値 (正規化 dB、h=1 相対) を
-// 平均した「倍音プロファイル」を作り、k-means で K 個に集約する。各テンプレートとの内積を
-// pass 2 の追加入力 channel にすると、曲ごとの楽器音色に適応した推定になる
+// 曲内の音色テンプレート。学習側 train_timbre.py の song_templates / template_channels と
+// 構成・順序まで同一でなければならない
 
 import type { DecodedNote } from "./note-decode";
 

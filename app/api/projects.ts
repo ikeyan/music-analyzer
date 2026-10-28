@@ -1348,29 +1348,45 @@ export const projects = new Hono()
       requireProject(c.var.user.id, id),
       Effect.flatMap((project) => requireAudio(project.id, audioId)),
       Effect.flatMap((audio) =>
-        Effect.promise(async () => {
-          const noteId = crypto.randomUUID();
-          const [est, task] = await prisma.$transaction([
-            prisma.noteEstimation.create({
-              data: { id: noteId, audioId: audio.id, modelVersion: noteModel.version },
+        pipe(
+          txEither((tx) =>
+            Effect.gen(function* () {
+              const noteId = crypto.randomUUID();
+              // 先に書いて write lock を取ってから数える (同じ audio の推定は同時に 1 つまで)
+              const est = yield* Effect.promise(() =>
+                tx.noteEstimation.create({
+                  data: { id: noteId, audioId: audio.id, modelVersion: noteModel.version },
+                }),
+              );
+              const pending = yield* Effect.promise(() =>
+                tx.noteEstimation.count({ where: { audioId: audio.id, status: "pending" } }),
+              );
+              if (pending > 1) {
+                return yield* leftErr({ status: 409, error: "note estimation already running" });
+              }
+              const task = yield* Effect.promise(() =>
+                tx.task.create({
+                  data: {
+                    id: noteId,
+                    projectId: audio.projectId,
+                    type: "note_estimation",
+                    fileName: audio.name,
+                    audioId: audio.id,
+                    status: "pending",
+                  },
+                }),
+              );
+              return { est, task };
             }),
-            prisma.task.create({
-              data: {
-                id: noteId,
-                projectId: audio.projectId,
-                type: "note_estimation",
-                fileName: audio.name,
-                audioId: audio.id,
-                status: "pending",
-              },
-            }),
-          ]);
-          enqueueTask(task.id);
-          return {
-            noteEstimation: toApiNoteEstimation(audio.projectId, est),
-            task: toApiTask(task),
-          };
-        }),
+          ),
+          Effect.map(({ est, task }) => {
+            enqueueTask(task.id);
+            return {
+              noteEstimation: toApiNoteEstimation(audio.projectId, est),
+              task: toApiTask(task),
+            };
+          }),
+        ),
       ),
       Effect.mapBoth({
         onSuccess: (r) =>
