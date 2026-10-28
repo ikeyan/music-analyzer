@@ -4,8 +4,9 @@ CFG = {
   'kipa': {'off': 0.9636, 'edo12_from': None, 'map': {
       'chords_41edo': (60, C4 * 2 ** (36/41), 41), 'bass_41edo': (60, C4 * 2 ** (36/41) / 4, 41)}},
   'xenprog': {'off': 0.4325, 'edo12_from': 174.375, 'map': {
-      'chords_41edo': (60, C4, 41), 'structure_41edo': (60, C4, 41), 'bass_41edo': (60, C4/4, 41),
-      'chords_12edo': (60, C4, 12), 'structure_12edo': (60, C4, 12), 'bass_12edo': (60, C4/2, 12)}},
+      # structure_* はコード参照用で音は鳴っていない (map に無いトラックは教師にしない)
+      'chords_41edo': (60, C4, 41), 'bass_41edo': (60, C4/4, 41),
+      'chords_12edo': (60, C4, 12), 'bass_12edo': (60, C4/2, 12)}},
   # 2026-10-23 追加 (offset は onset 相互相関、基準は calibrate3/diffscan + alignment histogram で確認)
   'yxeni': {'off': 0.4354, 'edo12_from': None, 'map': {'chords_41edo': (60, C4, 41), 'bass_41edo': (60, C4 / 4, 41)}},
   'mafle': {'off': 0.238, 'edo12_from': None, 'map': {
@@ -23,6 +24,7 @@ def build(name):
         weight[int((cfg['edo12_from'] + cfg['off']) * fps):] = 0
     rows = []
     for n in notes:
+        if n['track'] not in cfg['map']: continue
         base, hz, spo = cfg['map'][n['track']]
         f = hz * 2 ** ((n['note'] - base) / spo)
         pf = 41 * np.log2(f / C1)
