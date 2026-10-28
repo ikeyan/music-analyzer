@@ -89,7 +89,15 @@ function accumulatePair(
   }
 }
 
-async function convLayer(x: Tensor, l: ConvLayer, maybeYield?: MaybeYield): Promise<Tensor> {
+/** 実在する frame の範囲 (入力 tensor の frame 座標、end は含まない) */
+export type FrameRange = { start: number; end: number };
+
+async function convLayer(
+  x: Tensor,
+  l: ConvLayer,
+  outRange: FrameRange | undefined,
+  maybeYield?: MaybeYield,
+): Promise<Tensor> {
   const { dt: dilT } = dilation(l);
   const ht = (dilT * (l.kt - 1)) / 2;
   const frames = x.frames - 2 * ht;
@@ -107,16 +115,32 @@ async function convLayer(x: Tensor, l: ConvLayer, maybeYield?: MaybeYield): Prom
   if (l.act === "relu") {
     for (let i = 0; i < out.length; i++) if (out[i]! < 0) out[i] = 0;
   }
+  if (outRange) {
+    const lo = Math.max(0, Math.min(frames, outRange.start));
+    const hi = Math.max(lo, Math.min(frames, outRange.end));
+    for (let co = 0; co < l.out; co++) {
+      const base = co * frames * bins;
+      out.fill(0, base, base + lo * bins);
+      out.fill(0, base + hi * bins, base + frames * bins);
+    }
+  }
   return { channels: l.out, frames, bins, data: out };
 }
 
-// 入力 (channels × frames × bins) → 出力 (lastOut × (frames - 2·halo) × bins)
+// 入力 (channels × frames × bins) → 出力 (lastOut × (frames - 2·halo) × bins)。
+// valid を渡すと範囲外 frame の中間出力を層ごとに 0 にする (学習側 Conv2d の層ごとの zero padding と一致させる)
 export async function runConvNet(
   net: ConvNet,
   x: Tensor,
   maybeYield?: MaybeYield,
+  valid?: FrameRange,
 ): Promise<Tensor> {
   let cur = x;
-  for (const l of net.layers) cur = await convLayer(cur, l, maybeYield);
+  let shift = 0;
+  for (const l of net.layers) {
+    shift += (dilation(l).dt * (l.kt - 1)) / 2;
+    const outRange = valid && { start: valid.start - shift, end: valid.end - shift };
+    cur = await convLayer(cur, l, outRange, maybeYield);
+  }
   return cur;
 }

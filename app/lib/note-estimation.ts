@@ -265,7 +265,7 @@ export async function runConvModel(
     }
     for (const t of templates) fillFloatChannel(x.data, c++, chunkFrames, t, frames, f0 - halo);
     if (model.input.norm === "frame") normalizeFrames(x, f0 - halo, frames);
-    const y = await runConvNet(model, x, maybeYield);
+    const y = await runConvNet(model, x, maybeYield, { start: halo - f0, end: halo - f0 + frames });
     if (y.channels !== 2 || y.frames !== f1 - f0) {
       throw new Error(`note model: unexpected output ${y.channels}ch × ${y.frames} frames`);
     }

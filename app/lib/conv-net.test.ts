@@ -103,6 +103,63 @@ describe("conv-net", () => {
     expect(at(2, 4)).toBe(v(2, 4) + v(6, 4) + v(4, 2) + 0);
   });
 
+  // 性質: halo 分 0 埋めした入力 + valid 指定の結果は、層ごとに frame 方向も zero padding する
+  //       (PyTorch の padding=same) 参照実装と一致する
+  // 入力: 2 層 ReLU (bias 正)、frames∈[1,8]、kernel kt∈{1,3,5}、重みは小整数
+  it("valid 指定時は層ごとの zero padding と一致する", async () => {
+    const layerArb = (cin: number, cout: number) =>
+      fc
+        .record({
+          kt: fc.constantFrom(1, 3, 5),
+          w: fc.array(fc.integer({ min: -2, max: 2 }), { minLength: 75, maxLength: 75 }),
+          b: fc.array(fc.integer({ min: 1, max: 3 }), { minLength: cout, maxLength: cout }),
+        })
+        .map(
+          ({ kt, w, b }): ConvLayer => ({
+            in: cin,
+            out: cout,
+            kt,
+            kb: 1,
+            w: w.slice(0, cout * cin * kt),
+            b,
+            act: "relu",
+          }),
+        );
+    await fc.assert(
+      fc.asyncProperty(
+        fc.integer({ min: 1, max: 8 }),
+        layerArb(1, 2),
+        layerArb(2, 1),
+        fc.array(fc.integer({ min: -3, max: 3 }), { minLength: 8, maxLength: 8 }),
+        async (frames, l1, l2, xs) => {
+          const net = { layers: [l1, l2] };
+          const halo = convNetHaloFrames(net);
+          const padded = tensor(1, frames + 2 * halo, 1, (_c, f) =>
+            f >= halo && f < halo + frames ? xs[f - halo]! : 0,
+          );
+          const y = await runConvNet(net, padded, undefined, { start: halo, end: halo + frames });
+          let ref = tensor(1, frames, 1, (_c, f) => xs[f]!);
+          for (const l of net.layers) {
+            const h = (l.kt - 1) / 2;
+            ref = tensor(l.out, frames, 1, (co, f) => {
+              let acc = l.b[co]!;
+              for (let ci = 0; ci < l.in; ci++) {
+                for (let t = 0; t < l.kt; t++) {
+                  const g = f + t - h;
+                  if (g >= 0 && g < frames)
+                    acc += l.w[(co * l.in + ci) * l.kt + t]! * ref.data[ci * frames + g]!;
+                }
+              }
+              return Math.max(0, acc);
+            });
+          }
+          expect(Array.from(y.data)).toEqual(Array.from(ref.data));
+        },
+      ),
+      { numRuns: 30 },
+    );
+  });
+
   it("validateConvNet は channel / kernel 不整合を弾く", () => {
     expect(() => validateConvNet({ layers: [delta(2, 1, 3, 3)] }, 1)).toThrow(/channels/);
     expect(() => validateConvNet({ layers: [delta(1, 1, 2, 3)] }, 1)).toThrow(/odd/);
