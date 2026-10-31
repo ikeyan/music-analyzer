@@ -82,8 +82,17 @@ export async function navigateAndWait(
   url: string,
   timeoutMs = 15_000,
 ): Promise<void> {
-  wv.navigate(url);
   const deadline = Date.now() + timeoutMs;
+  // 直前の load (新規 WebView の about:blank 等) が loading に現れないまま pending のことがある
+  for (;;) {
+    try {
+      wv.navigate(url);
+      break;
+    } catch (e) {
+      if (!String(e).includes("navigation is already pending") || Date.now() > deadline) throw e;
+      await Bun.sleep(50);
+    }
+  }
   while (!wv.loading) {
     if (Date.now() > deadline) throw new Error(`navigate didn't start: ${url}`);
     await Bun.sleep(5);
@@ -110,7 +119,7 @@ export function useFrontend(): {
     });
     // 初期 about:blank の load が pending のまま次の navigate を呼ぶと
     // "navigation pending" になるので loading が落ち着くまで待つ。
-    // chrome 初回起動が遅いケース (MinIO 起動を別 fixture が並行している等) を
+    // chrome 初回起動が遅いケース (S3 container 起動を別 fixture が並行している等) を
     // 含めるため 30s
     const deadline = Date.now() + 30_000;
     while (view.loading) {

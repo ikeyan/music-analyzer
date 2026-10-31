@@ -1,5 +1,6 @@
 import { type CSSProperties, useEffect, useRef, useState } from "react";
 import type { ApiAudio, ApiSpectrogram } from "../api/types";
+import { edo41NoteName, hzToEdo41Step } from "../lib/edo41";
 import { loadLocal, saveLocal } from "../lib/local-store";
 import {
   MAX_SPECTROGRAM_BINS,
@@ -618,7 +619,10 @@ export function HarmonicLens({
       // 白線の左に 2 段ラベル: 上=step, 下=note + Hz
       const fSel = spec.fminHz * 2 ** (binSel / spec.binsPerOctave);
       const l1 = `${Math.floor(binSel / spec.binsPerOctave)}oct +${binSel % spec.binsPerOctave}/${spec.binsPerOctave}`;
-      const l2 = `${noteName(fSel)} ${formatHz(fSel)}Hz`;
+      // 41edo 表示 (bins/octave が 41 の倍数) のときは 41edo のノート名も併記する
+      const edoName =
+        spec.binsPerOctave % 41 === 0 ? ` ${edo41NoteName(Math.round(hzToEdo41Step(fSel)))}` : "";
+      const l2 = `${noteName(fSel)}${edoName} ${formatHz(fSel)}Hz`;
       const yc = y + rowH / 2;
       ctx.font = "8px system-ui, sans-serif";
       ctx.textAlign = "right";

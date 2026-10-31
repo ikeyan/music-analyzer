@@ -17,11 +17,13 @@ import { prisma } from "./prisma";
 import { withSlotRetry } from "./prisma-retry";
 import { awaitAllOrAggregate } from "./promise";
 import { getS3 } from "./s3";
+import { runNoteEstimationTask } from "./note-task";
 import { runSpectrogramTask } from "./spectrogram-task";
 import {
   audioPrefix,
   audioRawKey,
   audioTranscodedKey,
+  noteEstimationPrefix,
   spectrogramPrefix,
   uploadFile,
   uploadPrefix,
@@ -401,6 +403,37 @@ async function executeSpectrogramTask(task: Task): Promise<void> {
   }
 }
 
+// note_estimation も cqt_spectrogram と同じ失敗処理 (結果行を failed に倒し S3 prefix を eager 掃除)
+async function executeNoteEstimationTask(task: Task): Promise<void> {
+  let result: Either.Either<void, string>;
+  try {
+    result = await runNoteEstimationTask(task, TASK_GRACE_MS, TASK_SUCCESS_GRACE_MS);
+  } catch (err) {
+    result = Either.left(describeError(err));
+  }
+  if (Either.isLeft(result)) {
+    const finishedAt = new Date();
+    await prisma.$transaction([
+      prisma.task.updateMany({
+        where: { id: task.id },
+        data: {
+          status: "failed",
+          error: result.left,
+          finishedAt,
+          expireAt: new Date(finishedAt.getTime() + TASK_FAILURE_GRACE_MS),
+        },
+      }),
+      prisma.noteEstimation.updateMany({
+        where: { id: task.id, status: "pending" },
+        data: { status: "failed" },
+      }),
+    ]);
+    if (task.audioId) {
+      await eagerCleanupAndUnmark(noteEstimationPrefix(task.projectId, task.audioId, task.id));
+    }
+  }
+}
+
 // pending → running の claim。0 行なら他所が実行済み (または行が消えた)
 async function claimTask(taskId: string): Promise<Task | null> {
   const claimed = await prisma.task.updateMany({
@@ -419,12 +452,13 @@ async function executeTask(taskId: string): Promise<void> {
     select: { type: true },
   });
   if (!peek) return;
-  if (peek.type === "cqt_spectrogram") {
+  if (peek.type === "cqt_spectrogram" || peek.type === "note_estimation") {
     // CQT は in-process 計算で job ごとに PCM + CQT バッファを保持する。協調 yield で
     // 同一スレッドを分け合うだけなので並列化は peak メモリを増やすだけ → global に直列化
+    const isNotes = peek.type === "note_estimation";
     const run = async () => {
       const task = await claimTask(taskId);
-      if (task) await executeSpectrogramTask(task);
+      if (task) await (isNotes ? executeNoteEstimationTask(task) : executeSpectrogramTask(task));
     };
     const prev = globalThis.__musicAnalyzerCqtChain ?? Promise.resolve();
     const next = prev.then(run, run);
@@ -525,6 +559,12 @@ export function enqueueTask(taskId: string): void {
           data: { status: "failed" },
         })
         .catch(() => {});
+      await prisma.noteEstimation
+        .updateMany({
+          where: { id: taskId, status: "pending" },
+          data: { status: "failed" },
+        })
+        .catch(() => {});
     } finally {
       inflight.delete(taskId);
     }
@@ -560,6 +600,10 @@ export async function recoverTasksOnStartup(): Promise<void> {
         where: { id: { in: orphanedIds }, status: "pending" },
         data: { status: "failed" },
       }),
+      prisma.noteEstimation.updateMany({
+        where: { id: { in: orphanedIds }, status: "pending" },
+        data: { status: "failed" },
+      }),
     ]);
     console.error(`task-runner: marked ${orphaned.length} orphaned tasks as failed`);
   }
@@ -572,7 +616,9 @@ export async function recoverTasksOnStartup(): Promise<void> {
     const prefix =
       t.type === "cqt_spectrogram"
         ? t.audioId && spectrogramPrefix(t.projectId, t.audioId, t.id)
-        : uploadPrefix(t.projectId, t.id);
+        : t.type === "note_estimation"
+          ? t.audioId && noteEstimationPrefix(t.projectId, t.audioId, t.id)
+          : uploadPrefix(t.projectId, t.id);
     if (prefix) {
       await prisma.deletionMark.updateMany({
         where: { prefix },

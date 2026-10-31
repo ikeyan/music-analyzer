@@ -1,4 +1,4 @@
 {
   "$schema": "./node_modules/oxfmt/configuration_schema.json",
-  "ignorePatterns": []
+  "ignorePatterns": ["app/lib/note-model.json", "app/test-fixtures/note-decode-cases.json"]
 }

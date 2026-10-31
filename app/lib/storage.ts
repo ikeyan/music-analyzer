@@ -36,6 +36,11 @@ export const spectrogramTileKey = (
 ) =>
   `${spectrogramPrefix(projectId, audioId, specId)}tiles/h${harmonic}/${level}/${String(index).padStart(6, "0")}.bin`;
 
+export const noteEstimationPrefix = (projectId: string, audioId: string, noteId: string) =>
+  `${audioPrefix(projectId, audioId)}notes/${noteId}/`;
+export const noteEstimationNotesKey = (projectId: string, audioId: string, noteId: string) =>
+  `${noteEstimationPrefix(projectId, audioId, noteId)}notes.json`;
+
 // retry は別 key を書いて DB tx で promote するため writeId で unique 化
 export const uploadChunkKey = (
   projectId: string,

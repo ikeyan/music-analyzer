@@ -86,9 +86,10 @@ model Audio {
   projStartSec Float
   projEndSec   Float
 
-  createdAt    DateTime      @default(now())
-  updatedAt    DateTime      @updatedAt
-  spectrograms Spectrogram[]
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+  spectrograms    Spectrogram[]
+  noteEstimations NoteEstimation[]
 
   @@unique([projectId, order])
   @@index([projectId])
@@ -107,6 +108,20 @@ model Spectrogram {
   harmonics     String // JSON int array (例: "[1,2,3]")
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
+
+  @@index([audioId])
+}
+
+// Audio に対する 41edo ノート推定の結果。id は対応する Task.id と共有する。
+// ノート列 (notes.json) は S3 の noteEstimationPrefix 以下に置く
+model NoteEstimation {
+  id           String   @id
+  audioId      String
+  audio        Audio    @relation(fields: [audioId], references: [id])
+  status       String   @default("pending") // "pending" | "ready" | "failed"
+  modelVersion String
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
 
   @@index([audioId])
 }
@@ -172,7 +187,7 @@ model Task {
   id         String    @id
   projectId  String
   project    Project   @relation(fields: [projectId], references: [id])
-  type       String // "video_validation" | "audio_validation" | "cqt_spectrogram"
+  type       String // "video_validation" | "audio_validation" | "cqt_spectrogram" | "note_estimation"
   status     String    @default("pending") // "pending" | "running" | "succeeded" | "failed"
   error      String?
   fileName   String

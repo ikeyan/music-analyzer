@@ -286,7 +286,7 @@ export async function extractThumbnails(
     input,
     "-vf",
     `select=${select},scale=${THUMBNAIL_WIDTH}:-2,format=yuvj420p`,
-    "-vsync",
+    "-fps_mode",
     "vfr",
     "-q:v",
     "5",

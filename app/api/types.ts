@@ -2,6 +2,7 @@
 // bigint が JSON に乗らず Hono RPC の型推論も全フィールドにつく
 import type {
   Audio,
+  NoteEstimation,
   Project,
   Spectrogram,
   Task,
@@ -13,9 +14,15 @@ import { parseHarmonics } from "../lib/spectrogram";
 
 const UPLOAD_KINDS = ["video", "audio"] as const;
 const UPLOAD_STATUSES = ["pending", "completed", "aborted"] as const;
-const TASK_TYPES = ["video_validation", "audio_validation", "cqt_spectrogram"] as const;
+const TASK_TYPES = [
+  "video_validation",
+  "audio_validation",
+  "cqt_spectrogram",
+  "note_estimation",
+] as const;
 const TASK_STATUSES = ["pending", "running", "succeeded", "failed"] as const;
 const SPECTROGRAM_STATUSES = ["pending", "ready", "failed"] as const;
+const NOTE_ESTIMATION_STATUSES = ["pending", "ready", "failed"] as const;
 
 function assertIn<T extends string>(
   v: string,
@@ -75,6 +82,17 @@ export type ApiSpectrogram = {
   tileUrlBase: string;
 };
 
+export type ApiNoteEstimation = {
+  id: string;
+  audioId: string;
+  status: "pending" | "ready" | "failed";
+  modelVersion: string;
+  createdAt: string;
+  updatedAt: string;
+  // NoteEstimationResult (app/lib/note-estimation.ts) の JSON
+  notesUrl: string;
+};
+
 export type ApiAudio = {
   id: string;
   projectId: string;
@@ -97,6 +115,7 @@ export type ApiAudio = {
   streamUrl: string;
   rawUrl: string | null;
   spectrograms: ApiSpectrogram[];
+  noteEstimations: ApiNoteEstimation[];
 };
 
 export type ApiProject = {
@@ -138,8 +157,8 @@ export type ApiUpload = {
 export type ApiTask = {
   id: string;
   projectId: string;
-  type: "video_validation" | "audio_validation" | "cqt_spectrogram";
-  kind: "video" | "audio" | "spectrogram";
+  type: "video_validation" | "audio_validation" | "cqt_spectrogram" | "note_estimation";
+  kind: "video" | "audio" | "spectrogram" | "notes";
   status: "pending" | "running" | "succeeded" | "failed";
   error: string | null;
   fileName: string;
@@ -207,7 +226,25 @@ export function toApiSpectrogram(projectId: string, s: Spectrogram): ApiSpectrog
   };
 }
 
-export function toApiAudio(a: Audio & { spectrograms: Spectrogram[] }): ApiAudio {
+export function toApiNoteEstimation(projectId: string, n: NoteEstimation): ApiNoteEstimation {
+  assertIn(n.status, NOTE_ESTIMATION_STATUSES, "NoteEstimation.status");
+  return {
+    id: n.id,
+    audioId: n.audioId,
+    status: n.status,
+    modelVersion: n.modelVersion,
+    createdAt: n.createdAt.toISOString(),
+    updatedAt: n.updatedAt.toISOString(),
+    notesUrl: `/api/projects/${projectId}/audios/${n.audioId}/notes/${n.id}/notes.json`,
+  };
+}
+
+export type AudioWithAnalyses = Audio & {
+  spectrograms: Spectrogram[];
+  noteEstimations: NoteEstimation[];
+};
+
+export function toApiAudio(a: AudioWithAnalyses): ApiAudio {
   return {
     id: a.id,
     projectId: a.projectId,
@@ -230,6 +267,7 @@ export function toApiAudio(a: Audio & { spectrograms: Spectrogram[] }): ApiAudio
     streamUrl: `/api/projects/${a.projectId}/audios/${a.id}/stream`,
     rawUrl: a.rawKey ? `/api/projects/${a.projectId}/audios/${a.id}/raw` : null,
     spectrograms: a.spectrograms.map((s) => toApiSpectrogram(a.projectId, s)),
+    noteEstimations: a.noteEstimations.map((n) => toApiNoteEstimation(a.projectId, n)),
   };
 }
 
@@ -246,7 +284,7 @@ export function toApiProject(p: Project): ApiProject {
 export function toApiProjectDetail(
   p: Project & {
     videos: (Video & { thumbnails: Thumbnail[] })[];
-    audios: (Audio & { spectrograms: Spectrogram[] })[];
+    audios: AudioWithAnalyses[];
     tasks: Task[];
   },
 ): ApiProjectDetail {
@@ -300,7 +338,9 @@ export function toApiTask(t: Task): ApiTask {
         ? "video"
         : t.type === "audio_validation"
           ? "audio"
-          : "spectrogram",
+          : t.type === "cqt_spectrogram"
+            ? "spectrogram"
+            : "notes",
     status: t.status,
     error: t.error,
     fileName: t.fileName,
